@@ -1,7 +1,6 @@
 import asyncio
+import logging
 import random
-import re
-import typing
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -15,6 +14,7 @@ from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.chat_formatting import box
 
 _ = Translator("Honeypot", __file__)
+log = logging.getLogger("red.Honeypot")
 
 DEFAULT_FAKE_MESSAGES = [
     "BAN CHANNEL - DO NOT WRITE HERE.",
@@ -103,7 +103,7 @@ class ReviewView(discord.ui.View):
                 reason=reason,
             )
         except Exception:
-            pass
+            log.exception("Failed to create modlog case in ReviewView")
 
     async def _update_done(self, interaction: discord.Interaction, action_taken: str) -> None:
         self._disable_all()
@@ -122,8 +122,9 @@ class ReviewView(discord.ui.View):
             )
         review_message = self.review_message or interaction.message
         if review_message is not None:
-            await review_message.edit(content=_("✅ **Review completed**"), embed=embed, view=self)
-        self.cog._active_views.pop(self.active_key or self.target_id, None)
+            await review_message.edit(content=_("\u2705 **Review completed**"), embed=embed, view=self)
+        async with self.cog._views_lock:
+            self.cog._active_views.pop(self.active_key or self.target_id, None)
         if interaction.guild is not None:
             await self.cog._delete_pending_review(interaction.guild, self.active_key)
         self.stop()
@@ -246,7 +247,9 @@ class Honeypot(Cog):
         )
 
         self._last_fake_message: dict[int, datetime] = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
+        self._fake_config_cache: dict[int, tuple[datetime, dict]] = {}
         self._active_views: dict[int, ReviewView] = {}
+        self._views_lock: asyncio.Lock = asyncio.Lock()
         self._restore_task: asyncio.Task | None = None
 
     async def _increment_stat(self, guild: discord.Guild, key: str, amount: int = 1) -> None:
@@ -324,9 +327,15 @@ class Honeypot(Cog):
 
     @tasks.loop(minutes=1)
     async def fake_activity_loop(self) -> None:
+        now = datetime.now(timezone.utc)
         for guild in self.bot.guilds:
             try:
-                config = await self.config.guild(guild).all()
+                cached = self._fake_config_cache.get(guild.id)
+                if cached and (now - cached[0]).total_seconds() < 120:
+                    config = cached[1]
+                else:
+                    config = await self.config.guild(guild).all()
+                    self._fake_config_cache[guild.id] = (now, config)
                 if not config["enabled"] or not config["fake_activity_enabled"]:
                     continue
                 honeypot_channel_id = config["honeypot_channel"]
@@ -336,7 +345,6 @@ class Honeypot(Cog):
                 if honeypot_channel is None:
                     continue
                 interval = config["fake_activity_interval"]
-                now = datetime.now(timezone.utc)
                 last = self._last_fake_message[guild.id]
                 if (now - last).total_seconds() < interval * 60:
                     continue
@@ -346,7 +354,7 @@ class Honeypot(Cog):
                 await honeypot_channel.send(msg)
                 self._last_fake_message[guild.id] = now
             except Exception:
-                pass
+                log.exception("Error in fake_activity_loop for guild %s", guild.id)
 
     @fake_activity_loop.before_loop
     async def before_fake_activity(self) -> None:
@@ -398,12 +406,14 @@ class Honeypot(Cog):
                     await self._expire_review(view)
                     continue
                 self.bot.add_view(view, message_id=int(review_message_id))
-                self._active_views[int(review_message_id)] = view
+                async with self._views_lock:
+                    self._active_views[int(review_message_id)] = view
 
     async def _expire_review(self, view: ReviewView) -> None:
         guild = self.bot.get_guild(view.guild_id)
         if guild is None:
-            self._active_views.pop(view.active_key or view.target_id, None)
+            async with self.cog._views_lock:
+                self.cog._active_views.pop(view.active_key or view.target_id, None)
             view.stop()
             return
         member = guild.get_member(view.target_id)
@@ -435,7 +445,8 @@ class Honeypot(Cog):
                 pass
         await self._increment_stat(guild, "review_expired")
         await self._increment_stat(guild, "ignored")
-        self._active_views.pop(view.active_key or view.target_id, None)
+        async with self._views_lock:
+            self._active_views.pop(view.active_key or view.target_id, None)
         await self._delete_pending_review(guild, view.active_key)
         view.stop()
 
@@ -458,19 +469,16 @@ class Honeypot(Cog):
         self, channel: discord.TextChannel | discord.Thread, author_id: int, minutes: int
     ) -> int:
         after = datetime.now(timezone.utc) - timedelta(minutes=minutes)
-        deleted = 0
         try:
-            async for msg in channel.history(limit=200, after=after):
-                if msg.author.id == author_id:
-                    try:
-                        await msg.delete()
-                        deleted += 1
-                        await asyncio.sleep(0.5)
-                    except (discord.HTTPException, discord.Forbidden):
-                        pass
+            deleted = await channel.purge(
+                limit=200,
+                after=after,
+                check=lambda m: m.author.id == author_id,
+                bulk=True,
+            )
+            return len(deleted)
         except (discord.HTTPException, discord.Forbidden):
-            pass
-        return deleted
+            return 0
 
     async def _execute_action(
         self, message: discord.Message, config: dict, reason: str, action: str | None = None
@@ -512,7 +520,7 @@ class Honeypot(Cog):
                 reason=reason,
             )
         except Exception:
-            pass
+            log.exception("Failed to create modlog case in _execute_action")
         label = _("The member has been kicked.") if action == "kick" else _("The member has been banned.")
         return (label, None)
 
@@ -575,7 +583,7 @@ class Honeypot(Cog):
                 f = await attachment.to_file()
                 review_files.append(f)
             except Exception:
-                pass
+                log.exception("Failed to download attachment for review")
         ping_content = None
         if ping_role_id := config.get("ping_role"):
             if ping_role := message.guild.get_role(ping_role_id):
@@ -590,7 +598,8 @@ class Honeypot(Cog):
         sent = await review_channel.send(**review_send_kwargs)
         view.review_message = sent
         view.active_key = sent.id
-        self._active_views[sent.id] = view
+        async with self._views_lock:
+            self._active_views[sent.id] = view
         await self._store_pending_review(message.guild, view, review_channel.id, sent.id)
         await self._increment_stat(message.guild, "reviewed")
         await logs_channel.send(
@@ -610,15 +619,11 @@ class Honeypot(Cog):
             return
         if message.author.bot:
             return
-        config = await self.config.guild(message.guild).all()
-        if (
-            not config["enabled"]
-            or (honeypot_channel_id := config["honeypot_channel"]) is None
-            or (logs_channel_id := config["logs_channel"]) is None
-            or (logs_channel := self._get_text_channel_or_thread(message.guild, logs_channel_id)) is None
-        ):
+        honeypot_channel_id = await self.config.guild(message.guild).honeypot_channel()
+        if honeypot_channel_id is None or message.channel.id != honeypot_channel_id:
             return
-        if message.channel.id != honeypot_channel_id:
+        config = await self.config.guild(message.guild).all()
+        if not config["enabled"] or (logs_channel_id := config["logs_channel"]) is None or (logs_channel := self._get_text_channel_or_thread(message.guild, logs_channel_id)) is None:
             return
         if (
             message.author.id in self.bot.owner_ids
