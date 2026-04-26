@@ -878,7 +878,7 @@ class Honeypot(Cog):
 
     @commands.guild_only()
     @commands.guildowner()
-    @commands.hybrid_group()
+    @commands.group()
     async def sethoneypot(self, ctx: commands.Context) -> None:
         """Set the honeypot settings. Only the server owner can use this command."""
 
