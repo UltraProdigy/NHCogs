@@ -1,0 +1,337 @@
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: Honeypot\n"
+"POT-Creation-Date: 2026-04-26 00:00+0200\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: redgettext\n"
+
+#: honeypot\honeypot.py:151
+#, docstring
+msgid ""
+"Create a channel at the top of the server to attract self bots/scammers and "
+"automatically handle them."
+msgstr ""
+
+# ─── Settings descriptions ────────────────────────────────────────────
+
+#: honeypot\honeypot.py:183
+msgid "Toggle the cog."
+msgstr ""
+
+#: honeypot\honeypot.py:187
+msgid "The action to take when a self bot/scammer is detected."
+msgstr ""
+
+#: honeypot\honeypot.py:190
+msgid "The channel to send the logs to."
+msgstr ""
+
+#: honeypot\honeypot.py:196
+msgid "The role to ping when a self bot/scammer is detected."
+msgstr ""
+
+#: honeypot\honeypot.py:200
+msgid "The mute role to assign, if the action is `mute`."
+msgstr ""
+
+#: honeypot\honeypot.py:203
+msgid "Number of days of messages to delete when banning."
+msgstr ""
+
+#: honeypot\honeypot.py:207
+msgid "Toggle purging recent messages from the user in the honeypot channel."
+msgstr ""
+
+#: honeypot\honeypot.py:210
+msgid "Minutes of message history to purge from the user."
+msgstr ""
+
+#: honeypot\honeypot.py:214
+msgid "Toggle fake activity in the honeypot channel to attract scammers."
+msgstr ""
+
+#: honeypot\honeypot.py:217
+msgid "Minutes between fake activity messages."
+msgstr ""
+
+#: honeypot\honeypot.py:221
+msgid "Toggle moderator review instead of instant action for suspicious messages."
+msgstr ""
+
+#: honeypot\honeypot.py:224
+msgid "The channel to send moderator review requests to."
+msgstr ""
+
+# ─── ReviewView ───────────────────────────────────────────────────────
+
+#: honeypot\honeypot.py:69
+msgid "Reviewed by:"
+msgstr ""
+
+#: honeypot\honeypot.py:74
+msgid "Action taken:"
+msgstr ""
+
+#: honeypot\honeypot.py:78
+msgid "✅ **Review completed**"
+msgstr ""
+
+#: honeypot\honeypot.py:84
+msgid "You need `Moderate Members` permission."
+msgstr ""
+
+#: honeypot\honeypot.py:87
+msgid "Guild not found."
+msgstr ""
+
+#: honeypot\honeypot.py:90
+msgid "User is no longer in the server."
+msgstr ""
+
+#: honeypot\honeypot.py:92
+msgid "Ignored (no action)"
+msgstr ""
+
+#: honeypot\honeypot.py:93
+msgid "Honeypot review: {action} by {mod}"
+msgstr ""
+
+#: honeypot\honeypot.py:97
+msgid "Kicked"
+msgstr ""
+
+#: honeypot\honeypot.py:101
+msgid "Banned"
+msgstr ""
+
+#: honeypot\honeypot.py:106
+msgid "Mute role is not configured."
+msgstr ""
+
+#: honeypot\honeypot.py:108
+msgid "Muted"
+msgstr ""
+
+#: honeypot\honeypot.py:110
+msgid "Failed to perform the action. Check bot permissions."
+msgstr ""
+
+# ─── on_message listener ──────────────────────────────────────────────
+
+#: honeypot\honeypot.py:360
+msgid "Honeypot — Self Bot/Scammer Detected!"
+msgstr ""
+
+#: honeypot\honeypot.py:361
+msgid "*(message with attachments only)*"
+msgstr ""
+
+#: honeypot\honeypot.py:372
+msgid "Attachments:"
+msgstr ""
+
+#: honeypot\honeypot.py:384
+msgid "Purged messages:"
+msgstr ""
+
+#: honeypot\honeypot.py:391
+msgid "Whitelisted role:"
+msgstr ""
+
+#: honeypot\honeypot.py:392
+msgid "User has a whitelisted role — no punishment applied."
+msgstr ""
+
+#: honeypot\honeypot.py:405
+msgid "Honeypot — Review Required"
+msgstr ""
+
+#: honeypot\honeypot.py:407
+msgid "Status:"
+msgstr ""
+
+#: honeypot\honeypot.py:408
+msgid "⏳ Pending moderator review"
+msgstr ""
+
+#: honeypot\honeypot.py:421
+msgid "🟡 **Review required** for {user} ({user_id}) — sent to {channel}."
+msgstr ""
+
+# auto-action
+#: honeypot\honeypot.py:442
+msgid "**Failed:** The mute role is not set or doesn't exist anymore."
+msgstr ""
+
+#: honeypot\honeypot.py:451
+msgid "**Failed:** An error occurred while trying to take action:\n"
+msgstr ""
+
+#: honeypot\honeypot.py:465
+msgid "Action:"
+msgstr ""
+
+#: honeypot\honeypot.py:468
+msgid "The member has been muted."
+msgstr ""
+
+#: honeypot\honeypot.py:471
+msgid "The member has been kicked."
+msgstr ""
+
+#: honeypot\honeypot.py:473
+msgid "The member has been banned."
+msgstr ""
+
+# ─── createchannel command ────────────────────────────────────────────
+
+#: honeypot\honeypot.py:503 (docstring)
+msgid "Create the honeypot channel."
+msgstr ""
+
+#: honeypot\honeypot.py:511
+msgid "The honeypot channel already exists: {channel.mention} ({channel.id})."
+msgstr ""
+
+#: honeypot\honeypot.py:532
+msgid "Honeypot channel creation requested by {author} ({author_id})."
+msgstr ""
+
+#: honeypot\honeypot.py:537
+msgid "⚠️ DO NOT POST HERE! ⚠️"
+msgstr ""
+
+#: honeypot\honeypot.py:538
+msgid "An action will be immediately taken against you if you send a message in this channel."
+msgstr ""
+
+#: honeypot\honeypot.py:542
+msgid "What not to do?"
+msgstr ""
+
+#: honeypot\honeypot.py:543
+msgid "Do not send any messages in this channel."
+msgstr ""
+
+#: honeypot\honeypot.py:547
+msgid "What WILL happen?"
+msgstr ""
+
+#: honeypot\honeypot.py:548
+msgid "An action will be taken against you."
+msgstr ""
+
+#: honeypot\honeypot.py:554
+msgid "## ⚠️ WARNING ⚠️"
+msgstr ""
+
+#: honeypot\honeypot.py:560
+msgid ""
+"The honeypot channel has been set to {channel.mention} ({channel.id}).\n"
+"Please configure the remaining settings (action, logs channel, etc.) before "
+"enabling."
+msgstr ""
+
+# ─── sethoneypot group docstring ─────────────────────────────────────
+
+#: honeypot\honeypot.py:498 (docstring)
+msgid "Set the honeypot settings. Only the server owner can use this command."
+msgstr ""
+
+# ─── Whitelisted roles commands ──────────────────────────────────────
+
+#: honeypot\honeypot.py:569 (docstring)
+msgid "Manage whitelisted roles that bypass punishment."
+msgstr ""
+
+#: honeypot\honeypot.py:573 (docstring)
+msgid "Add a role to the whitelist. Users with this role won't be punished."
+msgstr ""
+
+#: honeypot\honeypot.py:577
+msgid "That role is already whitelisted."
+msgstr ""
+
+#: honeypot\honeypot.py:579
+msgid "✅ {role} ({role_id}) added to the whitelist."
+msgstr ""
+
+#: honeypot\honeypot.py:582 (docstring)
+msgid "Remove a role from the whitelist."
+msgstr ""
+
+#: honeypot\honeypot.py:586
+msgid "That role is not in the whitelist."
+msgstr ""
+
+#: honeypot\honeypot.py:588
+msgid "✅ {role} removed from the whitelist."
+msgstr ""
+
+#: honeypot\honeypot.py:591 (docstring)
+msgid "List all whitelisted roles."
+msgstr ""
+
+#: honeypot\honeypot.py:595
+msgid "No roles are whitelisted."
+msgstr ""
+
+#: honeypot\honeypot.py:599
+msgid "No valid whitelisted roles found (they may have been deleted)."
+msgstr ""
+
+#: honeypot\honeypot.py:602
+msgid "**Whitelisted roles:**\n{lines}"
+msgstr ""
+
+# ─── Fake activity commands ───────────────────────────────────────────
+
+#: honeypot\honeypot.py:607 (docstring)
+msgid "Manage fake activity messages for the honeypot channel."
+msgstr ""
+
+#: honeypot\honeypot.py:611 (docstring)
+msgid "Add a custom fake activity message."
+msgstr ""
+
+#: honeypot\honeypot.py:615
+msgid "✅ Fake activity message added. ({num} total)"
+msgstr ""
+
+#: honeypot\honeypot.py:618 (docstring)
+msgid "Remove a fake activity message by its number (see list)."
+msgstr ""
+
+#: honeypot\honeypot.py:623
+msgid "Invalid index. Use `{prefix}sethoneypot fakeactivity list` to see valid indices."
+msgstr ""
+
+#: honeypot\honeypot.py:628
+msgid "✅ Removed message #{index}: {msg}"
+msgstr ""
+
+#: honeypot\honeypot.py:631 (docstring)
+msgid "List all custom fake activity messages."
+msgstr ""
+
+#: honeypot\honeypot.py:635
+msgid "No custom fake activity messages set. Defaults will be used."
+msgstr ""
+
+#: honeypot\honeypot.py:638
+msgid "**Custom fake activity messages:**\n{lines}"
+msgstr ""
+
+#: honeypot\honeypot.py:641 (docstring)
+msgid "Reset to default fake activity messages."
+msgstr ""
+
+#: honeypot\honeypot.py:644
+msgid "✅ Custom messages cleared. Defaults will be used."
+msgstr ""
