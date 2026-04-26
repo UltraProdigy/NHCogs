@@ -142,19 +142,19 @@ class ReviewView(discord.ui.View):
             return (_("Failed to perform the action. Check bot permissions."), None)
         return (None, None)
 
-    @discord.ui.button(label="Kick", style=discord.ButtonStyle.danger, emoji="🔨")
-    async def kick_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    @discord.ui.button(label="Ban", style=discord.ButtonStyle.danger, emoji="🔨")
+    async def ban_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
-        msg, label = await self._action_perform(interaction, "kick")
+        msg, label = await self._action_perform(interaction, "ban")
         if label:
             await self._update_done(interaction, label)
         if msg:
             await interaction.followup.send(msg, ephemeral=True)
 
-    @discord.ui.button(label="Ban", style=discord.ButtonStyle.danger, emoji="⛔")
-    async def ban_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    @discord.ui.button(label="Kick", style=discord.ButtonStyle.secondary, emoji="👢")
+    async def kick_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
-        msg, label = await self._action_perform(interaction, "ban")
+        msg, label = await self._action_perform(interaction, "kick")
         if label:
             await self._update_done(interaction, label)
         if msg:
