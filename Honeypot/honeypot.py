@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import discord
 from discord.ext import tasks
 
-from AAA3A_utils import Cog, Settings
+from AAA3A_utils import Cog
 from redbot.core import Config, commands, modlog
 from redbot.core.bot import Red
 from redbot.core.i18n import Translator, cog_i18n
@@ -245,97 +245,6 @@ class Honeypot(Cog):
             scam_keywords=SCAM_KEYWORDS.copy(),
         )
 
-        _settings: dict[str, dict[str, typing.Any]] = {
-            "enabled": {
-                "converter": bool,
-                "description": "Toggle the cog.",
-            },
-            "action": {
-                "converter": typing.Literal["kick", "ban"],
-                "description": "The action to take when a clearly suspicious user is detected.",
-            },
-            "fallback_action": {
-                "converter": typing.Literal["review", "kick", "ban", "none"],
-                "description": "What to do when a honeypot post is not clearly suspicious.",
-            },
-            "dry_run": {
-                "converter": bool,
-                "description": "Log what would happen without kicking or banning users.",
-            },
-            "honeypot_channel": {
-                "converter": typing.Union[
-                    discord.TextChannel,
-                    discord.Thread,
-                ],
-                "description": "The honeypot channel where messages trigger detection.",
-            },
-            "logs_channel": {
-                "converter": typing.Union[
-                    discord.TextChannel,
-                    discord.Thread,
-                ],
-                "description": "The channel to send the logs to.",
-            },
-            "ping_role": {
-                "converter": discord.Role,
-                "description": "The role to ping when the trap channel is triggered.",
-            },
-            "mute_role": {
-                "converter": discord.Role,
-                "description": "The temporary containment role to assign while a user is waiting for review.",
-            },
-            "ban_delete_message_days": {
-                "converter": commands.Range[int, 0, 7],
-                "description": "Number of days of messages to delete when banning.",
-            },
-            "purge_enabled": {
-                "converter": bool,
-                "description": "Toggle purging recent messages from the user in the honeypot channel.",
-            },
-            "purge_minutes": {
-                "converter": commands.Range[int, 1, 60],
-                "description": "Minutes of message history to purge from the user.",
-            },
-            "fake_activity_enabled": {
-                "converter": bool,
-                "description": "Toggle warning messages in the trap channel.",
-            },
-            "fake_activity_interval": {
-                "converter": commands.Range[int, 1, 120],
-                "description": "Minutes between fake activity messages.",
-            },
-            "review_enabled": {
-                "converter": bool,
-                "description": "Send non-obvious cases to staff before taking action.",
-            },
-            "review_channel": {
-                "converter": typing.Union[
-                    discord.TextChannel,
-                    discord.Thread,
-                ],
-                "description": "The channel to send review requests to.",
-            },
-            "review_timeout_minutes": {
-                "converter": commands.Range[int, 1, 10080],
-                "description": "Minutes before pending review expires and temporary mute is removed.",
-            },
-            "whitelist_mode": {
-                "converter": typing.Literal["bypass", "review", "none"],
-                "description": "How whitelisted roles behave: bypass punishment, force review, or no special treatment.",
-            },
-        }
-        self.settings: Settings = Settings(
-            bot=self.bot,
-            cog=self,
-            config=self.config,
-            group=self.config.GUILD,
-            settings=_settings,
-            global_path=[],
-            use_profiles_system=False,
-            can_edit=True,
-            commands_group=self.sethoneypot,
-        )
-
         self._last_fake_message: dict[int, datetime] = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
         self._active_views: dict[int, ReviewView] = {}
         self._restore_task: asyncio.Task | None = None
@@ -400,7 +309,6 @@ class Honeypot(Cog):
 
     async def cog_load(self) -> None:
         await super().cog_load()
-        await self.settings.add_commands()
         self.fake_activity_loop.start()
         self.review_timeout_loop.start()
         self._restore_task = asyncio.create_task(self._restore_pending_reviews())
@@ -877,14 +785,82 @@ class Honeypot(Cog):
     # ─── Commands ─────────────────────────────────────────────────────────
 
     @commands.guild_only()
-    @commands.guildowner()
-    @commands.hybrid_group()
-    async def sethoneypot(self, ctx: commands.Context) -> None:
-        """Set the honeypot settings. Only the server owner can use this command."""
+    @commands.check(lambda ctx: ctx.author.id == ctx.guild.owner_id or ctx.author.id in ctx.bot.owner_ids)
+    @commands.group()
+    async def honeypot(self, ctx: commands.Context) -> None:
+        """Configure the honeypot system."""
+
+    # ─── core sub-group ───────────────────────────────────────────────
+
+    @honeypot.group()
+    async def core(self, ctx: commands.Context) -> None:
+        """Core settings: enabled, action, fallback, dry run."""
+
+    @core.command()
+    async def enabled(self, ctx: commands.Context, value: bool = None) -> None:
+        """Toggle the cog on/off."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).enabled()
+            await ctx.send(_("Enabled: {value}").format(value=v))
+        else:
+            await self.config.guild(ctx.guild).enabled.set(value)
+            await ctx.send(_("✅ Enabled set to {value}").format(value=value))
+
+    @core.command()
+    async def action(self, ctx: commands.Context, value: str = None) -> None:
+        """Action to take for suspicious users: kick or ban."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).action()
+            await ctx.send(_("Action: {value}").format(value=v or _("not set")))
+        elif value not in ("kick", "ban"):
+            await ctx.send(_("Action must be `kick` or `ban`."))
+        else:
+            await self.config.guild(ctx.guild).action.set(value)
+            await ctx.send(_("✅ Action set to {value}").format(value=value))
+
+    @core.command(name="fallback_action")
+    async def fallback_action(self, ctx: commands.Context, value: str = None) -> None:
+        """Fallback: review, kick, ban, or none."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).fallback_action()
+            await ctx.send(_("Fallback action: {value}").format(value=v))
+        elif value not in ("review", "kick", "ban", "none"):
+            await ctx.send(_("Must be `review`, `kick`, `ban`, or `none`."))
+        else:
+            await self.config.guild(ctx.guild).fallback_action.set(value)
+            await ctx.send(_("✅ Fallback action set to {value}").format(value=value))
+
+    @core.command(name="dry_run")
+    async def dry_run(self, ctx: commands.Context, value: bool = None) -> None:
+        """Log actions without actually punishing users."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).dry_run()
+            await ctx.send(_("Dry run: {value}").format(value=v))
+        else:
+            await self.config.guild(ctx.guild).dry_run.set(value)
+            await ctx.send(_("✅ Dry run set to {value}").format(value=value))
+
+    @core.command(name="whitelist_mode")
+    async def whitelist_mode(self, ctx: commands.Context, value: str = None) -> None:
+        """How whitelisted roles behave: bypass, review, or none."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).whitelist_mode()
+            await ctx.send(_("Whitelist mode: {value}").format(value=v))
+        elif value not in ("bypass", "review", "none"):
+            await ctx.send(_("Must be `bypass`, `review`, or `none`."))
+        else:
+            await self.config.guild(ctx.guild).whitelist_mode.set(value)
+            await ctx.send(_("✅ Whitelist mode set to {value}").format(value=value))
+
+    # ─── channel sub-group ────────────────────────────────────────────
+
+    @honeypot.group()
+    async def channel(self, ctx: commands.Context) -> None:
+        """Honeypot channel, logs channel, ping role."""
 
     @commands.bot_has_guild_permissions(manage_channels=True)
-    @sethoneypot.command(aliases=["makechannel"])
-    async def createchannel(self, ctx: commands.Context) -> None:
+    @channel.command()
+    async def create(self, ctx: commands.Context) -> None:
         """Create the honeypot channel."""
         if (
             honeypot_channel_id := await self.config.guild(ctx.guild).honeypot_channel()
@@ -892,118 +868,226 @@ class Honeypot(Cog):
             honeypot_channel := ctx.guild.get_channel(honeypot_channel_id)
         ) is not None:
             raise commands.UserFeedbackCheckFailure(
-                _("The honeypot channel already exists: {channel.mention} ({channel.id}).").format(
-                    channel=honeypot_channel,
-                ),
+                _("Already exists: {channel.mention} ({channel.id}).").format(channel=honeypot_channel),
             )
         honeypot_channel = await ctx.guild.create_text_channel(
             name="honeypot",
             position=0,
             overwrites={
                 ctx.guild.me: discord.PermissionOverwrite(
-                    view_channel=True,
-                    read_messages=True,
-                    send_messages=True,
-                    manage_messages=True,
-                    manage_channels=True,
+                    view_channel=True, read_messages=True, send_messages=True,
+                    manage_messages=True, manage_channels=True,
                 ),
                 ctx.guild.default_role: discord.PermissionOverwrite(
-                    view_channel=True,
-                    read_messages=True,
-                    send_messages=True,
+                    view_channel=True, read_messages=True, send_messages=True,
                 ),
             },
-            reason=_("Honeypot channel creation requested by {author} ({author_id}).").format(
-                author=ctx.author.display_name, author_id=ctx.author.id,
-            ),
+            reason=_("Honeypot channel requested by {author}.").format(author=ctx.author),
         )
         await self.config.guild(ctx.guild).honeypot_channel.set(honeypot_channel.id)
-        await ctx.send(
-            _(
-                "The honeypot channel has been set to {channel.mention} ({channel.id}).\n"
-                "Please configure the remaining settings (action, logs channel, etc.) before enabling."
-            ).format(channel=honeypot_channel),
-        )
+        await ctx.send(_("✅ Honeypot channel: {channel.mention}").format(channel=honeypot_channel))
 
-    @sethoneypot.command(name="stats")
-    async def honeypot_stats(self, ctx: commands.Context) -> None:
-        """Show honeypot moderation statistics for this server."""
-        stats = DEFAULT_STATS.copy()
-        stats.update(await self.config.guild(ctx.guild).stats())
-        lines = [f"{key}: {value}" for key, value in stats.items()]
-        await ctx.send(_("**Honeypot stats:**\n") + box("\n".join(lines)))
+    @channel.command(name="set")
+    async def channel_set(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread) -> None:
+        """Set an existing channel as the honeypot."""
+        await self.config.guild(ctx.guild).honeypot_channel.set(target.id)
+        await ctx.send(_("✅ Honeypot channel set to {channel.mention}").format(channel=target))
 
-    @sethoneypot.command(name="resetstats")
-    async def honeypot_reset_stats(self, ctx: commands.Context) -> None:
-        """Reset honeypot moderation statistics for this server."""
-        await self.config.guild(ctx.guild).stats.set(DEFAULT_STATS.copy())
-        await ctx.send(_("✅ Honeypot stats reset."))
+    @channel.command()
+    async def logs(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread = None) -> None:
+        """Set the logs channel."""
+        if target is None:
+            v = await self.config.guild(ctx.guild).logs_channel()
+            await ctx.send(_("Logs channel: {channel}").format(channel=ctx.guild.get_channel(v) if v else _("not set")))
+        else:
+            await self.config.guild(ctx.guild).logs_channel.set(target.id)
+            await ctx.send(_("✅ Logs channel set to {channel.mention}").format(channel=target))
 
-    @sethoneypot.command(name="doctor")
-    async def honeypot_doctor(self, ctx: commands.Context) -> None:
-        """Check common honeypot configuration and permission problems."""
-        config = await self.config.guild(ctx.guild).all()
-        checks: list[tuple[str, bool, str]] = []
-        me = ctx.guild.me
-        honeypot_channel = self._get_text_channel_or_thread(ctx.guild, config.get("honeypot_channel"))
-        logs_channel = self._get_text_channel_or_thread(ctx.guild, config.get("logs_channel"))
-        review_channel = self._get_text_channel_or_thread(ctx.guild, config.get("review_channel"))
-        checks.append(("Cog enabled", bool(config.get("enabled")), "Run `sethoneypot enabled true`."))
-        checks.append(("Suspicious action set", config.get("action") in ("kick", "ban"), "Set `action` to `kick` or `ban`."))
-        checks.append(("Honeypot channel exists", honeypot_channel is not None, "Set `honeypotchannel`."))
-        checks.append(("Logs channel exists", logs_channel is not None, "Set `logschannel`."))
-        if config.get("fallback_action") == "review" or config.get("review_enabled") or config.get("whitelist_mode") == "review":
-            checks.append(("Review channel exists", review_channel is not None, "Set `reviewchannel` or change `fallbackaction`."))
-        if config.get("mute_role"):
-            mute_role = ctx.guild.get_role(config["mute_role"])
-            checks.append(("Mute role exists", mute_role is not None, "Set `muterole` again."))
-            if mute_role is not None:
-                checks.append(("Bot is above mute role", me.top_role > mute_role, "Move the bot role above the mute role."))
-        if honeypot_channel is not None:
-            perms = honeypot_channel.permissions_for(me)
-            checks.append(("Can view honeypot", perms.view_channel, "Grant View Channel."))
-            checks.append(("Can read history", perms.read_message_history, "Grant Read Message History."))
-            checks.append(("Can manage messages", perms.manage_messages, "Grant Manage Messages."))
-        if logs_channel is not None:
-            perms = logs_channel.permissions_for(me)
-            checks.append(("Can send logs", perms.send_messages, "Grant Send Messages in logs channel."))
-        if review_channel is not None:
-            perms = review_channel.permissions_for(me)
-            checks.append(("Can send review", perms.send_messages, "Grant Send Messages in review channel."))
-        guild_perms = me.guild_permissions
-        checks.append(("Can kick members", guild_perms.kick_members, "Grant Kick Members if using kick."))
-        checks.append(("Can ban members", guild_perms.ban_members, "Grant Ban Members if using ban."))
-        checks.append(("Can manage roles", guild_perms.manage_roles, "Grant Manage Roles for review mute."))
-        failed = [f"❌ {name} - {hint}" for name, ok, hint in checks if not ok]
-        passed = [f"✅ {name}" for name, ok, _hint in checks if ok]
-        body = "\n".join(passed + failed)
-        await ctx.send(_("**Honeypot doctor:**\n{body}").format(body=body))
+    @channel.command(name="ping_role")
+    async def channel_ping_role(self, ctx: commands.Context, role: discord.Role = None) -> None:
+        """Role to ping on detection."""
+        if role is None:
+            v = await self.config.guild(ctx.guild).ping_role()
+            role = ctx.guild.get_role(v) if v else None
+            await ctx.send(_("Ping role: {role}").format(role=role.mention if role else _("not set")))
+        else:
+            await self.config.guild(ctx.guild).ping_role.set(role.id)
+            await ctx.send(_("✅ Ping role set to {role.mention}").format(role=role))
 
-    # ─── Extras Group ──────────────────────────────────────────────────────
+    # ─── punishment sub-group ─────────────────────────────────────────
 
-    @commands.guild_only()
-    @commands.guildowner()
-    @commands.hybrid_group()
-    async def honeypotextras(self, ctx: commands.Context) -> None:
-        """Additional honeypot settings: whitelisted roles, scam keywords, fake activity messages."""
+    @honeypot.group()
+    async def punishment(self, ctx: commands.Context) -> None:
+        """Mute role, delete days on ban."""
 
-    # ─── Whitelisted Roles ────────────────────────────────────────────────
+    @punishment.command(name="mute_role")
+    async def punishment_mute_role(self, ctx: commands.Context, role: discord.Role = None) -> None:
+        """Temporary mute role for users awaiting review."""
+        if role is None:
+            v = await self.config.guild(ctx.guild).mute_role()
+            r = ctx.guild.get_role(v) if v else None
+            await ctx.send(_("Mute role: {role}").format(role=r.mention if r else _("not set")))
+        else:
+            await self.config.guild(ctx.guild).mute_role.set(role.id)
+            await ctx.send(_("✅ Mute role set to {role.mention}").format(role=role))
 
-    @honeypotextras.group(name="whitelistedroles", aliases=["wlroles"])
-    async def whitelisted_roles_group(self, ctx: commands.Context) -> None:
+    @punishment.command(name="delete_days")
+    async def punishment_delete_days(self, ctx: commands.Context, days: int = None) -> None:
+        """Days of messages to delete on ban (0-7)."""
+        if days is None:
+            v = await self.config.guild(ctx.guild).ban_delete_message_days()
+            await ctx.send(_("Delete days: {value}").format(value=v))
+        elif days < 0 or days > 7:
+            await ctx.send(_("Days must be between 0 and 7."))
+        else:
+            await self.config.guild(ctx.guild).ban_delete_message_days.set(days)
+            await ctx.send(_("✅ Delete days set to {value}").format(value=days))
+
+    # ─── purge sub-group ──────────────────────────────────────────────
+
+    @honeypot.group()
+    async def purge(self, ctx: commands.Context) -> None:
+        """Auto-purge recent messages from caught users."""
+
+    @purge.command()
+    async def enabled(self, ctx: commands.Context, value: bool = None) -> None:
+        """Toggle purging on detection."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).purge_enabled()
+            await ctx.send(_("Purge enabled: {value}").format(value=v))
+        else:
+            await self.config.guild(ctx.guild).purge_enabled.set(value)
+            await ctx.send(_("✅ Purge enabled set to {value}").format(value=value))
+
+    @purge.command()
+    async def minutes(self, ctx: commands.Context, value: int = None) -> None:
+        """Minutes of history to purge (1-60)."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).purge_minutes()
+            await ctx.send(_("Purge minutes: {value}").format(value=v))
+        elif value < 1 or value > 60:
+            await ctx.send(_("Minutes must be between 1 and 60."))
+        else:
+            await self.config.guild(ctx.guild).purge_minutes.set(value)
+            await ctx.send(_("✅ Purge minutes set to {value}").format(value=value))
+
+    # ─── fakeactivity sub-group ───────────────────────────────────────
+
+    @honeypot.group()
+    async def fakeactivity(self, ctx: commands.Context) -> None:
+        """Fake activity to lure scammers."""
+
+    @fakeactivity.command()
+    async def enabled(self, ctx: commands.Context, value: bool = None) -> None:
+        """Toggle fake activity messages."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).fake_activity_enabled()
+            await ctx.send(_("Fake activity enabled: {value}").format(value=v))
+        else:
+            await self.config.guild(ctx.guild).fake_activity_enabled.set(value)
+            await ctx.send(_("✅ Fake activity enabled set to {value}").format(value=value))
+
+    @fakeactivity.command()
+    async def interval(self, ctx: commands.Context, value: int = None) -> None:
+        """Minutes between fake messages (1-120)."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).fake_activity_interval()
+            await ctx.send(_("Fake activity interval: {value} min").format(value=v))
+        elif value < 1 or value > 120:
+            await ctx.send(_("Interval must be between 1 and 120."))
+        else:
+            await self.config.guild(ctx.guild).fake_activity_interval.set(value)
+            await ctx.send(_("✅ Interval set to {value} minutes").format(value=value))
+
+    @fakeactivity.command(name="add")
+    async def fakeactivity_add(self, ctx: commands.Context, *, message: str) -> None:
+        """Add a custom fake activity message."""
+        async with self.config.guild(ctx.guild).fake_activity_messages() as msgs:
+            msgs.append(message)
+        await ctx.send(_("✅ Message added. ({num} total)").format(num=len(msgs)))
+
+    @fakeactivity.command(name="remove")
+    async def fakeactivity_remove(self, ctx: commands.Context, index: int) -> None:
+        """Remove a fake message by index (see list)."""
+        async with self.config.guild(ctx.guild).fake_activity_messages() as msgs:
+            if index < 1 or index > len(msgs):
+                raise commands.UserFeedbackCheckFailure(
+                    _("Invalid index. Use `{prefix}honeypot fakeactivity list` to see indices.").format(prefix=ctx.clean_prefix),
+                )
+            removed = msgs.pop(index - 1)
+        await ctx.send(_("✅ Removed #{index}: {msg}").format(index=index, msg=removed))
+
+    @fakeactivity.command(name="list")
+    async def fakeactivity_list(self, ctx: commands.Context) -> None:
+        """List custom fake activity messages."""
+        msgs = await self.config.guild(ctx.guild).fake_activity_messages()
+        if not msgs:
+            await ctx.send(_("No custom messages. Defaults will be used."))
+            return
+        lines = "\n".join(f"`{i}.` {m}" for i, m in enumerate(msgs, 1))
+        await ctx.send(_("**Fake activity messages:**\n{lines}").format(lines=lines))
+
+    @fakeactivity.command(name="reset")
+    async def fakeactivity_reset(self, ctx: commands.Context) -> None:
+        """Reset to defaults."""
+        await self.config.guild(ctx.guild).fake_activity_messages.set([])
+        await ctx.send(_("✅ Reset to defaults."))
+
+    # ─── review sub-group ─────────────────────────────────────────────
+
+    @honeypot.group()
+    async def review(self, ctx: commands.Context) -> None:
+        """Moderator review for non-obvious cases."""
+
+    @review.command()
+    async def enabled(self, ctx: commands.Context, value: bool = None) -> None:
+        """Toggle moderator review."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).review_enabled()
+            await ctx.send(_("Review enabled: {value}").format(value=v))
+        else:
+            await self.config.guild(ctx.guild).review_enabled.set(value)
+            await ctx.send(_("✅ Review enabled set to {value}").format(value=value))
+
+    @review.command(name="channel")
+    async def review_channel(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread = None) -> None:
+        """Channel for review requests."""
+        if target is None:
+            v = await self.config.guild(ctx.guild).review_channel()
+            await ctx.send(_("Review channel: {channel}").format(channel=ctx.guild.get_channel(v) if v else _("not set")))
+        else:
+            await self.config.guild(ctx.guild).review_channel.set(target.id)
+            await ctx.send(_("✅ Review channel set to {channel.mention}").format(channel=target))
+
+    @review.command()
+    async def timeout(self, ctx: commands.Context, minutes: int = None) -> None:
+        """Minutes before review expires and mute is removed (1-10080)."""
+        if minutes is None:
+            v = await self.config.guild(ctx.guild).review_timeout_minutes()
+            await ctx.send(_("Review timeout: {value} minutes").format(value=v))
+        elif minutes < 1 or minutes > 10080:
+            await ctx.send(_("Timeout must be between 1 and 10080 minutes."))
+        else:
+            await self.config.guild(ctx.guild).review_timeout_minutes.set(minutes)
+            await ctx.send(_("✅ Review timeout set to {value} minutes").format(value=minutes))
+
+    # ─── roles sub-group (was whitelistedroles) ───────────────────────
+
+    @honeypot.group()
+    async def roles(self, ctx: commands.Context) -> None:
         """Manage whitelisted roles that bypass punishment."""
 
-    @whitelisted_roles_group.command(name="add")
-    async def whitelisted_roles_add(self, ctx: commands.Context, role: discord.Role) -> None:
-        """Add a role to the whitelist. Users with this role won't be punished."""
+    @roles.command(name="add")
+    async def roles_add(self, ctx: commands.Context, role: discord.Role) -> None:
+        """Add a role to the whitelist."""
         async with self.config.guild(ctx.guild).whitelisted_roles() as roles:
             if role.id in roles:
                 raise commands.UserFeedbackCheckFailure(_("That role is already whitelisted."))
             roles.append(role.id)
-        await ctx.send(_("✅ {role} ({role_id}) added to the whitelist.").format(role=role.mention, role_id=role.id))
+        await ctx.send(_("✅ {role} added to the whitelist.").format(role=role.mention))
 
-    @whitelisted_roles_group.command(name="remove")
-    async def whitelisted_roles_remove(self, ctx: commands.Context, role: discord.Role) -> None:
+    @roles.command(name="remove")
+    async def roles_remove(self, ctx: commands.Context, role: discord.Role) -> None:
         """Remove a role from the whitelist."""
         async with self.config.guild(ctx.guild).whitelisted_roles() as roles:
             if role.id not in roles:
@@ -1011,105 +1095,115 @@ class Honeypot(Cog):
             roles.remove(role.id)
         await ctx.send(_("✅ {role} removed from the whitelist.").format(role=role.mention))
 
-    @whitelisted_roles_group.command(name="list")
-    async def whitelisted_roles_list(self, ctx: commands.Context) -> None:
-        """List all whitelisted roles."""
+    @roles.command(name="list")
+    async def roles_list(self, ctx: commands.Context) -> None:
+        """List whitelisted roles."""
         role_ids = await self.config.guild(ctx.guild).whitelisted_roles()
         if not role_ids:
-            await ctx.send(_("No roles are whitelisted."))
+            await ctx.send(_("No whitelisted roles."))
             return
         roles = [ctx.guild.get_role(rid) for rid in role_ids if ctx.guild.get_role(rid) is not None]
         if not roles:
-            await ctx.send(_("No valid whitelisted roles found (they may have been deleted)."))
+            await ctx.send(_("No valid roles found (deleted?)."))
             return
-        lines = "\n".join(f"- {r.mention} ({r.id})" for r in roles)
-        await ctx.send(_("**Whitelisted roles:**\n{lines}").format(lines=lines))
+        await ctx.send(_("**Whitelisted roles:**\n{lines}").format(lines="\n".join(f"- {r.mention}" for r in roles)))
 
-    # ─── Scam Keywords ────────────────────────────────────────────────────
+    # ─── keywords sub-group (was scamkeywords) ────────────────────────
 
-    @honeypotextras.group(name="scamkeywords", aliases=["keywords"])
-    async def scam_keywords_group(self, ctx: commands.Context) -> None:
-        """Manage scam keywords used by suspicious-message detection."""
+    @honeypot.group()
+    async def keywords(self, ctx: commands.Context) -> None:
+        """Manage scam keywords for suspicious-message detection."""
 
-    @scam_keywords_group.command(name="add")
-    async def scam_keywords_add(self, ctx: commands.Context, *, keyword: str) -> None:
-        """Add a scam keyword or phrase."""
+    @keywords.command(name="add")
+    async def keywords_add(self, ctx: commands.Context, *, keyword: str) -> None:
+        """Add a scam keyword."""
         keyword = keyword.strip().lower()
         if not keyword:
             raise commands.UserFeedbackCheckFailure(_("Keyword cannot be empty."))
         async with self.config.guild(ctx.guild).scam_keywords() as keywords:
-            normalized = [kw.lower() for kw in keywords]
-            if keyword in normalized:
-                raise commands.UserFeedbackCheckFailure(_("That keyword already exists."))
+            if keyword in [kw.lower() for kw in keywords]:
+                raise commands.UserFeedbackCheckFailure(_("Keyword already exists."))
             keywords.append(keyword)
-        await ctx.send(_("✅ Scam keyword added: `{keyword}`").format(keyword=keyword))
+        await ctx.send(_("✅ Keyword added: `{keyword}`").format(keyword=keyword))
 
-    @scam_keywords_group.command(name="remove")
-    async def scam_keywords_remove(self, ctx: commands.Context, *, keyword: str) -> None:
-        """Remove a scam keyword or phrase."""
+    @keywords.command(name="remove")
+    async def keywords_remove(self, ctx: commands.Context, *, keyword: str) -> None:
+        """Remove a scam keyword."""
         keyword = keyword.strip().lower()
         async with self.config.guild(ctx.guild).scam_keywords() as keywords:
             for existing in list(keywords):
                 if existing.lower() == keyword:
                     keywords.remove(existing)
-                    await ctx.send(_("✅ Scam keyword removed: `{keyword}`").format(keyword=existing))
+                    await ctx.send(_("✅ Keyword removed: `{keyword}`").format(keyword=existing))
                     return
-        raise commands.UserFeedbackCheckFailure(_("That keyword is not configured."))
+        raise commands.UserFeedbackCheckFailure(_("Keyword not found."))
 
-    @scam_keywords_group.command(name="list")
-    async def scam_keywords_list(self, ctx: commands.Context) -> None:
-        """List configured scam keywords."""
+    @keywords.command(name="list")
+    async def keywords_list(self, ctx: commands.Context) -> None:
+        """List scam keywords."""
         keywords = await self.config.guild(ctx.guild).scam_keywords()
         if not keywords:
-            await ctx.send(_("No scam keywords are configured."))
+            await ctx.send(_("No keywords configured."))
             return
-        lines = "\n".join(f"`{i}.` {keyword}" for i, keyword in enumerate(keywords, 1))
-        await ctx.send(_("**Scam keywords:**\n{lines}").format(lines=lines))
+        await ctx.send(_("**Scam keywords:**\n{lines}").format(lines="\n".join(f"`{i}.` {kw}" for i, kw in enumerate(keywords, 1))))
 
-    @scam_keywords_group.command(name="reset")
-    async def scam_keywords_reset(self, ctx: commands.Context) -> None:
-        """Reset scam keywords to defaults."""
+    @keywords.command(name="reset")
+    async def keywords_reset(self, ctx: commands.Context) -> None:
+        """Reset keywords to defaults."""
         await self.config.guild(ctx.guild).scam_keywords.set(SCAM_KEYWORDS.copy())
-        await ctx.send(_("✅ Scam keywords reset to defaults."))
+        await ctx.send(_("✅ Keywords reset to defaults."))
 
-    # ─── Fake Activity Messages ───────────────────────────────────────────
+    # ─── stats ────────────────────────────────────────────────────────
 
-    @honeypotextras.group(name="fakeactivity", aliases=["fakemsg"])
-    async def fake_activity_group(self, ctx: commands.Context) -> None:
-        """Manage fake activity messages for the honeypot channel."""
+    @honeypot.command(name="stats")
+    async def honeypot_stats(self, ctx: commands.Context) -> None:
+        """Show honeypot statistics."""
+        stats = DEFAULT_STATS.copy()
+        stats.update(await self.config.guild(ctx.guild).stats())
+        lines = [f"{key}: {value}" for key, value in stats.items()]
+        await ctx.send(_("**Honeypot stats:**\n") + box("\n".join(lines)))
 
-    @fake_activity_group.command(name="add")
-    async def fake_activity_add(self, ctx: commands.Context, *, message: str) -> None:
-        """Add a custom fake activity message."""
-        async with self.config.guild(ctx.guild).fake_activity_messages() as msgs:
-            msgs.append(message)
-        await ctx.send(_("✅ Fake activity message added. ({num} total)").format(num=len(msgs)))
+    @honeypot.command(name="resetstats")
+    async def honeypot_reset_stats(self, ctx: commands.Context) -> None:
+        """Reset statistics."""
+        await self.config.guild(ctx.guild).stats.set(DEFAULT_STATS.copy())
+        await ctx.send(_("✅ Stats reset."))
 
-    @fake_activity_group.command(name="remove")
-    async def fake_activity_remove(self, ctx: commands.Context, index: int) -> None:
-        """Remove a fake activity message by its number (see list)."""
-        async with self.config.guild(ctx.guild).fake_activity_messages() as msgs:
-            if index < 1 or index > len(msgs):
-                raise commands.UserFeedbackCheckFailure(
-                    _("Invalid index. Use `{prefix}sethoneypot fakeactivity list` to see valid indices.").format(
-                        prefix=ctx.clean_prefix,
-                    ),
-                )
-            removed = msgs.pop(index - 1)
-        await ctx.send(_("✅ Removed message #{index}: {msg}").format(index=index, msg=removed))
-
-    @fake_activity_group.command(name="list")
-    async def fake_activity_list(self, ctx: commands.Context) -> None:
-        """List all custom fake activity messages."""
-        msgs = await self.config.guild(ctx.guild).fake_activity_messages()
-        if not msgs:
-            await ctx.send(_("No custom fake activity messages set. Defaults will be used."))
-            return
-        lines = "\n".join(f"`{i}.` {m}" for i, m in enumerate(msgs, 1))
-        await ctx.send(_("**Custom fake activity messages:**\n{lines}").format(lines=lines))
-
-    @fake_activity_group.command(name="reset")
-    async def fake_activity_reset(self, ctx: commands.Context) -> None:
-        """Reset to default fake activity messages."""
-        await self.config.guild(ctx.guild).fake_activity_messages.set([])
-        await ctx.send(_("✅ Custom messages cleared. Defaults will be used."))
+    @honeypot.command(name="doctor")
+    async def honeypot_doctor(self, ctx: commands.Context) -> None:
+        """Check configuration and permissions."""
+        config = await self.config.guild(ctx.guild).all()
+        checks: list[tuple[str, bool, str]] = []
+        me = ctx.guild.me
+        honeypot_channel = self._get_text_channel_or_thread(ctx.guild, config.get("honeypot_channel"))
+        logs_channel = self._get_text_channel_or_thread(ctx.guild, config.get("logs_channel"))
+        review_channel = self._get_text_channel_or_thread(ctx.guild, config.get("review_channel"))
+        checks.append(("Cog enabled", bool(config.get("enabled")), "Run `honeypot core enabled true`."))
+        checks.append(("Suspicious action set", config.get("action") in ("kick", "ban"), "Run `honeypot core action`."))
+        checks.append(("Honeypot channel exists", honeypot_channel is not None, "Run `honeypot channel set`."))
+        checks.append(("Logs channel exists", logs_channel is not None, "Run `honeypot channel logs`."))
+        if config.get("fallback_action") == "review" or config.get("review_enabled") or config.get("whitelist_mode") == "review":
+            checks.append(("Review channel exists", review_channel is not None, "Run `honeypot review channel`."))
+        if config.get("mute_role"):
+            mute_role = ctx.guild.get_role(config["mute_role"])
+            checks.append(("Mute role exists", mute_role is not None, "Set `muterole` again."))
+            if mute_role is not None:
+                checks.append(("Bot above mute role", me.top_role > mute_role, "Move bot role above mute role."))
+        if honeypot_channel is not None:
+            perms = honeypot_channel.permissions_for(me)
+            checks.append(("Can view", perms.view_channel, "Grant View Channel."))
+            checks.append(("Can read history", perms.read_message_history, "Grant Read Message History."))
+            checks.append(("Can manage messages", perms.manage_messages, "Grant Manage Messages."))
+        if logs_channel is not None:
+            perms = logs_channel.permissions_for(me)
+            checks.append(("Can send logs", perms.send_messages, "Grant Send Messages."))
+        if review_channel is not None:
+            perms = review_channel.permissions_for(me)
+            checks.append(("Can send review", perms.send_messages, "Grant Send Messages."))
+        guild_perms = me.guild_permissions
+        checks.append(("Can kick members", guild_perms.kick_members, "Grant Kick Members."))
+        checks.append(("Can ban members", guild_perms.ban_members, "Grant Ban Members."))
+        checks.append(("Can manage roles", guild_perms.manage_roles, "Grant Manage Roles for mute."))
+        failed = [f"❌ {name} - {hint}" for name, ok, hint in checks if not ok]
+        passed = [f"✅ {name}" for name, ok, _hint in checks if ok]
+        await ctx.send(_("**Honeypot doctor:**\n{body}").format(body="\n".join(passed + failed)))
