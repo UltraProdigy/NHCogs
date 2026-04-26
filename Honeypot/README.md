@@ -5,7 +5,7 @@ Honeypot is a Red-DiscordBot cog that creates a visible trap channel for self-bo
 ## Main Features
 
 - Creates a dedicated `#honeypot` channel at the top of the server.
-- Detects suspicious posts using links, scam keywords, new-account age, and attachments from newer accounts.
+- Detects suspicious posts using scam keywords, new-account age, and attachments from newer accounts.
 - Supports automatic `kick` or `ban` actions.
 - Supports dry-run mode for safe production testing.
 - Supports separate handling for suspicious and non-suspicious honeypot posts.
@@ -14,11 +14,12 @@ Honeypot is a Red-DiscordBot cog that creates a visible trap channel for self-bo
 - Automatically ignores timed-out reviews and removes the pending review mute.
 - Restores pending review buttons after bot restarts.
 - Shows trigger reasons in logs and review embeds.
+- Supports per-server scam keyword management.
 - Deletes the triggering message immediately.
 - Optionally purges recent messages from the same user in the honeypot channel.
 - Supports whitelisted roles that are logged but not punished.
 - Supports a ping role for alerts.
-- Can post clear warning messages to make the trap channel look monitored.
+- Can post plain staff-style warnings in the trap channel.
 - Includes stats and doctor commands for operational checks.
 - Creates Red modlog cases for punishment actions when possible.
 
@@ -123,6 +124,14 @@ Only the server owner can use the `sethoneypot` command group.
 - `[p]sethoneypot whitelistedroles list` - Lists whitelisted roles.
 - `[p]sethoneypot wlroles ...` - Alias for `whitelistedroles`.
 
+### Scam Keywords
+
+- `[p]sethoneypot scamkeywords add <keyword or phrase>` - Adds a scam keyword.
+- `[p]sethoneypot scamkeywords remove <keyword or phrase>` - Removes a scam keyword.
+- `[p]sethoneypot scamkeywords list` - Lists configured scam keywords.
+- `[p]sethoneypot scamkeywords reset` - Resets scam keywords to defaults.
+- `[p]sethoneypot keywords ...` - Alias for `scamkeywords`.
+
 ### Fake Activity Messages
 
 - `[p]sethoneypot fakeactivity add <message>` - Adds a custom fake activity message.
@@ -135,10 +144,9 @@ Only the server owner can use the `sethoneypot` command group.
 
 A message in the honeypot channel is considered suspicious if any of these are true:
 
-- It contains an HTTP or HTTPS link.
 - The author account is less than 7 days old.
 - The content contains known scam keywords such as free Nitro, giveaway, generator, claim your, or similar phrases.
-- It has attachments and the author account is less than 30 days old.
+- It has attachments and the author account is less than 14 days old.
 
 Suspicious messages are punished immediately using the configured automatic action.
 
@@ -163,7 +171,7 @@ When review mode is enabled and a non-obvious message appears in the honeypot ch
 
 - `bypass` - Users with whitelisted roles are logged and not punished.
 - `review` - Users with whitelisted roles are sent to review instead of automatic punishment.
-- `none` - Whitelisted role is only noted; normal detection continues.
+- `none` - Whitelisted role is only noted; normal detection continues with no special treatment.
 
 ## Dry Run
 
@@ -196,4 +204,4 @@ The cog stores only guild configuration: channel IDs, role IDs, booleans, numeri
 - In review mode, a configured mute role is used as temporary containment until moderators decide.
 - The purge only scans recent messages in the honeypot channel, not the entire server.
 - Fake activity runs once per minute internally and only posts when the configured interval has elapsed.
-- Default fake activity messages are explicit warnings such as `BAN CHANNEL - DO NOT WRITE HERE.`
+- Default fake activity messages are plain warnings such as `BAN CHANNEL - DO NOT WRITE HERE.`

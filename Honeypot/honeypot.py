@@ -1,5 +1,4 @@
 import asyncio
-import os
 import random
 import re
 import typing
@@ -19,10 +18,10 @@ _ = Translator("Honeypot", __file__)
 
 DEFAULT_FAKE_MESSAGES = [
     "BAN CHANNEL - DO NOT WRITE HERE.",
-    "Security trap channel. Do not post here.",
-    "Writing in this channel may trigger moderation review.",
-    "Do not use this channel. Staff monitoring is active.",
-    "Warning: messages here are treated as honeypot activity.",
+    "Do not type in this channel.",
+    "Messages here are logged and reviewed by staff.",
+    "Wrong channel. Do not post here.",
+    "Stop. This channel is monitored.",
 ]
 
 DEFAULT_STATS = {
@@ -121,14 +120,13 @@ class ReviewView(discord.ui.View):
                 value=action_taken,
                 inline=False,
             )
-        await self.review_message.edit(content=_("✅ **Review completed**"), embed=embed, view=self)
+        review_message = self.review_message or interaction.message
+        if review_message is not None:
+            await review_message.edit(content=_("✅ **Review completed**"), embed=embed, view=self)
         self.cog._active_views.pop(self.active_key or self.target_id, None)
         if interaction.guild is not None:
             await self.cog._delete_pending_review(interaction.guild, self.active_key)
         self.stop()
-
-    async def on_timeout(self) -> None:
-        await self.cog._expire_review(self)
 
     async def _action_perform(self, interaction: discord.Interaction, action: str) -> tuple[str | None, str | None]:
         """Returns (result_message, action_label) or (None, None) to abort."""
@@ -147,7 +145,7 @@ class ReviewView(discord.ui.View):
                     try:
                         await member.remove_roles(mute_role, reason=_("Honeypot review ignored; removing pending mute."))
                     except discord.HTTPException:
-                        return (_("Failed to remove the pending mute role. Check bot permissions."), None)
+                        return (_("I couldn't remove the temporary mute role. Check my role permissions."), None)
             await self.cog._increment_stat(guild, "ignored")
             return (None, _("Ignored (no action)"))
         reason = _("Honeypot review: {action} by {mod}").format(action=action, mod=interaction.user)
@@ -159,9 +157,13 @@ class ReviewView(discord.ui.View):
                     try:
                         await member.remove_roles(mute_role, reason=_("Honeypot dry-run review completed; removing pending mute."))
                     except discord.HTTPException:
-                        return (_("Failed to remove the pending mute role. Check bot permissions."), None)
+                        return (_("I couldn't remove the temporary mute role. Check my role permissions."), None)
             await self.cog._increment_stat(guild, "dry_run_actions")
-            return (None, _("Dry run: would have {action}ed the member.").format(action=action))
+            return (None, self.cog._dry_run_label(action))
+        missing_permission = self.cog._missing_action_permission(guild, action)
+        if missing_permission is not None:
+            await self.cog._increment_stat(guild, "failed_actions")
+            return (missing_permission, None)
         try:
             if action == "kick":
                 await member.kick(reason=reason)
@@ -175,7 +177,7 @@ class ReviewView(discord.ui.View):
                 return (None, _("Banned"))
         except discord.HTTPException:
             await self.cog._increment_stat(guild, "failed_actions")
-            return (_("Failed to perform the action. Check bot permissions."), None)
+            return (_("Action failed. Check my permissions and role position."), None)
         return (None, None)
 
     @discord.ui.button(label="Ban", style=discord.ButtonStyle.danger, emoji="🔨", custom_id="honeypot:review:ban")
@@ -208,7 +210,7 @@ class ReviewView(discord.ui.View):
 
 @cog_i18n(_)
 class Honeypot(Cog):
-    """Create a channel at the top of the server to attract self bots/scammers and automatically handle them."""
+    """Create a trap channel and handle users who post in it."""
 
     def __init__(self, bot: Red) -> None:
         super().__init__(bot=bot)
@@ -240,6 +242,7 @@ class Honeypot(Cog):
             whitelist_mode="bypass",
             stats=DEFAULT_STATS.copy(),
             pending_reviews={},
+            scam_keywords=SCAM_KEYWORDS.copy(),
         )
 
         _settings: dict[str, dict[str, typing.Any]] = {
@@ -275,7 +278,7 @@ class Honeypot(Cog):
             },
             "ping_role": {
                 "converter": discord.Role,
-                "description": "The role to ping when a self bot/scammer is detected.",
+                "description": "The role to ping when the trap channel is triggered.",
             },
             "mute_role": {
                 "converter": discord.Role,
@@ -295,7 +298,7 @@ class Honeypot(Cog):
             },
             "fake_activity_enabled": {
                 "converter": bool,
-                "description": "Toggle fake activity in the honeypot channel to attract scammers.",
+                "description": "Toggle warning messages in the trap channel.",
             },
             "fake_activity_interval": {
                 "converter": commands.Range[int, 1, 120],
@@ -303,14 +306,14 @@ class Honeypot(Cog):
             },
             "review_enabled": {
                 "converter": bool,
-                "description": "Toggle moderator review instead of instant action for suspicious messages.",
+                "description": "Send non-obvious cases to staff before taking action.",
             },
             "review_channel": {
                 "converter": typing.Union[
                     discord.TextChannel,
                     discord.Thread,
                 ],
-                "description": "The channel to send moderator review requests to.",
+                "description": "The channel to send review requests to.",
             },
             "review_timeout_minutes": {
                 "converter": commands.Range[int, 1, 10080],
@@ -318,7 +321,7 @@ class Honeypot(Cog):
             },
             "whitelist_mode": {
                 "converter": typing.Literal["bypass", "review", "none"],
-                "description": "How whitelisted roles behave: bypass, review, or none.",
+                "description": "How whitelisted roles behave: bypass punishment, force review, or no special treatment.",
             },
         }
         self.settings: Settings = Settings(
@@ -378,6 +381,21 @@ class Honeypot(Cog):
             channel = self.bot.get_channel(channel_id)
         if isinstance(channel, (discord.TextChannel, discord.Thread)):
             return channel
+        return None
+
+    def _dry_run_label(self, action: str) -> str:
+        if action == "ban":
+            return _("Dry run: I would ban this member.")
+        if action == "kick":
+            return _("Dry run: I would kick this member.")
+        return _("Dry run: I would not take action.")
+
+    def _missing_action_permission(self, guild: discord.Guild, action: str) -> str | None:
+        permissions = guild.me.guild_permissions
+        if action == "kick" and not permissions.kick_members:
+            return _("**Failed:** I do not have the `Kick Members` permission.")
+        if action == "ban" and not permissions.ban_members:
+            return _("**Failed:** I do not have the `Ban Members` permission.")
         return None
 
     async def cog_load(self) -> None:
@@ -478,7 +496,6 @@ class Honeypot(Cog):
         guild = self.bot.get_guild(view.guild_id)
         if guild is None:
             self._active_views.pop(view.active_key or view.target_id, None)
-            await self._delete_pending_review(guild, view.active_key)
             view.stop()
             return
         member = guild.get_member(view.target_id)
@@ -495,12 +512,12 @@ class Honeypot(Cog):
             embed.color = discord.Color.green()
             embed.add_field(
                 name=_("Reviewed by:"),
-                value=_("Automatic timeout"),
+                value=_("Timed out"),
                 inline=False,
             )
             embed.add_field(
                 name=_("Action taken:"),
-                value=_("Ignored (review timed out)"),
+                value=_("Ignored after no staff response"),
                 inline=False,
             )
         if view.review_message is not None:
@@ -516,18 +533,17 @@ class Honeypot(Cog):
 
     # ─── Detection ────────────────────────────────────────────────────────
 
-    async def _suspicion_reasons(self, message: discord.Message) -> list[str]:
+    async def _suspicion_reasons(self, message: discord.Message, config: dict) -> list[str]:
         reasons: list[str] = []
         content = message.content.lower()
-        if re.search(r"https?://[^\s]+", content):
-            reasons.append(_("Contains a link."))
         if message.author.created_at > datetime.now(timezone.utc) - timedelta(days=7):
-            reasons.append(_("Account is less than 7 days old."))
-        matched_keywords = [kw for kw in SCAM_KEYWORDS if kw in content]
+            reasons.append(_("Account is under 7 days old"))
+        scam_keywords = config.get("scam_keywords") or SCAM_KEYWORDS
+        matched_keywords = [kw for kw in scam_keywords if kw.lower() in content]
         if matched_keywords:
-            reasons.append(_("Matched scam keyword(s): {keywords}").format(keywords=", ".join(matched_keywords[:5])))
-        if message.attachments and message.author.created_at > datetime.now(timezone.utc) - timedelta(days=30):
-            reasons.append(_("Has attachments from an account less than 30 days old."))
+            reasons.append(_("Matched keyword: {keywords}").format(keywords=", ".join(matched_keywords[:5])))
+        if message.attachments and message.author.created_at > datetime.now(timezone.utc) - timedelta(days=14):
+            reasons.append(_("Attachment from an account under 14 days old"))
         return reasons
 
     async def _purge_user_messages(
@@ -559,7 +575,11 @@ class Honeypot(Cog):
             return (_("No action configured."), None)
         if config.get("dry_run"):
             await self._increment_stat(message.guild, "dry_run_actions")
-            return (_("Dry run: would have {action}ed the member.").format(action=action), None)
+            return (self._dry_run_label(action), None)
+        missing_permission = self._missing_action_permission(message.guild, action)
+        if missing_permission is not None:
+            await self._increment_stat(message.guild, "failed_actions")
+            return (None, missing_permission)
         try:
             if action == "kick":
                 await message.author.kick(reason=reason)
@@ -572,7 +592,7 @@ class Honeypot(Cog):
                 await self._increment_stat(message.guild, "banned")
         except discord.HTTPException as e:
             await self._increment_stat(message.guild, "failed_actions")
-            return (None, _("**Failed:** An error occurred while trying to take action:\n") + box(str(e), lang="py"))
+            return (None, _("**Action failed:**\n") + box(str(e), lang="py"))
         try:
             await modlog.create_case(
                 self.bot,
@@ -597,10 +617,10 @@ class Honeypot(Cog):
         logs_channel: discord.TextChannel | discord.Thread,
     ) -> None:
         embed.color = discord.Color.gold()
-        embed.title = _("Honeypot — Review Required")
+        embed.title = _("Review needed")
         embed.add_field(
             name=_("Status:"),
-            value=_("⏳ Pending moderator review"),
+            value=_("Pending moderator review"),
             inline=False,
         )
         pending_mute_role_id = None
@@ -616,14 +636,14 @@ class Honeypot(Cog):
                     await self._increment_stat(message.guild, "pending_mutes")
                     embed.add_field(
                         name=_("Pending review mute:"),
-                        value=_("Mute role applied until moderators complete review."),
+                        value=_("Temporary mute applied while staff reviews this."),
                         inline=False,
                     )
                 except discord.HTTPException:
                     await self._increment_stat(message.guild, "pending_mute_failures")
                     embed.add_field(
                         name=_("Pending review mute:"),
-                        value=_("Failed to apply mute role. Check bot permissions."),
+                        value=_("I couldn't apply the temporary mute role."),
                         inline=False,
                     )
         attachment_urls = [a.url for a in message.attachments]
@@ -637,7 +657,7 @@ class Honeypot(Cog):
             review_timeout_minutes=config.get("review_timeout_minutes", 1440),
         )
         embed.add_field(
-            name=_("Review expires:"),
+            name=_("Auto-ignore:"),
             value=discord.utils.format_dt(view.expires_at, style="R"),
             inline=False,
         )
@@ -666,7 +686,7 @@ class Honeypot(Cog):
         await self._store_pending_review(message.guild, view, review_channel.id, sent.id)
         await self._increment_stat(message.guild, "reviewed")
         await logs_channel.send(
-            _("🟡 **Review required** for {user} ({user_id}) — sent to {channel}.").format(
+            _("🟡 Review queued for {user} ({user_id}) in {channel}.").format(
                 user=message.author.mention,
                 user_id=message.author.id,
                 channel=review_channel.mention,
@@ -713,7 +733,7 @@ class Honeypot(Cog):
         )
 
         embed: discord.Embed = discord.Embed(
-            title=_("Honeypot — Self Bot/Scammer Detected!"),
+            title=_("Honeypot hit"),
             description=f">>> {message.content}" if message.content else _("*(message with attachments only)*"),
             color=discord.Color.red(),
             timestamp=message.created_at,
@@ -763,18 +783,18 @@ class Honeypot(Cog):
             await self._increment_stat(message.guild, "whitelisted")
             embed.add_field(
                 name=_("Whitelisted role:"),
-                value=_("User has a whitelisted role. Mode: `{mode}`.").format(mode=whitelist_mode),
+                value=_("Whitelist mode: `{mode}`").format(mode=whitelist_mode),
                 inline=False,
             )
             if whitelist_mode == "bypass":
                 embed.color = discord.Color.orange()
-                embed.add_field(name=_("Action:"), value=_("No punishment applied."), inline=False)
+                embed.add_field(name=_("Action:"), value=_("No action taken."), inline=False)
                 await logs_channel.send(embed=embed)
                 return
             if whitelist_mode == "review":
                 force_review = True
 
-        suspicion_reasons = await self._suspicion_reasons(message)
+        suspicion_reasons = await self._suspicion_reasons(message, config)
         suspicious = bool(suspicion_reasons)
         if suspicion_reasons:
             await self._increment_stat(message.guild, "suspicious")
@@ -803,7 +823,7 @@ class Honeypot(Cog):
             embed.color = discord.Color.orange()
             embed.add_field(
                 name=_("Action:"),
-                value=_("No punishment applied because whitelist mode requires review, but no review channel is available."),
+                value=_("No action taken. This whitelist mode needs a review channel, but none is available."),
                 inline=False,
             )
             await logs_channel.send(embed=embed)
@@ -813,21 +833,21 @@ class Honeypot(Cog):
             action_label, failed = await self._execute_action(
                 message,
                 config,
-                reason="Self bot/scammer detected (message in the HoneyPot channel).",
+                reason="Suspicious post in the honeypot channel.",
             )
             embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
             if failed:
                 embed.color = discord.Color.dark_red()
-                embed.add_field(name=_("Staff attention:"), value=_("Automatic action failed."), inline=False)
+                embed.add_field(name=_("Staff check needed:"), value=_("Automatic action failed."), inline=False)
         else:
             if fallback_action == "none":
                 embed.color = discord.Color.orange()
-                embed.add_field(name=_("Action:"), value=_("No fallback action configured."), inline=False)
+                embed.add_field(name=_("Action:"), value=_("No fallback action set."), inline=False)
             elif fallback_action == "review":
                 embed.color = discord.Color.orange()
                 embed.add_field(
                     name=_("Action:"),
-                    value=_("No fallback action applied because review is unavailable."),
+                    value=_("No fallback action taken. Review is unavailable."),
                     inline=False,
                 )
             else:
@@ -840,7 +860,7 @@ class Honeypot(Cog):
                 embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
                 if failed:
                     embed.color = discord.Color.dark_red()
-                    embed.add_field(name=_("Staff attention:"), value=_("Fallback action failed."), inline=False)
+                    embed.add_field(name=_("Staff check needed:"), value=_("Fallback action failed."), inline=False)
 
         embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
         await logs_channel.send(
@@ -996,6 +1016,53 @@ class Honeypot(Cog):
             return
         lines = "\n".join(f"- {r.mention} ({r.id})" for r in roles)
         await ctx.send(_("**Whitelisted roles:**\n{lines}").format(lines=lines))
+
+    # ─── Scam Keywords ────────────────────────────────────────────────────
+
+    @sethoneypot.group(name="scamkeywords", aliases=["keywords"])
+    async def scam_keywords_group(self, ctx: commands.Context) -> None:
+        """Manage scam keywords used by suspicious-message detection."""
+
+    @scam_keywords_group.command(name="add")
+    async def scam_keywords_add(self, ctx: commands.Context, *, keyword: str) -> None:
+        """Add a scam keyword or phrase."""
+        keyword = keyword.strip().lower()
+        if not keyword:
+            raise commands.UserFeedbackCheckFailure(_("Keyword cannot be empty."))
+        async with self.config.guild(ctx.guild).scam_keywords() as keywords:
+            normalized = [kw.lower() for kw in keywords]
+            if keyword in normalized:
+                raise commands.UserFeedbackCheckFailure(_("That keyword already exists."))
+            keywords.append(keyword)
+        await ctx.send(_("✅ Scam keyword added: `{keyword}`").format(keyword=keyword))
+
+    @scam_keywords_group.command(name="remove")
+    async def scam_keywords_remove(self, ctx: commands.Context, *, keyword: str) -> None:
+        """Remove a scam keyword or phrase."""
+        keyword = keyword.strip().lower()
+        async with self.config.guild(ctx.guild).scam_keywords() as keywords:
+            for existing in list(keywords):
+                if existing.lower() == keyword:
+                    keywords.remove(existing)
+                    await ctx.send(_("✅ Scam keyword removed: `{keyword}`").format(keyword=existing))
+                    return
+        raise commands.UserFeedbackCheckFailure(_("That keyword is not configured."))
+
+    @scam_keywords_group.command(name="list")
+    async def scam_keywords_list(self, ctx: commands.Context) -> None:
+        """List configured scam keywords."""
+        keywords = await self.config.guild(ctx.guild).scam_keywords()
+        if not keywords:
+            await ctx.send(_("No scam keywords are configured."))
+            return
+        lines = "\n".join(f"`{i}.` {keyword}" for i, keyword in enumerate(keywords, 1))
+        await ctx.send(_("**Scam keywords:**\n{lines}").format(lines=lines))
+
+    @scam_keywords_group.command(name="reset")
+    async def scam_keywords_reset(self, ctx: commands.Context) -> None:
+        """Reset scam keywords to defaults."""
+        await self.config.guild(ctx.guild).scam_keywords.set(SCAM_KEYWORDS.copy())
+        await ctx.send(_("✅ Scam keywords reset to defaults."))
 
     # ─── Fake Activity Messages ───────────────────────────────────────────
 
