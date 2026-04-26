@@ -77,13 +77,12 @@ class ReviewView(discord.ui.View):
         action: str,
         reason: str,
     ) -> None:
-        action_type = action if action != "mute" else "smute"
         try:
             await modlog.create_case(
                 self.cog.bot,
                 guild,
                 datetime.now(timezone.utc),
-                action_type=action_type,
+                action_type=action,
                 user=member,
                 moderator=guild.me,
                 reason=reason,
@@ -139,14 +138,6 @@ class ReviewView(discord.ui.View):
                 await member.ban(reason=reason, delete_message_days=config.get("ban_delete_message_days", 0))
                 await self._create_modlog_case(guild, member, action, reason)
                 return (None, _("Banned"))
-            elif action == "mute":
-                mute_role_id = await self.cog.config.guild(guild).mute_role()
-                mute_role = guild.get_role(mute_role_id) if mute_role_id else None
-                if mute_role is None:
-                    return (_("Mute role is not configured."), None)
-                await member.add_roles(mute_role, reason=reason)
-                await self._create_modlog_case(guild, member, action, reason)
-                return (None, _("Muted"))
         except discord.HTTPException:
             return (_("Failed to perform the action. Check bot permissions."), None)
         return (None, None)
@@ -164,15 +155,6 @@ class ReviewView(discord.ui.View):
     async def ban_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         msg, label = await self._action_perform(interaction, "ban")
-        if label:
-            await self._update_done(interaction, label)
-        if msg:
-            await interaction.followup.send(msg, ephemeral=True)
-
-    @discord.ui.button(label="Mute", style=discord.ButtonStyle.secondary, emoji="🔇")
-    async def mute_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
-        msg, label = await self._action_perform(interaction, "mute")
         if label:
             await self._update_done(interaction, label)
         if msg:
@@ -224,7 +206,7 @@ class Honeypot(Cog):
                 "description": "Toggle the cog.",
             },
             "action": {
-                "converter": typing.Literal["mute", "kick", "ban"],
+                "converter": typing.Literal["kick", "ban"],
                 "description": "The action to take when a self bot/scammer is detected.",
             },
             "honeypot_channel": {
@@ -247,7 +229,7 @@ class Honeypot(Cog):
             },
             "mute_role": {
                 "converter": discord.Role,
-                "description": "The mute role to assign, if the action is `mute`.",
+                "description": "The temporary containment role to assign while a user is waiting for review.",
             },
             "ban_delete_message_days": {
                 "converter": commands.Range[int, 0, 7],
@@ -386,21 +368,14 @@ class Honeypot(Cog):
     async def _execute_action(
         self, message: discord.Message, config: dict, reason: str
     ) -> tuple[str | None, str | None]:
-        """Execute the configured action (mute/kick/ban) against the message author.
+        """Execute the configured action (kick/ban) against the message author.
         Returns (action_label, failed_message) where failed_message is None on success.
         """
         action = config["action"]
         if action is None:
             return (_("No action configured."), None)
         try:
-            if action == "mute":
-                if (mute_role_id := config["mute_role"]) is not None and (
-                    mute_role := message.guild.get_role(mute_role_id)
-                ) is not None:
-                    await message.author.add_roles(mute_role, reason=reason)
-                else:
-                    return (None, _("**Failed:** The mute role is not set or doesn't exist anymore."))
-            elif action == "kick":
+            if action == "kick":
                 await message.author.kick(reason=reason)
             elif action == "ban":
                 await message.author.ban(
@@ -409,28 +384,19 @@ class Honeypot(Cog):
                 )
         except discord.HTTPException as e:
             return (None, _("**Failed:** An error occurred while trying to take action:\n") + box(str(e), lang="py"))
-        action_type = action if action != "mute" else "smute"
         try:
             await modlog.create_case(
                 self.bot,
                 message.guild,
                 message.created_at,
-                action_type=action_type,
+                action_type=action,
                 user=message.author,
                 moderator=message.guild.me,
                 reason=reason,
             )
         except Exception:
             pass
-        label = (
-            _("The member has been muted.")
-            if action == "mute"
-            else (
-                _("The member has been kicked.")
-                if action == "kick"
-                else _("The member has been banned.")
-            )
-        )
+        label = _("The member has been kicked.") if action == "kick" else _("The member has been banned.")
         return (label, None)
 
     @commands.Cog.listener()

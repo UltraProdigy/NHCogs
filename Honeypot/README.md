@@ -6,7 +6,7 @@ Honeypot is a Red-DiscordBot cog that creates a visible trap channel for self-bo
 
 - Creates a dedicated `#honeypot` channel at the top of the server.
 - Detects suspicious posts using links, scam keywords, new-account age, and attachments from newer accounts.
-- Supports automatic `mute`, `kick`, or `ban` actions.
+- Supports automatic `kick` or `ban` actions.
 - Supports moderator review for less obvious cases.
 - Applies the configured mute role while a user is waiting for moderator review.
 - Deletes the triggering message immediately.
@@ -46,7 +46,7 @@ This cog also requires `AAA3A_utils`. If the dependency is missing, Red will sho
 [p]sethoneypot action ban
 ```
 
-4. If using `mute`, configure the mute role:
+4. Optionally configure the temporary review mute role:
 
 ```ini
 [p]sethoneypot muterole @Muted
@@ -87,11 +87,11 @@ Only the server owner can use the `sethoneypot` command group.
 ### Generated Settings Commands
 
 - `[p]sethoneypot enabled <true|false>` - Enables or disables detection.
-- `[p]sethoneypot action <mute|kick|ban>` - Sets the automatic punishment.
+- `[p]sethoneypot action <kick|ban>` - Sets the automatic punishment.
 - `[p]sethoneypot honeypotchannel <channel>` - Sets the trap channel.
 - `[p]sethoneypot logschannel <channel>` - Sets the logging channel.
 - `[p]sethoneypot pingrole <role>` - Sets the role to ping on alerts.
-- `[p]sethoneypot muterole <role>` - Sets the role used by the `mute` action.
+- `[p]sethoneypot muterole <role>` - Sets the temporary containment role used while review is pending.
 - `[p]sethoneypot bandeletemessagedays <0-7>` - Sets how many days of messages are deleted on ban.
 - `[p]sethoneypot purgeenabled <true|false>` - Enables recent-message purge in the honeypot channel.
 - `[p]sethoneypot purgeminutes <1-60>` - Sets how far back the purge should look.
@@ -137,7 +137,7 @@ When review mode is enabled and a non-obvious message appears in the honeypot ch
 - If a mute role is configured and the user does not already have it, the mute role is applied while review is pending.
 - A review embed is sent to the configured review channel.
 - Attachments are copied into the review message when possible.
-- Moderators with `Moderate Members` permission can choose `Kick`, `Ban`, `Mute`, or `Ignore`.
+- Moderators with `Moderate Members` permission can choose `Kick`, `Ban`, or `Ignore`.
 - If moderators choose `Ignore`, the pending mute role is removed when it was applied by this review flow.
 - Once a moderator acts, the review buttons are disabled and the embed records who reviewed it.
 
@@ -151,7 +151,7 @@ The bot should have these permissions in the relevant channels and server:
 - Manage Channels, if using `createchannel`
 - Kick Members, if using `kick`
 - Ban Members, if using `ban`
-- Manage Roles, if using `mute`
+- Manage Roles, if using temporary review mute
 - Access to the configured logs and review channels
 
 The bot role must be higher than users it needs to punish and higher than the configured mute role.
