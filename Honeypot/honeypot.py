@@ -18,17 +18,28 @@ from redbot.core.utils.chat_formatting import box
 _ = Translator("Honeypot", __file__)
 
 DEFAULT_FAKE_MESSAGES = [
-    "Hey, is this the right place?",
-    "Anyone here?",
-    "Check DMs",
-    "Who wants free stuff?",
-    "DM me for a surprise!",
-    "Free Nitro here: check my bio",
-    "I'm new here, what's this server?",
-    "Anyone trading?",
-    "Join my server! Link in bio",
-    "Who's online?",
+    "BAN CHANNEL - DO NOT WRITE HERE.",
+    "Security trap channel. Do not post here.",
+    "Writing in this channel may trigger moderation review.",
+    "Do not use this channel. Staff monitoring is active.",
+    "Warning: messages here are treated as honeypot activity.",
 ]
+
+DEFAULT_STATS = {
+    "detections": 0,
+    "suspicious": 0,
+    "reviewed": 0,
+    "review_expired": 0,
+    "ignored": 0,
+    "kicked": 0,
+    "banned": 0,
+    "failed_actions": 0,
+    "dry_run_actions": 0,
+    "whitelisted": 0,
+    "pending_mutes": 0,
+    "pending_mute_failures": 0,
+    "purged_messages": 0,
+}
 
 SCAM_KEYWORDS = [
     "free nitro", "giveaway", "steam gift", "free discord",
@@ -48,16 +59,21 @@ class ReviewView(discord.ui.View):
         content: str,
         attachment_urls: list[str],
         pending_mute_role_id: int | None = None,
+        review_timeout_minutes: int = 1440,
+        expires_at: datetime | None = None,
     ) -> None:
-        super().__init__(timeout=86400)
+        super().__init__(timeout=None)
         self.cog = cog
         self.target_id = target_id
         self.guild_id = guild_id
         self.content = content
         self.attachment_urls = attachment_urls
         self.pending_mute_role_id = pending_mute_role_id
+        self.created_at = datetime.now(timezone.utc)
+        self.expires_at = expires_at or self.created_at + timedelta(minutes=review_timeout_minutes)
         self.review_message: discord.Message | None = None
         self.claimed_by: int | None = None
+        self.active_key: int | None = None
 
     def _check_perms(self, interaction: discord.Interaction) -> bool:
         guild_permissions = getattr(interaction.user, "guild_permissions", None)
@@ -106,7 +122,13 @@ class ReviewView(discord.ui.View):
                 inline=False,
             )
         await self.review_message.edit(content=_("✅ **Review completed**"), embed=embed, view=self)
+        self.cog._active_views.pop(self.active_key or self.target_id, None)
+        if interaction.guild is not None:
+            await self.cog._delete_pending_review(interaction.guild, self.active_key)
         self.stop()
+
+    async def on_timeout(self) -> None:
+        await self.cog._expire_review(self)
 
     async def _action_perform(self, interaction: discord.Interaction, action: str) -> tuple[str | None, str | None]:
         """Returns (result_message, action_label) or (None, None) to abort."""
@@ -126,23 +148,37 @@ class ReviewView(discord.ui.View):
                         await member.remove_roles(mute_role, reason=_("Honeypot review ignored; removing pending mute."))
                     except discord.HTTPException:
                         return (_("Failed to remove the pending mute role. Check bot permissions."), None)
+            await self.cog._increment_stat(guild, "ignored")
             return (None, _("Ignored (no action)"))
         reason = _("Honeypot review: {action} by {mod}").format(action=action, mod=interaction.user)
+        config = await self.cog.config.guild(guild).all()
+        if config.get("dry_run"):
+            if self.pending_mute_role_id is not None:
+                mute_role = guild.get_role(self.pending_mute_role_id)
+                if mute_role is not None and mute_role in member.roles:
+                    try:
+                        await member.remove_roles(mute_role, reason=_("Honeypot dry-run review completed; removing pending mute."))
+                    except discord.HTTPException:
+                        return (_("Failed to remove the pending mute role. Check bot permissions."), None)
+            await self.cog._increment_stat(guild, "dry_run_actions")
+            return (None, _("Dry run: would have {action}ed the member.").format(action=action))
         try:
             if action == "kick":
                 await member.kick(reason=reason)
                 await self._create_modlog_case(guild, member, action, reason)
+                await self.cog._increment_stat(guild, "kicked")
                 return (None, _("Kicked"))
             elif action == "ban":
-                config = await self.cog.config.guild(guild).all()
                 await member.ban(reason=reason, delete_message_days=config.get("ban_delete_message_days", 0))
                 await self._create_modlog_case(guild, member, action, reason)
+                await self.cog._increment_stat(guild, "banned")
                 return (None, _("Banned"))
         except discord.HTTPException:
+            await self.cog._increment_stat(guild, "failed_actions")
             return (_("Failed to perform the action. Check bot permissions."), None)
         return (None, None)
 
-    @discord.ui.button(label="Ban", style=discord.ButtonStyle.danger, emoji="🔨")
+    @discord.ui.button(label="Ban", style=discord.ButtonStyle.danger, emoji="🔨", custom_id="honeypot:review:ban")
     async def ban_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         msg, label = await self._action_perform(interaction, "ban")
@@ -151,7 +187,7 @@ class ReviewView(discord.ui.View):
         if msg:
             await interaction.followup.send(msg, ephemeral=True)
 
-    @discord.ui.button(label="Kick", style=discord.ButtonStyle.secondary, emoji="👢")
+    @discord.ui.button(label="Kick", style=discord.ButtonStyle.secondary, emoji="👢", custom_id="honeypot:review:kick")
     async def kick_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         msg, label = await self._action_perform(interaction, "kick")
@@ -160,7 +196,7 @@ class ReviewView(discord.ui.View):
         if msg:
             await interaction.followup.send(msg, ephemeral=True)
 
-    @discord.ui.button(label="Ignore", style=discord.ButtonStyle.success, emoji="✅")
+    @discord.ui.button(label="Ignore", style=discord.ButtonStyle.success, emoji="✅", custom_id="honeypot:review:ignore")
     async def ignore_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         msg, label = await self._action_perform(interaction, "ignore")
@@ -185,6 +221,8 @@ class Honeypot(Cog):
         self.config.register_guild(
             enabled=False,
             action=None,
+            fallback_action="review",
+            dry_run=False,
             logs_channel=None,
             ping_role=None,
             honeypot_channel=None,
@@ -198,6 +236,10 @@ class Honeypot(Cog):
             fake_activity_messages=[],
             review_enabled=False,
             review_channel=None,
+            review_timeout_minutes=1440,
+            whitelist_mode="bypass",
+            stats=DEFAULT_STATS.copy(),
+            pending_reviews={},
         )
 
         _settings: dict[str, dict[str, typing.Any]] = {
@@ -207,7 +249,15 @@ class Honeypot(Cog):
             },
             "action": {
                 "converter": typing.Literal["kick", "ban"],
-                "description": "The action to take when a self bot/scammer is detected.",
+                "description": "The action to take when a clearly suspicious user is detected.",
+            },
+            "fallback_action": {
+                "converter": typing.Literal["review", "kick", "ban", "none"],
+                "description": "What to do when a honeypot post is not clearly suspicious.",
+            },
+            "dry_run": {
+                "converter": bool,
+                "description": "Log what would happen without kicking or banning users.",
             },
             "honeypot_channel": {
                 "converter": typing.Union[
@@ -262,6 +312,14 @@ class Honeypot(Cog):
                 ],
                 "description": "The channel to send moderator review requests to.",
             },
+            "review_timeout_minutes": {
+                "converter": commands.Range[int, 1, 10080],
+                "description": "Minutes before pending review expires and temporary mute is removed.",
+            },
+            "whitelist_mode": {
+                "converter": typing.Literal["bypass", "review", "none"],
+                "description": "How whitelisted roles behave: bypass, review, or none.",
+            },
         }
         self.settings: Settings = Settings(
             bot=self.bot,
@@ -277,6 +335,36 @@ class Honeypot(Cog):
 
         self._last_fake_message: dict[int, datetime] = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
         self._active_views: dict[int, ReviewView] = {}
+        self._restore_task: asyncio.Task | None = None
+
+    async def _increment_stat(self, guild: discord.Guild, key: str, amount: int = 1) -> None:
+        async with self.config.guild(guild).stats() as stats:
+            stats.setdefault(key, 0)
+            stats[key] += amount
+
+    async def _store_pending_review(
+        self,
+        guild: discord.Guild,
+        view: ReviewView,
+        review_channel_id: int,
+        review_message_id: int,
+    ) -> None:
+        async with self.config.guild(guild).pending_reviews() as pending_reviews:
+            pending_reviews[str(review_message_id)] = {
+                "target_id": view.target_id,
+                "review_channel_id": review_channel_id,
+                "review_message_id": review_message_id,
+                "content": view.content,
+                "attachment_urls": view.attachment_urls,
+                "pending_mute_role_id": view.pending_mute_role_id,
+                "expires_at": view.expires_at.isoformat(),
+            }
+
+    async def _delete_pending_review(self, guild: discord.Guild, review_message_id: int | None) -> None:
+        if review_message_id is None:
+            return
+        async with self.config.guild(guild).pending_reviews() as pending_reviews:
+            pending_reviews.pop(str(review_message_id), None)
 
     def _get_text_channel_or_thread(
         self, guild: discord.Guild, channel_id: int | None
@@ -296,9 +384,14 @@ class Honeypot(Cog):
         await super().cog_load()
         await self.settings.add_commands()
         self.fake_activity_loop.start()
+        self.review_timeout_loop.start()
+        self._restore_task = asyncio.create_task(self._restore_pending_reviews())
 
     async def cog_unload(self) -> None:
         self.fake_activity_loop.cancel()
+        self.review_timeout_loop.cancel()
+        if self._restore_task is not None:
+            self._restore_task.cancel()
         await super().cog_unload()
 
     # ─── Fake Activity Loop ───────────────────────────────────────────────
@@ -333,19 +426,109 @@ class Honeypot(Cog):
     async def before_fake_activity(self) -> None:
         await self.bot.wait_until_red_ready()
 
+    @tasks.loop(minutes=5)
+    async def review_timeout_loop(self) -> None:
+        now = datetime.now(timezone.utc)
+        for view in list(self._active_views.values()):
+            if view.expires_at <= now:
+                await self._expire_review(view)
+
+    @review_timeout_loop.before_loop
+    async def before_review_timeout(self) -> None:
+        await self.bot.wait_until_red_ready()
+
+    async def _restore_pending_reviews(self) -> None:
+        await self.bot.wait_until_red_ready()
+        all_guilds = await self.config.all_guilds()
+        now = datetime.now(timezone.utc)
+        for guild_id, guild_config in all_guilds.items():
+            guild = self.bot.get_guild(int(guild_id))
+            if guild is None:
+                continue
+            pending_reviews = guild_config.get("pending_reviews", {})
+            for review_message_id, data in list(pending_reviews.items()):
+                try:
+                    expires_at = datetime.fromisoformat(data["expires_at"])
+                except (KeyError, ValueError, TypeError):
+                    await self._delete_pending_review(guild, int(review_message_id))
+                    continue
+                view = ReviewView(
+                    self,
+                    int(data["target_id"]),
+                    guild.id,
+                    data.get("content", ""),
+                    data.get("attachment_urls", []),
+                    pending_mute_role_id=data.get("pending_mute_role_id"),
+                    expires_at=expires_at,
+                )
+                view.active_key = int(review_message_id)
+                review_channel = self._get_text_channel_or_thread(guild, data.get("review_channel_id"))
+                if review_channel is not None:
+                    try:
+                        view.review_message = await review_channel.fetch_message(int(review_message_id))
+                    except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                        view.review_message = None
+                if expires_at <= now:
+                    await self._expire_review(view)
+                    continue
+                self.bot.add_view(view, message_id=int(review_message_id))
+                self._active_views[int(review_message_id)] = view
+
+    async def _expire_review(self, view: ReviewView) -> None:
+        guild = self.bot.get_guild(view.guild_id)
+        if guild is None:
+            self._active_views.pop(view.active_key or view.target_id, None)
+            await self._delete_pending_review(guild, view.active_key)
+            view.stop()
+            return
+        member = guild.get_member(view.target_id)
+        if member is not None and view.pending_mute_role_id is not None:
+            mute_role = guild.get_role(view.pending_mute_role_id)
+            if mute_role is not None and mute_role in member.roles:
+                try:
+                    await member.remove_roles(mute_role, reason="Honeypot review expired; removing pending mute.")
+                except discord.HTTPException:
+                    pass
+        view._disable_all()
+        embed = view.review_message.embeds[0] if view.review_message and view.review_message.embeds else None
+        if embed:
+            embed.color = discord.Color.green()
+            embed.add_field(
+                name=_("Reviewed by:"),
+                value=_("Automatic timeout"),
+                inline=False,
+            )
+            embed.add_field(
+                name=_("Action taken:"),
+                value=_("Ignored (review timed out)"),
+                inline=False,
+            )
+        if view.review_message is not None:
+            try:
+                await view.review_message.edit(content=_("✅ **Review completed**"), embed=embed, view=view)
+            except discord.HTTPException:
+                pass
+        await self._increment_stat(guild, "review_expired")
+        await self._increment_stat(guild, "ignored")
+        self._active_views.pop(view.active_key or view.target_id, None)
+        await self._delete_pending_review(guild, view.active_key)
+        view.stop()
+
     # ─── Detection ────────────────────────────────────────────────────────
 
-    async def _is_suspicious(self, message: discord.Message) -> bool:
+    async def _suspicion_reasons(self, message: discord.Message) -> list[str]:
+        reasons: list[str] = []
         content = message.content.lower()
         if re.search(r"https?://[^\s]+", content):
-            return True
+            reasons.append(_("Contains a link."))
         if message.author.created_at > datetime.now(timezone.utc) - timedelta(days=7):
-            return True
-        if any(kw in content for kw in SCAM_KEYWORDS):
-            return True
+            reasons.append(_("Account is less than 7 days old."))
+        matched_keywords = [kw for kw in SCAM_KEYWORDS if kw in content]
+        if matched_keywords:
+            reasons.append(_("Matched scam keyword(s): {keywords}").format(keywords=", ".join(matched_keywords[:5])))
         if message.attachments and message.author.created_at > datetime.now(timezone.utc) - timedelta(days=30):
-            return True
-        return False
+            reasons.append(_("Has attachments from an account less than 30 days old."))
+        return reasons
 
     async def _purge_user_messages(
         self, channel: discord.TextChannel | discord.Thread, author_id: int, minutes: int
@@ -366,23 +549,29 @@ class Honeypot(Cog):
         return deleted
 
     async def _execute_action(
-        self, message: discord.Message, config: dict, reason: str
+        self, message: discord.Message, config: dict, reason: str, action: str | None = None
     ) -> tuple[str | None, str | None]:
         """Execute the configured action (kick/ban) against the message author.
         Returns (action_label, failed_message) where failed_message is None on success.
         """
-        action = config["action"]
-        if action is None:
+        action = action or config["action"]
+        if action not in ("kick", "ban"):
             return (_("No action configured."), None)
+        if config.get("dry_run"):
+            await self._increment_stat(message.guild, "dry_run_actions")
+            return (_("Dry run: would have {action}ed the member.").format(action=action), None)
         try:
             if action == "kick":
                 await message.author.kick(reason=reason)
+                await self._increment_stat(message.guild, "kicked")
             elif action == "ban":
                 await message.author.ban(
                     reason=reason,
                     delete_message_days=config["ban_delete_message_days"],
                 )
+                await self._increment_stat(message.guild, "banned")
         except discord.HTTPException as e:
+            await self._increment_stat(message.guild, "failed_actions")
             return (None, _("**Failed:** An error occurred while trying to take action:\n") + box(str(e), lang="py"))
         try:
             await modlog.create_case(
@@ -398,6 +587,92 @@ class Honeypot(Cog):
             pass
         label = _("The member has been kicked.") if action == "kick" else _("The member has been banned.")
         return (label, None)
+
+    async def _send_review(
+        self,
+        message: discord.Message,
+        config: dict,
+        embed: discord.Embed,
+        review_channel: discord.TextChannel | discord.Thread,
+        logs_channel: discord.TextChannel | discord.Thread,
+    ) -> None:
+        embed.color = discord.Color.gold()
+        embed.title = _("Honeypot — Review Required")
+        embed.add_field(
+            name=_("Status:"),
+            value=_("⏳ Pending moderator review"),
+            inline=False,
+        )
+        pending_mute_role_id = None
+        if mute_role_id := config.get("mute_role"):
+            mute_role = message.guild.get_role(mute_role_id)
+            if mute_role is not None and mute_role not in message.author.roles:
+                try:
+                    await message.author.add_roles(
+                        mute_role,
+                        reason="Honeypot review pending; temporary containment mute.",
+                    )
+                    pending_mute_role_id = mute_role.id
+                    await self._increment_stat(message.guild, "pending_mutes")
+                    embed.add_field(
+                        name=_("Pending review mute:"),
+                        value=_("Mute role applied until moderators complete review."),
+                        inline=False,
+                    )
+                except discord.HTTPException:
+                    await self._increment_stat(message.guild, "pending_mute_failures")
+                    embed.add_field(
+                        name=_("Pending review mute:"),
+                        value=_("Failed to apply mute role. Check bot permissions."),
+                        inline=False,
+                    )
+        attachment_urls = [a.url for a in message.attachments]
+        view = ReviewView(
+            self,
+            message.author.id,
+            message.guild.id,
+            message.content,
+            attachment_urls,
+            pending_mute_role_id=pending_mute_role_id,
+            review_timeout_minutes=config.get("review_timeout_minutes", 1440),
+        )
+        embed.add_field(
+            name=_("Review expires:"),
+            value=discord.utils.format_dt(view.expires_at, style="R"),
+            inline=False,
+        )
+        review_files = []
+        for attachment in message.attachments[:10]:
+            try:
+                f = await attachment.to_file()
+                review_files.append(f)
+            except Exception:
+                pass
+        ping_content = None
+        if ping_role_id := config.get("ping_role"):
+            if ping_role := message.guild.get_role(ping_role_id):
+                ping_content = ping_role.mention
+        review_send_kwargs = {
+            "content": ping_content,
+            "embed": embed,
+            "view": view,
+        }
+        if review_files:
+            review_send_kwargs["files"] = review_files
+        sent = await review_channel.send(**review_send_kwargs)
+        view.review_message = sent
+        view.active_key = sent.id
+        self._active_views[sent.id] = view
+        await self._store_pending_review(message.guild, view, review_channel.id, sent.id)
+        await self._increment_stat(message.guild, "reviewed")
+        await logs_channel.send(
+            _("🟡 **Review required** for {user} ({user_id}) — sent to {channel}.").format(
+                user=message.author.mention,
+                user_id=message.author.id,
+                channel=review_channel.mention,
+            ),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -430,6 +705,7 @@ class Honeypot(Cog):
             await message.delete()
         except discord.HTTPException:
             pass
+        await self._increment_stat(message.guild, "detections")
 
         whitelisted_role_ids: list[int] = config.get("whitelisted_roles", [])
         has_whitelist_role = any(
@@ -453,6 +729,19 @@ class Honeypot(Cog):
                 value="\n".join(a.url for a in message.attachments[:5]),
                 inline=False,
             )
+        account_age = datetime.now(timezone.utc) - message.author.created_at
+        embed.add_field(
+            name=_("Account age:"),
+            value=_("{days} days").format(days=account_age.days),
+            inline=True,
+        )
+        if message.author.joined_at is not None:
+            joined_age = datetime.now(timezone.utc) - message.author.joined_at
+            embed.add_field(
+                name=_("Server age:"),
+                value=_("{days} days").format(days=joined_age.days),
+                inline=True,
+            )
 
         # Purge — always runs before any action/review
         purged = 0
@@ -461,106 +750,97 @@ class Honeypot(Cog):
                 message.channel, message.author.id, config["purge_minutes"]
             )
         if purged:
+            await self._increment_stat(message.guild, "purged_messages", purged)
             embed.add_field(
                 name=_("Purged messages:"),
                 value=str(purged),
                 inline=True,
             )
 
-        # Whitelisted role — delete + log only, no punishment
+        force_review = False
         if has_whitelist_role:
+            whitelist_mode = config.get("whitelist_mode", "bypass")
+            await self._increment_stat(message.guild, "whitelisted")
             embed.add_field(
                 name=_("Whitelisted role:"),
-                value=_("User has a whitelisted role — no punishment applied."),
+                value=_("User has a whitelisted role. Mode: `{mode}`.").format(mode=whitelist_mode),
                 inline=False,
             )
+            if whitelist_mode == "bypass":
+                embed.color = discord.Color.orange()
+                embed.add_field(name=_("Action:"), value=_("No punishment applied."), inline=False)
+                await logs_channel.send(embed=embed)
+                return
+            if whitelist_mode == "review":
+                force_review = True
+
+        suspicion_reasons = await self._suspicion_reasons(message)
+        suspicious = bool(suspicion_reasons)
+        if suspicion_reasons:
+            await self._increment_stat(message.guild, "suspicious")
+            embed.add_field(
+                name=_("Trigger reason(s):"),
+                value="\n".join(f"- {reason}" for reason in suspicion_reasons),
+                inline=False,
+            )
+
+        review_channel = None
+        if config.get("review_channel") is not None:
+            review_channel = self._get_text_channel_or_thread(message.guild, config["review_channel"])
+        fallback_action = config.get("fallback_action", "review")
+        should_review = force_review or (
+            not suspicious
+            and fallback_action == "review"
+            and config["review_enabled"]
+            and review_channel is not None
+        )
+
+        if should_review and review_channel is not None:
+            await self._send_review(message, config, embed, review_channel, logs_channel)
+            return
+
+        if force_review and review_channel is None:
             embed.color = discord.Color.orange()
+            embed.add_field(
+                name=_("Action:"),
+                value=_("No punishment applied because whitelist mode requires review, but no review channel is available."),
+                inline=False,
+            )
             await logs_channel.send(embed=embed)
             return
 
-        # Determine path: suspicious → instant action, otherwise → possible review
-        suspicious = await self._is_suspicious(message)
-
         if suspicious:
-            # Instant action — scammer detected
-            action_label, failed = await self._execute_action(message, config, reason="Self bot/scammer detected (message in the HoneyPot channel).")
+            action_label, failed = await self._execute_action(
+                message,
+                config,
+                reason="Self bot/scammer detected (message in the HoneyPot channel).",
+            )
             embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
+            if failed:
+                embed.color = discord.Color.dark_red()
+                embed.add_field(name=_("Staff attention:"), value=_("Automatic action failed."), inline=False)
         else:
-            # Not obviously a scammer — maybe accidental poster
-            if config["review_enabled"] and (review_channel_id := config["review_channel"]) is not None:
-                review_channel = self._get_text_channel_or_thread(message.guild, review_channel_id)
-                if review_channel is not None:
-                    embed.color = discord.Color.gold()
-                    embed.title = _("Honeypot — Review Required")
-                    embed.add_field(
-                        name=_("Status:"),
-                        value=_("⏳ Pending moderator review"),
-                        inline=False,
-                    )
-                    pending_mute_role_id = None
-                    if mute_role_id := config.get("mute_role"):
-                        mute_role = message.guild.get_role(mute_role_id)
-                        if mute_role is not None and mute_role not in message.author.roles:
-                            try:
-                                await message.author.add_roles(
-                                    mute_role,
-                                    reason="Honeypot review pending; temporary containment mute.",
-                                )
-                                pending_mute_role_id = mute_role.id
-                                embed.add_field(
-                                    name=_("Pending review mute:"),
-                                    value=_("Mute role applied until moderators complete review."),
-                                    inline=False,
-                                )
-                            except discord.HTTPException:
-                                embed.add_field(
-                                    name=_("Pending review mute:"),
-                                    value=_("Failed to apply mute role. Check bot permissions."),
-                                    inline=False,
-                                )
-                    attachment_urls = [a.url for a in message.attachments]
-                    view = ReviewView(
-                        self,
-                        message.author.id,
-                        message.guild.id,
-                        message.content,
-                        attachment_urls,
-                        pending_mute_role_id=pending_mute_role_id,
-                    )
-                    review_files = []
-                    for attachment in message.attachments[:10]:
-                        try:
-                            f = await attachment.to_file()
-                            review_files.append(f)
-                        except Exception:
-                            pass
-                    ping_content = None
-                    if ping_role_id := config.get("ping_role"):
-                        if ping_role := message.guild.get_role(ping_role_id):
-                            ping_content = ping_role.mention
-                    review_send_kwargs = {
-                        "content": ping_content,
-                        "embed": embed,
-                        "view": view,
-                    }
-                    if review_files:
-                        review_send_kwargs["files"] = review_files
-                    sent = await review_channel.send(**review_send_kwargs)
-                    view.review_message = sent
-                    self._active_views[message.author.id] = view
-                    await logs_channel.send(
-                        _("🟡 **Review required** for {user} ({user_id}) — sent to {channel}.").format(
-                            user=message.author.mention,
-                            user_id=message.author.id,
-                            channel=review_channel.mention,
-                        ),
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    return
-
-            # Review disabled or channel not set — fallback to auto-action
-            action_label, failed = await self._execute_action(message, config, reason="User posted in honeypot channel (no scam pattern detected).")
-            embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
+            if fallback_action == "none":
+                embed.color = discord.Color.orange()
+                embed.add_field(name=_("Action:"), value=_("No fallback action configured."), inline=False)
+            elif fallback_action == "review":
+                embed.color = discord.Color.orange()
+                embed.add_field(
+                    name=_("Action:"),
+                    value=_("No fallback action applied because review is unavailable."),
+                    inline=False,
+                )
+            else:
+                action_label, failed = await self._execute_action(
+                    message,
+                    config,
+                    reason="User posted in honeypot channel (no scam pattern detected).",
+                    action=fallback_action,
+                )
+                embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
+                if failed:
+                    embed.color = discord.Color.dark_red()
+                    embed.add_field(name=_("Staff attention:"), value=_("Fallback action failed."), inline=False)
 
         embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
         await logs_channel.send(
@@ -624,6 +904,60 @@ class Honeypot(Cog):
                 "Please configure the remaining settings (action, logs channel, etc.) before enabling."
             ).format(channel=honeypot_channel),
         )
+
+    @sethoneypot.command(name="stats")
+    async def honeypot_stats(self, ctx: commands.Context) -> None:
+        """Show honeypot moderation statistics for this server."""
+        stats = DEFAULT_STATS.copy()
+        stats.update(await self.config.guild(ctx.guild).stats())
+        lines = [f"{key}: {value}" for key, value in stats.items()]
+        await ctx.send(_("**Honeypot stats:**\n") + box("\n".join(lines)))
+
+    @sethoneypot.command(name="resetstats")
+    async def honeypot_reset_stats(self, ctx: commands.Context) -> None:
+        """Reset honeypot moderation statistics for this server."""
+        await self.config.guild(ctx.guild).stats.set(DEFAULT_STATS.copy())
+        await ctx.send(_("✅ Honeypot stats reset."))
+
+    @sethoneypot.command(name="doctor")
+    async def honeypot_doctor(self, ctx: commands.Context) -> None:
+        """Check common honeypot configuration and permission problems."""
+        config = await self.config.guild(ctx.guild).all()
+        checks: list[tuple[str, bool, str]] = []
+        me = ctx.guild.me
+        honeypot_channel = self._get_text_channel_or_thread(ctx.guild, config.get("honeypot_channel"))
+        logs_channel = self._get_text_channel_or_thread(ctx.guild, config.get("logs_channel"))
+        review_channel = self._get_text_channel_or_thread(ctx.guild, config.get("review_channel"))
+        checks.append(("Cog enabled", bool(config.get("enabled")), "Run `sethoneypot enabled true`."))
+        checks.append(("Suspicious action set", config.get("action") in ("kick", "ban"), "Set `action` to `kick` or `ban`."))
+        checks.append(("Honeypot channel exists", honeypot_channel is not None, "Set `honeypotchannel`."))
+        checks.append(("Logs channel exists", logs_channel is not None, "Set `logschannel`."))
+        if config.get("fallback_action") == "review" or config.get("review_enabled") or config.get("whitelist_mode") == "review":
+            checks.append(("Review channel exists", review_channel is not None, "Set `reviewchannel` or change `fallbackaction`."))
+        if config.get("mute_role"):
+            mute_role = ctx.guild.get_role(config["mute_role"])
+            checks.append(("Mute role exists", mute_role is not None, "Set `muterole` again."))
+            if mute_role is not None:
+                checks.append(("Bot is above mute role", me.top_role > mute_role, "Move the bot role above the mute role."))
+        if honeypot_channel is not None:
+            perms = honeypot_channel.permissions_for(me)
+            checks.append(("Can view honeypot", perms.view_channel, "Grant View Channel."))
+            checks.append(("Can read history", perms.read_message_history, "Grant Read Message History."))
+            checks.append(("Can manage messages", perms.manage_messages, "Grant Manage Messages."))
+        if logs_channel is not None:
+            perms = logs_channel.permissions_for(me)
+            checks.append(("Can send logs", perms.send_messages, "Grant Send Messages in logs channel."))
+        if review_channel is not None:
+            perms = review_channel.permissions_for(me)
+            checks.append(("Can send review", perms.send_messages, "Grant Send Messages in review channel."))
+        guild_perms = me.guild_permissions
+        checks.append(("Can kick members", guild_perms.kick_members, "Grant Kick Members if using kick."))
+        checks.append(("Can ban members", guild_perms.ban_members, "Grant Ban Members if using ban."))
+        checks.append(("Can manage roles", guild_perms.manage_roles, "Grant Manage Roles for review mute."))
+        failed = [f"❌ {name} - {hint}" for name, ok, hint in checks if not ok]
+        passed = [f"✅ {name}" for name, ok, _hint in checks if ok]
+        body = "\n".join(passed + failed)
+        await ctx.send(_("**Honeypot doctor:**\n{body}").format(body=body))
 
     # ─── Whitelisted Roles ────────────────────────────────────────────────
 

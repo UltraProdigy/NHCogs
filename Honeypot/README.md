@@ -7,13 +7,19 @@ Honeypot is a Red-DiscordBot cog that creates a visible trap channel for self-bo
 - Creates a dedicated `#honeypot` channel at the top of the server.
 - Detects suspicious posts using links, scam keywords, new-account age, and attachments from newer accounts.
 - Supports automatic `kick` or `ban` actions.
+- Supports dry-run mode for safe production testing.
+- Supports separate handling for suspicious and non-suspicious honeypot posts.
 - Supports moderator review for less obvious cases.
 - Applies the configured mute role while a user is waiting for moderator review.
+- Automatically ignores timed-out reviews and removes the pending review mute.
+- Restores pending review buttons after bot restarts.
+- Shows trigger reasons in logs and review embeds.
 - Deletes the triggering message immediately.
 - Optionally purges recent messages from the same user in the honeypot channel.
 - Supports whitelisted roles that are logged but not punished.
 - Supports a ping role for alerts.
-- Can post fake activity messages to make the trap channel look active.
+- Can post clear warning messages to make the trap channel look monitored.
+- Includes stats and doctor commands for operational checks.
 - Creates Red modlog cases for punishment actions when possible.
 
 ## Installation
@@ -88,6 +94,8 @@ Only the server owner can use the `sethoneypot` command group.
 
 - `[p]sethoneypot enabled <true|false>` - Enables or disables detection.
 - `[p]sethoneypot action <kick|ban>` - Sets the automatic punishment.
+- `[p]sethoneypot fallbackaction <review|kick|ban|none>` - Sets what happens when a post is not clearly suspicious.
+- `[p]sethoneypot dryrun <true|false>` - Logs what would happen without kicking or banning.
 - `[p]sethoneypot honeypotchannel <channel>` - Sets the trap channel.
 - `[p]sethoneypot logschannel <channel>` - Sets the logging channel.
 - `[p]sethoneypot pingrole <role>` - Sets the role to ping on alerts.
@@ -99,6 +107,14 @@ Only the server owner can use the `sethoneypot` command group.
 - `[p]sethoneypot fakeactivityinterval <1-120>` - Sets fake activity interval in minutes.
 - `[p]sethoneypot reviewenabled <true|false>` - Enables moderator review for non-obvious cases.
 - `[p]sethoneypot reviewchannel <channel>` - Sets the review queue channel.
+- `[p]sethoneypot reviewtimeoutminutes <1-10080>` - Sets review expiration time.
+- `[p]sethoneypot whitelistmode <bypass|review|none>` - Sets how whitelisted roles behave.
+
+### Operational Commands
+
+- `[p]sethoneypot stats` - Shows honeypot counters for this server.
+- `[p]sethoneypot resetstats` - Resets honeypot counters.
+- `[p]sethoneypot doctor` - Checks config, channels, permissions, and role hierarchy.
 
 ### Whitelisted Roles
 
@@ -126,7 +142,7 @@ A message in the honeypot channel is considered suspicious if any of these are t
 
 Suspicious messages are punished immediately using the configured automatic action.
 
-Messages that are not obviously suspicious can be sent to the review channel if review mode is enabled. If review mode is disabled or no review channel is configured, the automatic action is used anyway.
+Messages that are not obviously suspicious follow `fallbackaction`: `review`, `kick`, `ban`, or `none`.
 
 ## Review Flow
 
@@ -139,7 +155,19 @@ When review mode is enabled and a non-obvious message appears in the honeypot ch
 - Attachments are copied into the review message when possible.
 - Moderators with `Moderate Members` permission can choose `Kick`, `Ban`, or `Ignore`.
 - If moderators choose `Ignore`, the pending mute role is removed when it was applied by this review flow.
+- If review expires, it is treated like an automatic `Ignore`: the pending mute role is removed when possible and the review message is marked completed.
+- Pending reviews are stored in Red Config so review buttons and timeout cleanup survive bot restarts.
 - Once a moderator acts, the review buttons are disabled and the embed records who reviewed it.
+
+## Whitelist Modes
+
+- `bypass` - Users with whitelisted roles are logged and not punished.
+- `review` - Users with whitelisted roles are sent to review instead of automatic punishment.
+- `none` - Whitelisted role is only noted; normal detection continues.
+
+## Dry Run
+
+When dry-run mode is enabled, the cog deletes, logs, purges, reviews, and records stats normally, but it does not kick or ban users. Action fields show what would have happened.
 
 ## Permissions Needed
 
@@ -168,3 +196,4 @@ The cog stores only guild configuration: channel IDs, role IDs, booleans, numeri
 - In review mode, a configured mute role is used as temporary containment until moderators decide.
 - The purge only scans recent messages in the honeypot channel, not the entire server.
 - Fake activity runs once per minute internally and only posts when the configured interval has elapsed.
+- Default fake activity messages are explicit warnings such as `BAN CHANNEL - DO NOT WRITE HERE.`
