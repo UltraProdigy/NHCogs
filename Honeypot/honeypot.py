@@ -878,7 +878,7 @@ class Honeypot(Cog):
 
     @commands.guild_only()
     @commands.guildowner()
-    @commands.group()
+    @commands.hybrid_group()
     async def sethoneypot(self, ctx: commands.Context) -> None:
         """Set the honeypot settings. Only the server owner can use this command."""
 
@@ -979,9 +979,17 @@ class Honeypot(Cog):
         body = "\n".join(passed + failed)
         await ctx.send(_("**Honeypot doctor:**\n{body}").format(body=body))
 
+    # ─── Extras Group ──────────────────────────────────────────────────────
+
+    @commands.guild_only()
+    @commands.guildowner()
+    @commands.hybrid_group()
+    async def honeypotextras(self, ctx: commands.Context) -> None:
+        """Additional honeypot settings: whitelisted roles, scam keywords, fake activity messages."""
+
     # ─── Whitelisted Roles ────────────────────────────────────────────────
 
-    @sethoneypot.group(name="whitelistedroles", aliases=["wlroles"])
+    @honeypotextras.group(name="whitelistedroles", aliases=["wlroles"])
     async def whitelisted_roles_group(self, ctx: commands.Context) -> None:
         """Manage whitelisted roles that bypass punishment."""
 
@@ -1019,7 +1027,7 @@ class Honeypot(Cog):
 
     # ─── Scam Keywords ────────────────────────────────────────────────────
 
-    @sethoneypot.group(name="scamkeywords", aliases=["keywords"])
+    @honeypotextras.group(name="scamkeywords", aliases=["keywords"])
     async def scam_keywords_group(self, ctx: commands.Context) -> None:
         """Manage scam keywords used by suspicious-message detection."""
 
@@ -1066,7 +1074,7 @@ class Honeypot(Cog):
 
     # ─── Fake Activity Messages ───────────────────────────────────────────
 
-    @sethoneypot.group(name="fakeactivity", aliases=["fakemsg"])
+    @honeypotextras.group(name="fakeactivity", aliases=["fakemsg"])
     async def fake_activity_group(self, ctx: commands.Context) -> None:
         """Manage fake activity messages for the honeypot channel."""
 
