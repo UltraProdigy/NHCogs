@@ -1,6 +1,9 @@
 import asyncio
+import io
 import logging
 import random
+import re
+import typing
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -46,6 +49,11 @@ SCAM_KEYWORDS = [
     "free robux", "free coins", "boost your server",
     "limited time", "exclusive offer", "free membership",
     "hack", "crack", "generator",
+]
+
+DEFAULT_ATTACHMENT_PATTERNS = [
+    r"^image ?\(\d+\)$",
+    r"^[1-4]$",
 ]
 
 
@@ -244,6 +252,7 @@ class Honeypot(Cog):
             stats=DEFAULT_STATS.copy(),
             pending_reviews={},
             scam_keywords=SCAM_KEYWORDS.copy(),
+            attachment_patterns=DEFAULT_ATTACHMENT_PATTERNS.copy(),
         )
 
         self._last_fake_message: dict[int, datetime] = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
@@ -309,6 +318,93 @@ class Honeypot(Cog):
         if action == "ban" and not permissions.ban_members:
             return _("**Failed:** I do not have the `Ban Members` permission.")
         return None
+
+    def _format_bytes(self, size: int) -> str:
+        if size >= 1024 * 1024:
+            return f"{size / (1024 * 1024):.1f} MB"
+        if size >= 1024:
+            return f"{size / 1024:.1f} KB"
+        return f"{size} B"
+
+    async def _snapshot_attachments(self, message: discord.Message) -> list[dict[str, typing.Any]]:
+        snapshots: list[dict[str, typing.Any]] = []
+        upload_limit = getattr(message.guild, "filesize_limit", 25 * 1024 * 1024)
+        for attachment in message.attachments[:10]:
+            snapshot: dict[str, typing.Any] = {
+                "filename": attachment.filename,
+                "url": attachment.url,
+                "size": attachment.size,
+                "content_type": attachment.content_type,
+                "description": attachment.description,
+                "spoiler": attachment.is_spoiler(),
+                "data": None,
+                "error": None,
+            }
+            if attachment.size > upload_limit:
+                snapshot["error"] = _("too large to re-upload ({size})").format(size=self._format_bytes(attachment.size))
+            else:
+                try:
+                    snapshot["data"] = await attachment.read(use_cached=True)
+                except TypeError:
+                    try:
+                        snapshot["data"] = await attachment.read()
+                    except (discord.HTTPException, discord.Forbidden, discord.NotFound) as exc:
+                        snapshot["error"] = type(exc).__name__
+                except (discord.HTTPException, discord.Forbidden, discord.NotFound) as exc:
+                    snapshot["error"] = type(exc).__name__
+            snapshots.append(snapshot)
+        if len(message.attachments) > 10:
+            snapshots.append(
+                {
+                    "filename": _("Additional attachments"),
+                    "url": None,
+                    "size": 0,
+                    "content_type": None,
+                    "description": None,
+                    "spoiler": False,
+                    "data": None,
+                    "error": _("{count} more attachment(s) not copied; Discord allows 10 files per message.").format(
+                        count=len(message.attachments) - 10
+                    ),
+                }
+            )
+        return snapshots
+
+    def _attachment_files(self, attachment_snapshots: list[dict[str, typing.Any]]) -> list[discord.File]:
+        files: list[discord.File] = []
+        for snapshot in attachment_snapshots:
+            data = snapshot.get("data")
+            if data is None:
+                continue
+            files.append(
+                discord.File(
+                    io.BytesIO(data),
+                    filename=snapshot["filename"],
+                    spoiler=snapshot.get("spoiler", False),
+                    description=snapshot.get("description"),
+                )
+            )
+        return files
+
+    def _attachment_summary(self, attachment_snapshots: list[dict[str, typing.Any]]) -> str | None:
+        if not attachment_snapshots:
+            return None
+        lines: list[str] = []
+        for snapshot in attachment_snapshots:
+            filename = snapshot["filename"]
+            if snapshot.get("url"):
+                line = f"[{filename}]({snapshot['url']})"
+            else:
+                line = str(filename)
+            if snapshot.get("size"):
+                line += f" ({self._format_bytes(snapshot['size'])})"
+            if snapshot.get("data") is not None:
+                line += " - copied"
+            elif snapshot.get("error"):
+                line += f" - {snapshot['error']}"
+            lines.append(line)
+        summary = "\n".join(lines)
+        return summary if len(summary) <= 1024 else summary[:1000] + "\n..."
 
     async def cog_load(self) -> None:
         await super().cog_load()
@@ -463,6 +559,22 @@ class Honeypot(Cog):
             reasons.append(_("Matched keyword: {keywords}").format(keywords=", ".join(matched_keywords[:5])))
         if message.attachments and message.author.created_at > datetime.now(timezone.utc) - timedelta(days=14):
             reasons.append(_("Attachment from an account under 14 days old"))
+        attachment_patterns = config.get("attachment_patterns") or DEFAULT_ATTACHMENT_PATTERNS
+        filenames = [attachment.filename.lower() for attachment in message.attachments]
+        image_name_count = sum(1 for filename in filenames if filename.rsplit(".", 1)[0] == "image")
+        if image_name_count >= 4:
+            reasons.append(_("Repeated attachment basename: image x{count}").format(count=image_name_count))
+        filename_bases = [filename.rsplit(".", 1)[0] for filename in filenames]
+        matched_patterns = []
+        for pattern in attachment_patterns:
+            try:
+                matches = sum(1 for filename_base in filename_bases if re.fullmatch(pattern, filename_base, flags=re.IGNORECASE))
+            except re.error:
+                continue
+            if matches >= 4:
+                matched_patterns.append(pattern)
+        if matched_patterns:
+            reasons.append(_("Matched attachment pattern: {patterns}").format(patterns=", ".join(matched_patterns[:3])))
         return reasons
 
     async def _purge_user_messages(
@@ -531,6 +643,7 @@ class Honeypot(Cog):
         embed: discord.Embed,
         review_channel: discord.TextChannel | discord.Thread,
         logs_channel: discord.TextChannel | discord.Thread,
+        attachment_snapshots: list[dict[str, typing.Any]],
     ) -> None:
         embed.color = discord.Color.gold()
         embed.title = _("Review needed")
@@ -577,13 +690,7 @@ class Honeypot(Cog):
             value=discord.utils.format_dt(view.expires_at, style="R"),
             inline=False,
         )
-        review_files = []
-        for attachment in message.attachments[:10]:
-            try:
-                f = await attachment.to_file()
-                review_files.append(f)
-            except Exception:
-                log.exception("Failed to download attachment for review")
+        review_files = self._attachment_files(attachment_snapshots)
         ping_content = None
         if ping_role_id := config.get("ping_role"):
             if ping_role := message.guild.get_role(ping_role_id):
@@ -611,6 +718,22 @@ class Honeypot(Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    async def _send_log(
+        self,
+        channel: discord.TextChannel | discord.Thread,
+        embed: discord.Embed,
+        attachment_snapshots: list[dict[str, typing.Any]],
+        content: str | None = None,
+        allowed_mentions: discord.AllowedMentions | None = None,
+    ) -> None:
+        send_kwargs: dict[str, typing.Any] = {"content": content, "embed": embed}
+        if allowed_mentions is not None:
+            send_kwargs["allowed_mentions"] = allowed_mentions
+        files = self._attachment_files(attachment_snapshots)
+        if files:
+            send_kwargs["files"] = files
+        await channel.send(**send_kwargs)
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if message.guild is None:
@@ -634,6 +757,8 @@ class Honeypot(Cog):
         ):
             return
 
+        attachment_snapshots = await self._snapshot_attachments(message)
+
         try:
             await message.delete()
         except discord.HTTPException:
@@ -656,10 +781,11 @@ class Honeypot(Cog):
             icon_url=message.author.display_avatar,
         )
         embed.set_thumbnail(url=message.author.display_avatar)
-        if message.attachments:
+        attachment_summary = self._attachment_summary(attachment_snapshots)
+        if attachment_summary:
             embed.add_field(
                 name=_("Attachments:"),
-                value="\n".join(a.url for a in message.attachments[:5]),
+                value=attachment_summary,
                 inline=False,
             )
         account_age = datetime.now(timezone.utc) - message.author.created_at
@@ -691,6 +817,7 @@ class Honeypot(Cog):
             )
 
         force_review = False
+        force_fallback = False
         if has_whitelist_role:
             whitelist_mode = config.get("whitelist_mode", "bypass")
             await self._increment_stat(message.guild, "whitelisted")
@@ -702,10 +829,12 @@ class Honeypot(Cog):
             if whitelist_mode == "bypass":
                 embed.color = discord.Color.orange()
                 embed.add_field(name=_("Action:"), value=_("No action taken."), inline=False)
-                await logs_channel.send(embed=embed)
+                await self._send_log(logs_channel, embed, attachment_snapshots)
                 return
             if whitelist_mode == "review":
                 force_review = True
+            elif whitelist_mode == "fallback":
+                force_fallback = True
 
         suspicion_reasons = await self._suspicion_reasons(message, config)
         suspicious = bool(suspicion_reasons)
@@ -720,16 +849,21 @@ class Honeypot(Cog):
         review_channel = None
         if config.get("review_channel") is not None:
             review_channel = self._get_text_channel_or_thread(message.guild, config["review_channel"])
+        action = config.get("action")
         fallback_action = config.get("fallback_action", "review")
         should_review = force_review or (
-            not suspicious
+            action == "review"
+            and config["review_enabled"]
+            and review_channel is not None
+        ) or (
+            (not suspicious or force_fallback)
             and fallback_action == "review"
             and config["review_enabled"]
             and review_channel is not None
         )
 
         if should_review and review_channel is not None:
-            await self._send_review(message, config, embed, review_channel, logs_channel)
+            await self._send_review(message, config, embed, review_channel, logs_channel, attachment_snapshots)
             return
 
         if force_review and review_channel is None:
@@ -739,20 +873,24 @@ class Honeypot(Cog):
                 value=_("No action taken. This whitelist mode needs a review channel, but none is available."),
                 inline=False,
             )
-            await logs_channel.send(embed=embed)
+            await self._send_log(logs_channel, embed, attachment_snapshots)
             return
 
-        if suspicious:
-            action_label, failed = await self._execute_action(
-                message,
-                config,
-                reason="Suspicious post in the honeypot channel.",
-            )
-            embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
-            if failed:
-                embed.color = discord.Color.dark_red()
-                embed.add_field(name=_("Staff check needed:"), value=_("Automatic action failed."), inline=False)
-        else:
+        if suspicious and not force_fallback:
+            if action in ("review", "none"):
+                pass
+            else:
+                action_label, failed = await self._execute_action(
+                    message,
+                    config,
+                    reason="Suspicious post in the honeypot channel.",
+                )
+                embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
+                if failed:
+                    embed.color = discord.Color.dark_red()
+                    embed.add_field(name=_("Staff check needed:"), value=_("Automatic action failed."), inline=False)
+
+        if not suspicious or force_fallback or suspicious and action in ("review", "none"):
             if fallback_action == "none":
                 embed.color = discord.Color.orange()
                 embed.add_field(name=_("Action:"), value=_("No fallback action set."), inline=False)
@@ -776,14 +914,16 @@ class Honeypot(Cog):
                     embed.add_field(name=_("Staff check needed:"), value=_("Fallback action failed."), inline=False)
 
         embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
-        await logs_channel.send(
+        await self._send_log(
+            logs_channel,
+            embed,
+            attachment_snapshots,
             content=(
                 ping_role.mention
                 if (ping_role_id := config["ping_role"]) is not None
                 and (ping_role := message.guild.get_role(ping_role_id)) is not None
                 else None
             ),
-            embed=embed,
             allowed_mentions=discord.AllowedMentions(roles=True),
         )
 
@@ -813,12 +953,12 @@ class Honeypot(Cog):
 
     @core.command()
     async def action(self, ctx: commands.Context, value: str = None) -> None:
-        """Action to take for suspicious users: kick or ban."""
+        """Main action for suspicious users: kick, ban, review, or none."""
         if value is None:
             v = await self.config.guild(ctx.guild).action()
             await ctx.send(_("Action: {value}").format(value=v or _("not set")))
-        elif value not in ("kick", "ban"):
-            await ctx.send(_("Action must be `kick` or `ban`."))
+        elif value not in ("kick", "ban", "review", "none"):
+            await ctx.send(_("Action must be `kick`, `ban`, `review`, or `none`."))
         else:
             await self.config.guild(ctx.guild).action.set(value)
             await ctx.send(_("✅ Action set to {value}").format(value=value))
@@ -847,12 +987,12 @@ class Honeypot(Cog):
 
     @core.command(name="whitelist_mode")
     async def whitelist_mode(self, ctx: commands.Context, value: str = None) -> None:
-        """How whitelisted roles behave: bypass, review, or none."""
+        """How whitelisted roles behave: bypass, review, fallback, or none."""
         if value is None:
             v = await self.config.guild(ctx.guild).whitelist_mode()
             await ctx.send(_("Whitelist mode: {value}").format(value=v))
-        elif value not in ("bypass", "review", "none"):
-            await ctx.send(_("Must be `bypass`, `review`, or `none`."))
+        elif value not in ("bypass", "review", "fallback", "none"):
+            await ctx.send(_("Must be `bypass`, `review`, `fallback`, or `none`."))
         else:
             await self.config.guild(ctx.guild).whitelist_mode.set(value)
             await ctx.send(_("✅ Whitelist mode set to {value}").format(value=value))
@@ -1157,6 +1297,47 @@ class Honeypot(Cog):
         """Reset keywords to defaults."""
         await self.config.guild(ctx.guild).scam_keywords.set(SCAM_KEYWORDS.copy())
         await ctx.send(_("✅ Keywords reset to defaults."))
+
+    @keywords.group(name="attachments")
+    async def keyword_attachments(self, ctx: commands.Context) -> None:
+        """Manage suspicious attachment filename regexes."""
+
+    @keyword_attachments.command(name="add")
+    async def keyword_attachments_add(self, ctx: commands.Context, *, pattern: str) -> None:
+        """Add an attachment filename-base regex. It triggers when 4+ files match."""
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise commands.UserFeedbackCheckFailure(_("Invalid regex: {error}").format(error=exc))
+        async with self.config.guild(ctx.guild).attachment_patterns() as patterns:
+            if pattern in patterns:
+                raise commands.UserFeedbackCheckFailure(_("Pattern already exists."))
+            patterns.append(pattern)
+        await ctx.send(_("✅ Attachment pattern added: `{pattern}`").format(pattern=pattern))
+
+    @keyword_attachments.command(name="remove")
+    async def keyword_attachments_remove(self, ctx: commands.Context, *, pattern: str) -> None:
+        """Remove an attachment filename-base regex."""
+        async with self.config.guild(ctx.guild).attachment_patterns() as patterns:
+            if pattern not in patterns:
+                raise commands.UserFeedbackCheckFailure(_("Pattern not found."))
+            patterns.remove(pattern)
+        await ctx.send(_("✅ Attachment pattern removed: `{pattern}`").format(pattern=pattern))
+
+    @keyword_attachments.command(name="list")
+    async def keyword_attachments_list(self, ctx: commands.Context) -> None:
+        """List attachment filename-base regexes."""
+        patterns = await self.config.guild(ctx.guild).attachment_patterns()
+        if not patterns:
+            await ctx.send(_("No attachment patterns configured."))
+            return
+        await ctx.send(_("**Attachment patterns:**\n{lines}").format(lines="\n".join(f"`{i}.` {pattern}" for i, pattern in enumerate(patterns, 1))))
+
+    @keyword_attachments.command(name="reset")
+    async def keyword_attachments_reset(self, ctx: commands.Context) -> None:
+        """Reset attachment filename-base regexes to defaults."""
+        await self.config.guild(ctx.guild).attachment_patterns.set(DEFAULT_ATTACHMENT_PATTERNS.copy())
+        await ctx.send(_("✅ Attachment patterns reset to defaults."))
 
     # ─── stats ────────────────────────────────────────────────────────
 

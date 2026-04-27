@@ -126,11 +126,14 @@ Only the server owner can use the `sethoneypot` command group.
 
 ### Scam Keywords
 
-- `[p]sethoneypot scamkeywords add <keyword or phrase>` - Adds a scam keyword.
-- `[p]sethoneypot scamkeywords remove <keyword or phrase>` - Removes a scam keyword.
-- `[p]sethoneypot scamkeywords list` - Lists configured scam keywords.
-- `[p]sethoneypot scamkeywords reset` - Resets scam keywords to defaults.
-- `[p]sethoneypot keywords ...` - Alias for `scamkeywords`.
+- `[p]honeypot keywords add <keyword or phrase>` - Adds a scam keyword.
+- `[p]honeypot keywords remove <keyword or phrase>` - Removes a scam keyword.
+- `[p]honeypot keywords list` - Lists configured scam keywords.
+- `[p]honeypot keywords reset` - Resets scam keywords to defaults.
+- `[p]honeypot keywords attachments add <regex>` - Adds an attachment filename-base regex. It triggers when 4 or more files match.
+- `[p]honeypot keywords attachments remove <regex>` - Removes an attachment filename-base regex.
+- `[p]honeypot keywords attachments list` - Lists attachment filename-base regexes.
+- `[p]honeypot keywords attachments reset` - Restores default attachment filename-base regexes.
 
 ### Fake Activity Messages
 
@@ -147,6 +150,8 @@ A message in the honeypot channel is considered suspicious if any of these are t
 - The author account is less than 7 days old.
 - The content contains known scam keywords such as free Nitro, giveaway, generator, claim your, or similar phrases.
 - It has attachments and the author account is less than 14 days old.
+- It has 4 or more attachments whose filename base is exactly `image`, regardless of extension.
+- It has 4 or more attachments matching a configured suspicious filename-base pattern, such as `image (1)` / `image(1)` variants or `1`, `2`, `3`, `4`, regardless of extension.
 
 Suspicious messages are punished immediately using the configured automatic action.
 
