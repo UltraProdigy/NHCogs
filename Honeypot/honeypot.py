@@ -174,6 +174,13 @@ class ReviewView(discord.ui.View):
             await self.cog._increment_stat(guild, "failed_actions")
             return (missing_permission, None)
         try:
+            if self.pending_mute_role_id is not None:
+                mute_role = guild.get_role(self.pending_mute_role_id)
+                if mute_role is not None and mute_role in member.roles:
+                    try:
+                        await member.remove_roles(mute_role, reason=_("Removing pending mute before {action}.").format(action=action))
+                    except discord.HTTPException:
+                        pass
             if action == "kick":
                 await member.kick(reason=reason)
                 await self._create_modlog_case(guild, member, action, reason)
@@ -344,14 +351,17 @@ class Honeypot(Cog):
                 snapshot["error"] = _("too large to re-upload ({size})").format(size=self._format_bytes(attachment.size))
             else:
                 try:
-                    snapshot["data"] = await attachment.read(use_cached=True)
-                except TypeError:
+                    snapshot["data"] = await attachment.read()
+                except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                     try:
-                        snapshot["data"] = await attachment.read()
+                        snapshot["data"] = await attachment.read(use_cached=True)
+                    except TypeError:
+                        snapshot["error"] = _("could not download")
                     except (discord.HTTPException, discord.Forbidden, discord.NotFound) as exc:
-                        snapshot["error"] = type(exc).__name__
-                except (discord.HTTPException, discord.Forbidden, discord.NotFound) as exc:
-                    snapshot["error"] = type(exc).__name__
+                        log.warning("Failed to snapshot attachment %s (%s): %s", attachment.filename, attachment.url, exc)
+                        snapshot["error"] = _("could not download")
+                except TypeError:
+                    snapshot["error"] = _("could not download")
             snapshots.append(snapshot)
         if len(message.attachments) > 10:
             snapshots.append(
