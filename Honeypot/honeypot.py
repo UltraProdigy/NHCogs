@@ -260,6 +260,9 @@ class Honeypot(Cog):
             pending_reviews={},
             scam_keywords=SCAM_KEYWORDS.copy(),
             attachment_patterns=DEFAULT_ATTACHMENT_PATTERNS.copy(),
+            joinwatch_enabled=False,
+            joinwatch_channel=None,
+            joinwatch_min_age_hours=24,
         )
 
         self._last_fake_message: dict[int, datetime] = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
@@ -937,6 +940,37 @@ class Honeypot(Cog):
             allowed_mentions=discord.AllowedMentions(roles=True),
         )
 
+    # ─── New account join alert ────────────────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member) -> None:
+        if await self.bot.cog_disabled_in_guild(self, member.guild):
+            return
+        if member.bot:
+            return
+        config = await self.config.guild(member.guild).all()
+        if not config["joinwatch_enabled"] or config["joinwatch_channel"] is None:
+            return
+        channel = self._get_text_channel_or_thread(member.guild, config["joinwatch_channel"])
+        if channel is None:
+            return
+        min_age = timedelta(hours=config["joinwatch_min_age_hours"])
+        if member.created_at > datetime.now(timezone.utc) - min_age:
+            hours = max(1, round((datetime.now(timezone.utc) - member.created_at).total_seconds() / 3600))
+            embed = discord.Embed(
+                title=_("New account joined"),
+                description=_("{mention} ({id}) joined. Account is ~{hours} hours old.").format(
+                    mention=member.mention, id=member.id, hours=hours,
+                ),
+                color=discord.Color.orange(),
+                timestamp=member.joined_at or datetime.now(timezone.utc),
+            )
+            embed.set_thumbnail(url=member.display_avatar)
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
     # ─── Commands ─────────────────────────────────────────────────────────
 
     @commands.guild_only()
@@ -1348,6 +1382,44 @@ class Honeypot(Cog):
         """Reset attachment filename-base regexes to defaults."""
         await self.config.guild(ctx.guild).attachment_patterns.set(DEFAULT_ATTACHMENT_PATTERNS.copy())
         await ctx.send(_("✅ Attachment patterns reset to defaults."))
+
+    # ─── joinwatch sub-group ──────────────────────────────────────────
+
+    @honeypot.group()
+    async def joinwatch(self, ctx: commands.Context) -> None:
+        """Alert when accounts younger than N hours join."""
+
+    @joinwatch.command()
+    async def enabled(self, ctx: commands.Context, value: bool = None) -> None:
+        """Toggle new account join alerts."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).joinwatch_enabled()
+            await ctx.send(_("Joinwatch enabled: {value}").format(value=v))
+        else:
+            await self.config.guild(ctx.guild).joinwatch_enabled.set(value)
+            await ctx.send(_("✅ Joinwatch enabled set to {value}").format(value=value))
+
+    @joinwatch.command()
+    async def channel(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread = None) -> None:
+        """Channel for new account join alerts."""
+        if target is None:
+            v = await self.config.guild(ctx.guild).joinwatch_channel()
+            await ctx.send(_("Joinwatch channel: {channel}").format(channel=ctx.guild.get_channel(v) if v else _("not set")))
+        else:
+            await self.config.guild(ctx.guild).joinwatch_channel.set(target.id)
+            await ctx.send(_("✅ Joinwatch channel set to {channel.mention}").format(channel=target))
+
+    @joinwatch.command()
+    async def min_age(self, ctx: commands.Context, hours: int = None) -> None:
+        """Max account age in hours to trigger alert (default 24)."""
+        if hours is None:
+            v = await self.config.guild(ctx.guild).joinwatch_min_age_hours()
+            await ctx.send(_("Joinwatch min age: {value} hours").format(value=v))
+        elif hours < 1 or hours > 168:
+            await ctx.send(_("Hours must be between 1 and 168 (1 week)."))
+        else:
+            await self.config.guild(ctx.guild).joinwatch_min_age_hours.set(hours)
+            await ctx.send(_("✅ Joinwatch min age set to {value} hours").format(value=hours))
 
     # ─── stats ────────────────────────────────────────────────────────
 
