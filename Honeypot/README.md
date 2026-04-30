@@ -8,8 +8,8 @@ and either punished automatically or sent to moderators for review. Also alerts 
 
 ```ini
 [p]repo add Honeypot https://github.com/Pxx500/Honeypot
-[p]cog install Honeypot honeypot
-[p]load honeypot
+[p]cog install Honeypot Honeypot
+[p]load Honeypot
 ```
 
 Requires `AAA3A_utils`. Red will show the pip install command if missing.
