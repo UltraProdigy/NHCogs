@@ -8,7 +8,5 @@ Install with Red Downloader:
 [p]load downloader
 [p]repo add Honeypot https://github.com/Pxx500/Honeypot
 [p]cog install Honeypot Honeypot
-[p]load honeypot
+[p]load Honeypot
 ```
-
-See `Honeypot/README.md` for setup and usage details.

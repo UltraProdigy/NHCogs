@@ -1,212 +1,204 @@
 # Honeypot
 
-Honeypot is a Red-DiscordBot cog that creates a visible trap channel for self-bots, scammers, spam accounts, and suspicious users. Messages posted in the configured honeypot channel are deleted, logged, optionally purged from recent history, and then either punished automatically or sent to moderators for review.
-
-## Main Features
-
-- Creates a dedicated `#honeypot` channel at the top of the server.
-- Detects suspicious posts using scam keywords, new-account age, and attachments from newer accounts.
-- Supports automatic `kick` or `ban` actions.
-- Supports dry-run mode for safe production testing.
-- Supports separate handling for suspicious and non-suspicious honeypot posts.
-- Supports moderator review for less obvious cases.
-- Applies the configured mute role while a user is waiting for moderator review.
-- Automatically ignores timed-out reviews and removes the pending review mute.
-- Restores pending review buttons after bot restarts.
-- Shows trigger reasons in logs and review embeds.
-- Supports per-server scam keyword management.
-- Deletes the triggering message immediately.
-- Optionally purges recent messages from the same user in the honeypot channel.
-- Supports whitelisted roles that are logged but not punished.
-- Supports a ping role for alerts.
-- Can post plain staff-style warnings in the trap channel.
-- Includes stats and doctor commands for operational checks.
-- Creates Red modlog cases for punishment actions when possible.
+Honeypot is a Red-DiscordBot cog that protects your server by creating a trap channel for self-bots, scammers,
+spam accounts, and suspicious users. Messages posted in the honeypot channel are deleted, logged, optionally purged,
+and either punished automatically or sent to moderators for review. Also alerts on new accounts joining the server.
 
 ## Installation
 
 ```ini
-[p]repo add AAA3A-cogs https://github.com/AAA3A-AAA3A/AAA3A-cogs
-[p]cog install AAA3A-cogs honeypot
+[p]repo add Honeypot https://github.com/Pxx500/Honeypot
+[p]cog install Honeypot honeypot
 [p]load honeypot
 ```
 
-This cog also requires `AAA3A_utils`. If the dependency is missing, Red will show a load error with the required pip install command.
+Requires `AAA3A_utils`. Red will show the pip install command if missing.
 
-## Recommended Setup
-
-1. Create the trap channel:
+## Quick Setup
 
 ```ini
-[p]sethoneypot createchannel
-```
-
-2. Set a logs channel:
-
-```ini
-[p]sethoneypot logschannel #mod-logs
-```
-
-3. Choose an action:
-
-```ini
-[p]sethoneypot action ban
-```
-
-4. Optionally configure the temporary review mute role:
-
-```ini
-[p]sethoneypot muterole @Muted
-```
-
-5. Optionally configure review mode:
-
-```ini
-[p]sethoneypot reviewenabled true
-[p]sethoneypot reviewchannel #mod-review
-```
-
-6. Optionally configure alert pings:
-
-```ini
-[p]sethoneypot pingrole @Moderators
-```
-
-7. Enable the cog:
-
-```ini
-[p]sethoneypot enabled true
+[p]honeypot channel create
+[p]honeypot channel logs #mod-logs
+[p]honeypot core action ban
+[p]honeypot core enabled true
 ```
 
 ## Commands
 
-Only the server owner can use the `sethoneypot` command group.
+Only the server owner can use `!honeypot` and all subcommands.
 
-### Core Commands
+### core
 
-- `[p]sethoneypot` - Main configuration group.
-- `[p]sethoneypot createchannel` - Creates and stores the honeypot channel.
-- `[p]sethoneypot makechannel` - Alias for `createchannel`.
-- `[p]sethoneypot showsettings [with_dev=False]` - Shows current settings.
-- `[p]sethoneypot resetsetting <setting>` - Resets one setting.
-- `[p]sethoneypot modalconfig [confirmation=False]` - Opens the generated modal configuration flow.
+| Command | Description |
+|---------|-------------|
+| `!honeypot core enabled <bool>` | Toggle the cog on/off |
+| `!honeypot core action <kick\|ban\|review\|none>` | Main action for suspicious posts |
+| `!honeypot core fallback_action <review\|kick\|ban\|none>` | Action for non-suspicious posts |
+| `!honeypot core dry_run <bool>` | Log what would happen without punishing |
+| `!honeypot core whitelist_mode <bypass\|review\|fallback\|none>` | How whitelisted roles behave |
 
-### Generated Settings Commands
+### channel
 
-- `[p]sethoneypot enabled <true|false>` - Enables or disables detection.
-- `[p]sethoneypot action <kick|ban>` - Sets the automatic punishment.
-- `[p]sethoneypot fallbackaction <review|kick|ban|none>` - Sets what happens when a post is not clearly suspicious.
-- `[p]sethoneypot dryrun <true|false>` - Logs what would happen without kicking or banning.
-- `[p]sethoneypot honeypotchannel <channel>` - Sets the trap channel.
-- `[p]sethoneypot logschannel <channel>` - Sets the logging channel.
-- `[p]sethoneypot pingrole <role>` - Sets the role to ping on alerts.
-- `[p]sethoneypot muterole <role>` - Sets the temporary containment role used while review is pending.
-- `[p]sethoneypot bandeletemessagedays <0-7>` - Sets how many days of messages are deleted on ban.
-- `[p]sethoneypot purgeenabled <true|false>` - Enables recent-message purge in the honeypot channel.
-- `[p]sethoneypot purgeminutes <1-60>` - Sets how far back the purge should look.
-- `[p]sethoneypot fakeactivityenabled <true|false>` - Enables fake activity messages.
-- `[p]sethoneypot fakeactivityinterval <1-120>` - Sets fake activity interval in minutes.
-- `[p]sethoneypot reviewenabled <true|false>` - Enables moderator review for non-obvious cases.
-- `[p]sethoneypot reviewchannel <channel>` - Sets the review queue channel.
-- `[p]sethoneypot reviewtimeoutminutes <1-10080>` - Sets review expiration time.
-- `[p]sethoneypot whitelistmode <bypass|review|none>` - Sets how whitelisted roles behave.
+| Command | Description |
+|---------|-------------|
+| `!honeypot channel create` | Create a new `#honeypot` channel at position 0 |
+| `!honeypot channel set <channel>` | Use an existing channel as the honeypot |
+| `!honeypot channel logs <channel>` | Set the logs channel |
+| `!honeypot channel ping_role <role>` | Role to ping on detection |
 
-### Operational Commands
+### punishment
 
-- `[p]sethoneypot stats` - Shows honeypot counters for this server.
-- `[p]sethoneypot resetstats` - Resets honeypot counters.
-- `[p]sethoneypot doctor` - Checks config, channels, permissions, and role hierarchy.
+| Command | Description |
+|---------|-------------|
+| `!honeypot punishment mute_role <role>` | Temp mute role for users awaiting review |
+| `!honeypot punishment delete_days <0-7>` | Days of messages to delete on ban |
 
-### Whitelisted Roles
+### purge
 
-- `[p]sethoneypot whitelistedroles add <role>` - Adds a role that bypasses punishment.
-- `[p]sethoneypot whitelistedroles remove <role>` - Removes a role from the whitelist.
-- `[p]sethoneypot whitelistedroles list` - Lists whitelisted roles.
-- `[p]sethoneypot wlroles ...` - Alias for `whitelistedroles`.
+| Command | Description |
+|---------|-------------|
+| `!honeypot purge enabled <bool>` | Toggle auto-purge of recent messages |
+| `!honeypot purge minutes <1-60>` | Minutes of history to purge |
 
-### Scam Keywords
+### fakeactivity
 
-- `[p]honeypot keywords add <keyword or phrase>` - Adds a scam keyword.
-- `[p]honeypot keywords remove <keyword or phrase>` - Removes a scam keyword.
-- `[p]honeypot keywords list` - Lists configured scam keywords.
-- `[p]honeypot keywords reset` - Resets scam keywords to defaults.
-- `[p]honeypot keywords attachments add <regex>` - Adds an attachment filename-base regex. It triggers when 4 or more files match.
-- `[p]honeypot keywords attachments remove <regex>` - Removes an attachment filename-base regex.
-- `[p]honeypot keywords attachments list` - Lists attachment filename-base regexes.
-- `[p]honeypot keywords attachments reset` - Restores default attachment filename-base regexes.
+| Command | Description |
+|---------|-------------|
+| `!honeypot fakeactivity enabled <bool>` | Toggle fake activity messages |
+| `!honeypot fakeactivity interval <1-120>` | Minutes between fake messages |
+| `!honeypot fakeactivity add <message>` | Add a custom message |
+| `!honeypot fakeactivity remove <index>` | Remove a message by index |
+| `!honeypot fakeactivity list` | List custom messages |
+| `!honeypot fakeactivity reset` | Reset to default messages |
 
-### Fake Activity Messages
+### review
 
-- `[p]sethoneypot fakeactivity add <message>` - Adds a custom fake activity message.
-- `[p]sethoneypot fakeactivity remove <index>` - Removes a custom message by list index.
-- `[p]sethoneypot fakeactivity list` - Lists custom fake activity messages.
-- `[p]sethoneypot fakeactivity reset` - Clears custom messages and returns to defaults.
-- `[p]sethoneypot fakemsg ...` - Alias for `fakeactivity`.
+| Command | Description |
+|---------|-------------|
+| `!honeypot review enabled <bool>` | Toggle moderator review |
+| `!honeypot review channel <channel>` | Channel for review requests |
+| `!honeypot review timeout <1-10080>` | Minutes before review expires |
 
-## Detection Behavior
+### roles
 
-A message in the honeypot channel is considered suspicious if any of these are true:
+| Command | Description |
+|---------|-------------|
+| `!honeypot roles add <role>` | Add a whitelisted role |
+| `!honeypot roles remove <role>` | Remove a whitelisted role |
+| `!honeypot roles list` | List whitelisted roles |
 
-- The author account is less than 7 days old.
-- The content contains known scam keywords such as free Nitro, giveaway, generator, claim your, or similar phrases.
-- It has attachments and the author account is less than 14 days old.
-- It has 4 or more attachments whose filename base is exactly `image`, regardless of extension.
-- It has 4 or more attachments matching a configured suspicious filename-base pattern, such as `image (1)` / `image(1)` variants or `1`, `2`, `3`, `4`, regardless of extension.
+### keywords
 
-Suspicious messages are punished immediately using the configured automatic action.
+| Command | Description |
+|---------|-------------|
+| `!honeypot keywords add <keyword>` | Add a scam keyword |
+| `!honeypot keywords remove <keyword>` | Remove a scam keyword |
+| `!honeypot keywords list` | List scam keywords |
+| `!honeypot keywords reset` | Reset to defaults |
+| `!honeypot keywords attachments add <regex>` | Add filename-base regex (triggers at 4+ matches) |
+| `!honeypot keywords attachments remove <regex>` | Remove a filename regex |
+| `!honeypot keywords attachments list` | List filename regexes |
+| `!honeypot keywords attachments reset` | Reset to default patterns |
 
-Messages that are not obviously suspicious follow `fallbackaction`: `review`, `kick`, `ban`, or `none`.
+### joinwatch
 
-## Review Flow
+| Command | Description |
+|---------|-------------|
+| `!honeypot joinwatch enabled <bool>` | Toggle new-account join alerts |
+| `!honeypot joinwatch channel <channel>` | Channel for join alerts |
+| `!honeypot joinwatch min_age <1-168>` | Max account age in hours to trigger alert |
 
-When review mode is enabled and a non-obvious message appears in the honeypot channel:
+### other
 
-- The original message is deleted.
-- Recent honeypot messages from that user may be purged.
-- If a mute role is configured and the user does not already have it, the mute role is applied while review is pending.
-- A review embed is sent to the configured review channel.
-- Attachments are copied into the review message when possible.
-- Moderators with `Moderate Members` permission can choose `Kick`, `Ban`, or `Ignore`.
-- If moderators choose `Ignore`, the pending mute role is removed when it was applied by this review flow.
-- If review expires, it is treated like an automatic `Ignore`: the pending mute role is removed when possible and the review message is marked completed.
-- Pending reviews are stored in Red Config so review buttons and timeout cleanup survive bot restarts.
-- Once a moderator acts, the review buttons are disabled and the embed records who reviewed it.
+| Command | Description |
+|---------|-------------|
+| `!honeypot stats` | Show detection statistics |
+| `!honeypot resetstats` | Reset statistics |
+| `!honeypot doctor` | Check config, channels, and permissions |
+
+## Action & Fallback Logic
+
+```
+suspicious + action = kick/ban  → instant punishment
+suspicious + action = review    → review (if channel set), otherwise fallback
+suspicious + action = none      → skip to fallback
+non-suspicious                  → fallback_action decides
+
+fallback_action = review   → moderator review
+fallback_action = kick/ban → instant punishment
+fallback_action = none     → log only
+```
 
 ## Whitelist Modes
 
-- `bypass` - Users with whitelisted roles are logged and not punished.
-- `review` - Users with whitelisted roles are sent to review instead of automatic punishment.
-- `none` - Whitelisted role is only noted; normal detection continues with no special treatment.
+| Mode | Behavior |
+|------|----------|
+| `bypass` | Log and skip (no action) |
+| `review` | Force review regardless of suspicion |
+| `fallback` | Skip instant action, go through fallback logic |
+| `none` | Treat as normal user |
 
-## Dry Run
+## Detection
 
-When dry-run mode is enabled, the cog deletes, logs, purges, reviews, and records stats normally, but it does not kick or ban users. Action fields show what would have happened.
+A message is considered suspicious if:
 
-## Permissions Needed
+- Account is under 7 days old
+- Content contains scam keywords (customizable, see `!honeypot keywords`)
+- Has attachments and account is under 14 days old
+- Has 4+ attachments with the same filename base (e.g. "image.png", "image.jpg")
+- Has 4+ attachments matching configured filename-base regexes
 
-The bot should have these permissions in the relevant channels and server:
+Default scam keywords: `free nitro`, `giveaway`, `steam gift`, `free discord`, `discord.gift`,
+`claim your`, `you won`, `free vbucks`, `free robux`, `free coins`, `boost your server`,
+`limited time`, `exclusive offer`, `free membership`, `hack`, `crack`, `generator`.
 
-- View Channel
-- Send Messages
-- Manage Messages
-- Manage Channels, if using `createchannel`
-- Kick Members, if using `kick`
-- Ban Members, if using `ban`
-- Manage Roles, if using temporary review mute
-- Access to the configured logs and review channels
+Default attachment patterns: `^image ?\(\d+\)$` (matches `image(1)`, `image (2)`) and
+`^[1-4]$` (matches `1.png`, `2.png`).
 
-The bot role must be higher than users it needs to punish and higher than the configured mute role.
+## Review Flow
+
+1. Message deleted from honeypot channel
+2. Recent messages from that user purged (if enabled)
+3. Mute role applied while review is pending (if configured)
+4. Embed sent to review channel with Kick / Ban / Ignore buttons
+5. Attachments copied into the review message
+6. Moderators with `Moderate Members` permission can click buttons
+7. If review expires, mute role is removed and review marked as timed out
+8. Pending reviews survive bot restarts
+9. If kicked/banned, mute role is removed first (prevents role persistence bots from saving it)
+
+## Joinwatch
+
+When a user with an account younger than the configured threshold joins, an embed
+is sent to the joinwatch channel. No buttons, no actions — just an alert.
+
+## Permissions
+
+- View Channel, Send Messages, Read Message History, Manage Messages (in honeypot channel)
+- Send Messages (in logs, review, and joinwatch channels)
+- Kick Members (if using kick)
+- Ban Members (if using ban)
+- Manage Roles (if using review mute role)
+- Manage Channels (if using `channel create`)
+- Bot role must be above users it punishes and above the mute role
+
+## Intents
+
+- `GUILD_MEMBERS` (privileged) — required for `on_member_join` (joinwatch)
+- `MESSAGE_CONTENT` (privileged) — required for `on_message` (detection)
+
+Both are enabled by default in RedBot v3.5+.
 
 ## Data Storage
 
-The cog stores only guild configuration: channel IDs, role IDs, booleans, numeric settings, and custom fake activity messages. It does not persistently store user metadata.
+Only guild configuration: channel IDs, role IDs, booleans, numeric settings, custom messages, and
+pending review metadata. No persistent user data.
 
 ## Operational Notes
 
-- Users with whitelisted roles are still logged, but no punishment is applied.
-- Bot owners, mods, admins, users with `Manage Server`, and users above or equal to the bot's top role are ignored.
-- Triggering messages are deleted before punishment or review.
-- In review mode, a configured mute role is used as temporary containment until moderators decide.
-- The purge only scans recent messages in the honeypot channel, not the entire server.
-- Fake activity runs once per minute internally and only posts when the configured interval has elapsed.
-- Default fake activity messages are plain warnings such as `BAN CHANNEL - DO NOT WRITE HERE.`
+- Bot owners, mods, admins, users with `Manage Server`, and users at or above the bot's top role are ignored
+- The purge only scans the honeypot channel, not the entire server
+- Fake activity runs once per minute, only posts when the configured interval has elapsed
+- When using review mode, a mute role is used as temporary containment until moderators decide
+- `!honeypot doctor` checks all permissions and configuration at once
+- Stats are per-server and reset with `resetstats`
