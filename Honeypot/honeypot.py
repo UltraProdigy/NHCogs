@@ -263,6 +263,9 @@ class Honeypot(Cog):
             joinwatch_enabled=False,
             joinwatch_channel=None,
             joinwatch_min_age_hours=24,
+            baitrole_enabled=False,
+            baitrole_id=None,
+            baitrole_action="ban",
         )
 
         self._last_fake_message: dict[int, datetime] = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
@@ -815,7 +818,7 @@ class Honeypot(Cog):
                 inline=True,
             )
 
-        # Purge — always runs before any action/review
+        # Purge - always runs before any action/review
         purged = 0
         if config["purge_enabled"]:
             purged = await self._purge_user_messages(
@@ -970,6 +973,55 @@ class Honeypot(Cog):
                 await channel.send(embed=embed)
             except discord.HTTPException:
                 pass
+
+    # ─── Baited role trap ─────────────────────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
+        if await self.bot.cog_disabled_in_guild(self, after.guild):
+            return
+        if after.bot:
+            return
+        config = await self.config.guild(after.guild).all()
+        if not config["baitrole_enabled"] or config["baitrole_id"] is None:
+            return
+        bait_role = after.guild.get_role(config["baitrole_id"])
+        if bait_role is None:
+            return
+        if bait_role not in before.roles and bait_role in after.roles:
+            if (
+                after.id in self.bot.owner_ids
+                or await self.bot.is_mod(after)
+                or await self.bot.is_admin(after)
+                or after.guild_permissions.manage_guild
+                or after.top_role >= after.guild.me.top_role
+            ):
+                return
+            action = config["baitrole_action"]
+            reason = "Took the bait role - potential DM bot/scammer."
+            try:
+                if action == "ban":
+                    await after.ban(reason=reason, delete_message_days=1)
+                elif action == "kick":
+                    await after.kick(reason=reason)
+            except discord.HTTPException:
+                pass
+            logs_channel_id = config.get("logs_channel")
+            logs_channel = self._get_text_channel_or_thread(after.guild, logs_channel_id)
+            if logs_channel is not None:
+                embed = discord.Embed(
+                    title=_("Bait role triggered"),
+                    description=_("{mention} ({id}) took the bait role and was {action}.").format(
+                        mention=after.mention, id=after.id, action=action,
+                    ),
+                    color=discord.Color.dark_red(),
+                    timestamp=datetime.now(timezone.utc),
+                )
+                embed.set_thumbnail(url=after.display_avatar)
+                try:
+                    await logs_channel.send(embed=embed)
+                except discord.HTTPException:
+                    pass
 
     # ─── Commands ─────────────────────────────────────────────────────────
 
@@ -1420,6 +1472,45 @@ class Honeypot(Cog):
         else:
             await self.config.guild(ctx.guild).joinwatch_min_age_hours.set(hours)
             await ctx.send(_("✅ Joinwatch min age set to {value} hours").format(value=hours))
+
+    # ─── bait sub-group ───────────────────────────────────────────────
+
+    @honeypot.group()
+    async def bait(self, ctx: commands.Context) -> None:
+        """Trap role: automatically punish users who take a specific role."""
+
+    @bait.command()
+    async def enabled(self, ctx: commands.Context, value: bool = None) -> None:
+        """Toggle the bait role trap."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).baitrole_enabled()
+            await ctx.send(_("Bait role trap: {value}").format(value=v))
+        else:
+            await self.config.guild(ctx.guild).baitrole_enabled.set(value)
+            await ctx.send(_("✅ Bait role trap set to {value}").format(value=value))
+
+    @bait.command()
+    async def role(self, ctx: commands.Context, role: discord.Role = None) -> None:
+        """Set the bait role - users who take it get punished."""
+        if role is None:
+            v = await self.config.guild(ctx.guild).baitrole_id()
+            r = ctx.guild.get_role(v) if v else None
+            await ctx.send(_("Bait role: {role}").format(role=r.mention if r else _("not set")))
+        else:
+            await self.config.guild(ctx.guild).baitrole_id.set(role.id)
+            await ctx.send(_("✅ Bait role set to {role.mention}").format(role=role))
+
+    @bait.command(name="action")
+    async def bait_action(self, ctx: commands.Context, value: str = None) -> None:
+        """Action to take: kick or ban."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).baitrole_action()
+            await ctx.send(_("Bait action: {value}").format(value=v))
+        elif value not in ("kick", "ban"):
+            await ctx.send(_("Must be `kick` or `ban`."))
+        else:
+            await self.config.guild(ctx.guild).baitrole_action.set(value)
+            await ctx.send(_("✅ Bait action set to {value}").format(value=value))
 
     # ─── stats ────────────────────────────────────────────────────────
 
