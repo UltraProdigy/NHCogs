@@ -1001,7 +1001,7 @@ class Honeypot(Cog):
             reason = "Took the bait role - potential DM bot/scammer."
             try:
                 if action == "ban":
-                    await after.ban(reason=reason, delete_message_days=1)
+                    await after.ban(reason=reason)
                 elif action == "kick":
                     await after.kick(reason=reason)
             except discord.HTTPException:
