@@ -180,7 +180,7 @@ class ReviewView(discord.ui.View):
                     try:
                         await member.remove_roles(mute_role, reason=_("Removing pending mute before {action}.").format(action=action))
                     except discord.HTTPException:
-                        pass
+                        log.debug("Failed to remove pending mute role before %s for user %s", action, self.target_id)
             if action == "kick":
                 await member.kick(reason=reason)
                 await self._create_modlog_case(guild, member, action, reason)
@@ -465,6 +465,8 @@ class Honeypot(Cog):
                 msg = random.choice(pool)
                 await honeypot_channel.send(msg)
                 self._last_fake_message[guild.id] = now
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 log.exception("Error in fake_activity_loop for guild %s", guild.id)
 
@@ -485,47 +487,54 @@ class Honeypot(Cog):
 
     async def _restore_pending_reviews(self) -> None:
         await self.bot.wait_until_red_ready()
-        all_guilds = await self.config.all_guilds()
+        try:
+            all_guilds = await self.config.all_guilds()
+        except Exception:
+            log.exception("Failed to load guild configs during review restoration")
+            return
         now = datetime.now(timezone.utc)
         for guild_id, guild_config in all_guilds.items():
-            guild = self.bot.get_guild(int(guild_id))
-            if guild is None:
-                continue
-            pending_reviews = guild_config.get("pending_reviews", {})
-            for review_message_id, data in list(pending_reviews.items()):
-                try:
-                    expires_at = datetime.fromisoformat(data["expires_at"])
-                except (KeyError, ValueError, TypeError):
-                    await self._delete_pending_review(guild, int(review_message_id))
+            try:
+                guild = self.bot.get_guild(int(guild_id))
+                if guild is None:
                     continue
-                view = ReviewView(
-                    self,
-                    int(data["target_id"]),
-                    guild.id,
-                    data.get("content", ""),
-                    data.get("attachment_urls", []),
-                    pending_mute_role_id=data.get("pending_mute_role_id"),
-                    expires_at=expires_at,
-                )
-                view.active_key = int(review_message_id)
-                review_channel = self._get_text_channel_or_thread(guild, data.get("review_channel_id"))
-                if review_channel is not None:
+                pending_reviews = guild_config.get("pending_reviews", {})
+                for review_message_id, data in list(pending_reviews.items()):
                     try:
-                        view.review_message = await review_channel.fetch_message(int(review_message_id))
-                    except (discord.HTTPException, discord.NotFound, discord.Forbidden):
-                        view.review_message = None
-                if expires_at <= now:
-                    await self._expire_review(view)
-                    continue
-                self.bot.add_view(view, message_id=int(review_message_id))
-                async with self._views_lock:
-                    self._active_views[int(review_message_id)] = view
+                        expires_at = datetime.fromisoformat(data["expires_at"])
+                    except (KeyError, ValueError, TypeError):
+                        await self._delete_pending_review(guild, int(review_message_id))
+                        continue
+                    view = ReviewView(
+                        self,
+                        int(data["target_id"]),
+                        guild.id,
+                        data.get("content", ""),
+                        data.get("attachment_urls", []),
+                        pending_mute_role_id=data.get("pending_mute_role_id"),
+                        expires_at=expires_at,
+                    )
+                    view.active_key = int(review_message_id)
+                    review_channel = self._get_text_channel_or_thread(guild, data.get("review_channel_id"))
+                    if review_channel is not None:
+                        try:
+                            view.review_message = await review_channel.fetch_message(int(review_message_id))
+                        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                            view.review_message = None
+                    if expires_at <= now:
+                        await self._expire_review(view)
+                        continue
+                    self.bot.add_view(view, message_id=int(review_message_id))
+                    async with self._views_lock:
+                        self._active_views[int(review_message_id)] = view
+            except Exception:
+                log.exception("Failed to restore pending reviews for guild %s", guild_id)
 
     async def _expire_review(self, view: ReviewView) -> None:
         guild = self.bot.get_guild(view.guild_id)
         if guild is None:
-            async with self.cog._views_lock:
-                self.cog._active_views.pop(view.active_key or view.target_id, None)
+            async with self._views_lock:
+                self._active_views.pop(view.active_key or view.target_id, None)
             view.stop()
             return
         member = guild.get_member(view.target_id)
@@ -535,7 +544,7 @@ class Honeypot(Cog):
                 try:
                     await member.remove_roles(mute_role, reason="Honeypot review expired; removing pending mute.")
                 except discord.HTTPException:
-                    pass
+                    log.debug("Failed to remove mute role on expired review for user %s in guild %s", view.target_id, guild.id)
         view._disable_all()
         embed = view.review_message.embeds[0] if view.review_message and view.review_message.embeds else None
         if embed:
@@ -554,7 +563,7 @@ class Honeypot(Cog):
             try:
                 await view.review_message.edit(content=_("✅ **Review completed**"), embed=embed, view=view)
             except discord.HTTPException:
-                pass
+                log.debug("Failed to edit expired review message %s", view.active_key)
         await self._increment_stat(guild, "review_expired")
         await self._increment_stat(guild, "ignored")
         async with self._views_lock:
@@ -778,7 +787,7 @@ class Honeypot(Cog):
         try:
             await message.delete()
         except discord.HTTPException:
-            pass
+            log.debug("Failed to delete honeypot message from user %s", message.author.id)
         await self._increment_stat(message.guild, "detections")
 
         whitelisted_role_ids: list[int] = config.get("whitelisted_roles", [])
@@ -972,7 +981,7 @@ class Honeypot(Cog):
             try:
                 await channel.send(embed=embed)
             except discord.HTTPException:
-                pass
+                log.debug("Failed to send joinwatch alert for user %s in guild %s", member.id, member.guild.id)
 
     # ─── Baited role trap ─────────────────────────────────────────────
 
@@ -1005,8 +1014,7 @@ class Honeypot(Cog):
                 elif action == "kick":
                     await after.kick(reason=reason)
             except discord.HTTPException:
-                pass
-            logs_channel_id = config.get("logs_channel")
+                log.warning("Failed to %s bait-role target %s in guild %s", action, after.id, after.guild.id)
             logs_channel = self._get_text_channel_or_thread(after.guild, logs_channel_id)
             if logs_channel is not None:
                 embed = discord.Embed(
@@ -1021,7 +1029,7 @@ class Honeypot(Cog):
                 try:
                     await logs_channel.send(embed=embed)
                 except discord.HTTPException:
-                    pass
+                    log.debug("Failed to send bait role log for user %s in guild %s", after.id, after.guild.id)
 
     # ─── Commands ─────────────────────────────────────────────────────────
 
