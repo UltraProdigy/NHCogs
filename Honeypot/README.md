@@ -20,7 +20,7 @@ Requires `AAA3A_utils`. Red will show the pip install command if missing.
 [p]honeypot channel create
 [p]honeypot channel logs #mod-logs
 [p]honeypot core action ban
-[p]honeypot core enabled true
+[p]honeypot core toggle true
 ```
 
 ## Commands
@@ -31,7 +31,7 @@ Only the server owner can use `!honeypot` and all subcommands.
 
 | Command | Description |
 |---------|-------------|
-| `!honeypot core enabled <bool>` | Toggle the cog on/off |
+| `!honeypot core toggle <bool>` | Toggle the cog on/off |
 | `!honeypot core action <kick\|ban\|review\|none>` | Main action for suspicious posts |
 | `!honeypot core fallback_action <review\|kick\|ban\|none>` | Action for non-suspicious posts |
 | `!honeypot core dry_run <bool>` | Log what would happen without punishing |
@@ -57,14 +57,14 @@ Only the server owner can use `!honeypot` and all subcommands.
 
 | Command | Description |
 |---------|-------------|
-| `!honeypot purge enabled <bool>` | Toggle auto-purge of recent messages |
+| `!honeypot purge toggle <bool>` | Toggle auto-purge of recent messages |
 | `!honeypot purge minutes <1-60>` | Minutes of history to purge |
 
 ### fakeactivity
 
 | Command | Description |
 |---------|-------------|
-| `!honeypot fakeactivity enabled <bool>` | Toggle fake activity messages |
+| `!honeypot fakeactivity toggle <bool>` | Toggle fake activity messages |
 | `!honeypot fakeactivity interval <1-120>` | Minutes between fake messages |
 | `!honeypot fakeactivity add <message>` | Add a custom message |
 | `!honeypot fakeactivity remove <index>` | Remove a message by index |
@@ -75,7 +75,7 @@ Only the server owner can use `!honeypot` and all subcommands.
 
 | Command | Description |
 |---------|-------------|
-| `!honeypot review enabled <bool>` | Toggle moderator review |
+| `!honeypot review toggle <bool>` | Toggle moderator review |
 | `!honeypot review channel <channel>` | Channel for review requests |
 | `!honeypot review timeout <1-10080>` | Minutes before review expires |
 
@@ -104,7 +104,7 @@ Only the server owner can use `!honeypot` and all subcommands.
 
 | Command | Description |
 |---------|-------------|
-| `!honeypot joinwatch enabled <bool>` | Toggle new-account join alerts |
+| `!honeypot joinwatch toggle <bool>` | Toggle new-account join alerts |
 | `!honeypot joinwatch channel <channel>` | Channel for join alerts |
 | `!honeypot joinwatch min_age <1-168>` | Max account age in hours to trigger alert |
 

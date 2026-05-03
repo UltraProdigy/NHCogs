@@ -1045,8 +1045,8 @@ class Honeypot(Cog):
     async def core(self, ctx: commands.Context) -> None:
         """Core settings: enabled, action, fallback, dry run."""
 
-    @core.command()
-    async def enabled(self, ctx: commands.Context, value: bool = None) -> None:
+    @core.command(name="toggle")
+    async def core_toggle(self, ctx: commands.Context, value: bool = None) -> None:
         """Toggle the cog on/off."""
         if value is None:
             v = await self.config.guild(ctx.guild).enabled()
@@ -1198,8 +1198,8 @@ class Honeypot(Cog):
     async def purge(self, ctx: commands.Context) -> None:
         """Auto-purge recent messages from caught users."""
 
-    @purge.command()
-    async def enabled(self, ctx: commands.Context, value: bool = None) -> None:
+    @purge.command(name="toggle")
+    async def purge_toggle(self, ctx: commands.Context, value: bool = None) -> None:
         """Toggle purging on detection."""
         if value is None:
             v = await self.config.guild(ctx.guild).purge_enabled()
@@ -1226,8 +1226,8 @@ class Honeypot(Cog):
     async def fakeactivity(self, ctx: commands.Context) -> None:
         """Fake activity to lure scammers."""
 
-    @fakeactivity.command()
-    async def enabled(self, ctx: commands.Context, value: bool = None) -> None:
+    @fakeactivity.command(name="toggle")
+    async def fakeactivity_toggle(self, ctx: commands.Context, value: bool = None) -> None:
         """Toggle fake activity messages."""
         if value is None:
             v = await self.config.guild(ctx.guild).fake_activity_enabled()
@@ -1288,8 +1288,8 @@ class Honeypot(Cog):
     async def review(self, ctx: commands.Context) -> None:
         """Moderator review for non-obvious cases."""
 
-    @review.command()
-    async def enabled(self, ctx: commands.Context, value: bool = None) -> None:
+    @review.command(name="toggle")
+    async def review_toggle(self, ctx: commands.Context, value: bool = None) -> None:
         """Toggle moderator review."""
         if value is None:
             v = await self.config.guild(ctx.guild).review_enabled()
@@ -1449,8 +1449,8 @@ class Honeypot(Cog):
     async def joinwatch(self, ctx: commands.Context) -> None:
         """Alert when accounts younger than N hours join."""
 
-    @joinwatch.command()
-    async def enabled(self, ctx: commands.Context, value: bool = None) -> None:
+    @joinwatch.command(name="toggle")
+    async def joinwatch_toggle(self, ctx: commands.Context, value: bool = None) -> None:
         """Toggle new account join alerts."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_enabled()
@@ -1487,8 +1487,8 @@ class Honeypot(Cog):
     async def bait(self, ctx: commands.Context) -> None:
         """Trap role: automatically punish users who take a specific role."""
 
-    @bait.command()
-    async def enabled(self, ctx: commands.Context, value: bool = None) -> None:
+    @bait.command(name="toggle")
+    async def bait_toggle(self, ctx: commands.Context, value: bool = None) -> None:
         """Toggle the bait role trap."""
         if value is None:
             v = await self.config.guild(ctx.guild).baitrole_enabled()
@@ -1545,7 +1545,7 @@ class Honeypot(Cog):
         honeypot_channel = self._get_text_channel_or_thread(ctx.guild, config.get("honeypot_channel"))
         logs_channel = self._get_text_channel_or_thread(ctx.guild, config.get("logs_channel"))
         review_channel = self._get_text_channel_or_thread(ctx.guild, config.get("review_channel"))
-        checks.append(("Cog enabled", bool(config.get("enabled")), "Run `honeypot core enabled true`."))
+        checks.append(("Cog enabled", bool(config.get("enabled")), "Run `honeypot core toggle true`."))
         checks.append(("Suspicious action set", config.get("action") in ("kick", "ban"), "Run `honeypot core action`."))
         checks.append(("Honeypot channel exists", honeypot_channel is not None, "Run `honeypot channel set`."))
         checks.append(("Logs channel exists", logs_channel is not None, "Run `honeypot channel logs`."))
