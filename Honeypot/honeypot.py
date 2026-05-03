@@ -1103,12 +1103,12 @@ class Honeypot(Cog):
 
     # ─── channel sub-group ────────────────────────────────────────────
 
-    @honeypot.group()
-    async def channel(self, ctx: commands.Context) -> None:
+    @honeypot.group(name="channel")
+    async def channels(self, ctx: commands.Context) -> None:
         """Honeypot channel, logs channel, ping role."""
 
     @commands.bot_has_guild_permissions(manage_channels=True)
-    @channel.command()
+    @channels.command()
     async def create(self, ctx: commands.Context) -> None:
         """Create the honeypot channel."""
         if (
@@ -1136,13 +1136,13 @@ class Honeypot(Cog):
         await self.config.guild(ctx.guild).honeypot_channel.set(honeypot_channel.id)
         await ctx.send(_("✅ Honeypot channel: {channel.mention}").format(channel=honeypot_channel))
 
-    @channel.command(name="set")
+    @channels.command(name="set")
     async def channel_set(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread) -> None:
         """Set an existing channel as the honeypot."""
         await self.config.guild(ctx.guild).honeypot_channel.set(target.id)
         await ctx.send(_("✅ Honeypot channel set to {channel.mention}").format(channel=target))
 
-    @channel.command()
+    @channels.command()
     async def logs(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread = None) -> None:
         """Set the logs channel."""
         if target is None:
@@ -1152,7 +1152,7 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).logs_channel.set(target.id)
             await ctx.send(_("✅ Logs channel set to {channel.mention}").format(channel=target))
 
-    @channel.command(name="ping_role")
+    @channels.command(name="ping_role")
     async def channel_ping_role(self, ctx: commands.Context, role: discord.Role = None) -> None:
         """Role to ping on detection."""
         if role is None:
