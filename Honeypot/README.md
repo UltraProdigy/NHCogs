@@ -25,7 +25,7 @@ Requires `AAA3A_utils`. Red will show the pip install command if missing.
 
 ## Commands
 
-Only the server owner can use `!honeypot` and all subcommands.
+By default, only the server owner can use `!honeypot` and all subcommands. Red Permissions rules can allow other users or roles.
 
 ### core
 
@@ -108,6 +108,14 @@ Only the server owner can use `!honeypot` and all subcommands.
 | `!honeypot joinwatch channel <channel>` | Channel for join alerts |
 | `!honeypot joinwatch min_age <1-168>` | Max account age in hours to trigger alert |
 
+### bait
+
+| Command | Description |
+|---------|-------------|
+| `!honeypot bait toggle <bool>` | Toggle the bait role trap |
+| `!honeypot bait role <role>` | Set the bait role |
+| `!honeypot bait action <kick\|ban>` | Action to take when users take the bait role |
+
 ### other
 
 | Command | Description |
@@ -172,6 +180,28 @@ Default attachment patterns: `^image ?\(\d+\)$` (matches `image(1)`, `image (2)`
 When a user with an account younger than the configured threshold joins, an embed
 is sent to the joinwatch channel. No buttons, no actions — just an alert.
 
+## Bait Role
+
+The bait role trap watches for users receiving a configured role. This is meant for
+roles that should not be assigned to normal users, for example a fake verification,
+reward, or access role used to catch automated accounts.
+
+Setup:
+
+```ini
+[p]honeypot bait role @SuspiciousRole
+[p]honeypot bait action ban
+[p]honeypot bait toggle true
+```
+
+When the trap is enabled and a non-exempt user receives the bait role, the cog
+immediately performs the configured bait action: `kick` or `ban`. It then sends a
+log embed to the configured logs channel if one is available.
+
+The bait trap ignores bot owners, server mods, server admins, users with
+`Manage Server`, and users whose top role is at or above the bot's top role. If
+the bait role is deleted or no bait role is configured, the trap does nothing.
+
 ## Permissions
 
 - View Channel, Send Messages, Read Message History, Manage Messages (in honeypot channel)
@@ -186,6 +216,9 @@ is sent to the joinwatch channel. No buttons, no actions — just an alert.
 
 - `GUILD_MEMBERS` (privileged) — required for `on_member_join` (joinwatch)
 - `MESSAGE_CONTENT` (privileged) — required for `on_message` (detection)
+
+The bait role trap also requires member update events, which are covered by the
+`GUILD_MEMBERS` privileged intent.
 
 Both are enabled by default in RedBot v3.5+.
 

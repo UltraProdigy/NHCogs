@@ -1015,6 +1015,7 @@ class Honeypot(Cog):
                     await after.kick(reason=reason)
             except discord.HTTPException:
                 log.warning("Failed to %s bait-role target %s in guild %s", action, after.id, after.guild.id)
+            logs_channel_id = config.get("logs_channel")
             logs_channel = self._get_text_channel_or_thread(after.guild, logs_channel_id)
             if logs_channel is not None:
                 embed = discord.Embed(
@@ -1034,7 +1035,7 @@ class Honeypot(Cog):
     # ─── Commands ─────────────────────────────────────────────────────────
 
     @commands.guild_only()
-    @commands.check(lambda ctx: ctx.author.id == ctx.guild.owner_id or ctx.author.id in ctx.bot.owner_ids)
+    @commands.permissions_check(lambda ctx: ctx.author.id == ctx.guild.owner_id or ctx.author.id in ctx.bot.owner_ids)
     @commands.group()
     async def honeypot(self, ctx: commands.Context) -> None:
         """Configure the honeypot system."""
