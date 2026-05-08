@@ -175,6 +175,21 @@ Default attachment patterns: `^image ?\(\d+\)$` (matches `image(1)`, `image (2)`
 8. Pending reviews survive bot restarts
 9. If kicked/banned, mute role is removed first (prevents role persistence bots from saving it)
 
+## Stats
+
+`Total detections` counts every non-exempt message caught in the honeypot
+channel. `Suspicious detections` counts only detections matching
+suspicious-account, keyword, or attachment rules. `Reviews sent` counts cases
+sent to moderator review, while `Active pending reviews` is the current number
+of unresolved review messages.
+
+`Applied temporary mutes` and `Failed temporary mutes` are historical counters
+for review containment mutes. They do not mean those users are still muted.
+
+`Purged messages` counts extra recent messages removed by the purge step. It
+does not include the original honeypot message, which is deleted separately as
+part of every detection.
+
 ## Joinwatch
 
 When a user with an account younger than the configured threshold joins, an embed

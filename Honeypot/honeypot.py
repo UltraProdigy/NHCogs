@@ -1528,7 +1528,35 @@ class Honeypot(Cog):
         """Show honeypot statistics."""
         stats = DEFAULT_STATS.copy()
         stats.update(await self.config.guild(ctx.guild).stats())
-        lines = [f"{key}: {value}" for key, value in stats.items()]
+        pending_reviews = await self.config.guild(ctx.guild).pending_reviews()
+        sections = {
+            "Detection": {
+                "Total detections": stats["detections"],
+                "Suspicious detections": stats["suspicious"],
+                "Whitelisted users": stats["whitelisted"],
+                "Purged messages": stats["purged_messages"],
+            },
+            "Review": {
+                "Reviews sent": stats["reviewed"],
+                "Active pending reviews": len(pending_reviews),
+                "Expired reviews": stats["review_expired"],
+                "Ignored reviews": stats["ignored"],
+                "Applied temporary mutes": stats["pending_mutes"],
+                "Failed temporary mutes": stats["pending_mute_failures"],
+            },
+            "Actions": {
+                "Kicked users": stats["kicked"],
+                "Banned users": stats["banned"],
+                "Failed actions": stats["failed_actions"],
+                "Dry-run actions": stats["dry_run_actions"],
+            },
+        }
+        lines = []
+        for section, values in sections.items():
+            if lines:
+                lines.append("")
+            lines.append(f"{section}:")
+            lines.extend(f"  {label}: {value}" for label, value in values.items())
         await ctx.send(_("**Honeypot stats:**\n") + box("\n".join(lines)))
 
     @honeypot.command(name="resetstats")
