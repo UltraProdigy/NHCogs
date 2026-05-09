@@ -969,14 +969,16 @@ class Honeypot(Cog):
         min_age = timedelta(hours=config["joinwatch_min_age_hours"])
         if member.created_at > datetime.now(timezone.utc) - min_age:
             hours = max(1, round((datetime.now(timezone.utc) - member.created_at).total_seconds() / 3600))
+            member_label = f"{member.display_name} ({member})"
             embed = discord.Embed(
                 title=_("New account joined"),
-                description=_("{mention} ({id}) joined. Account is ~{hours} hours old.").format(
-                    mention=member.mention, id=member.id, hours=hours,
+                description=_("**{member}**\nMention: {mention}\nID: `{id}`\nAccount is ~{hours} hours old.").format(
+                    member=member_label, mention=member.mention, id=member.id, hours=hours,
                 ),
                 color=discord.Color.orange(),
                 timestamp=member.joined_at or datetime.now(timezone.utc),
             )
+            embed.set_author(name=f"{member.display_name} ({member.id})", icon_url=member.display_avatar)
             embed.set_thumbnail(url=member.display_avatar)
             try:
                 await channel.send(embed=embed)
