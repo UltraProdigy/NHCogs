@@ -41,6 +41,12 @@ DEFAULT_STATS = {
     "pending_mutes": 0,
     "pending_mute_failures": 0,
     "purged_messages": 0,
+    "joinwatch_total_joins": 0,
+    "joinwatch_young_joins": 0,
+    "joinwatch_auto_roles": 0,
+    "joinwatch_auto_role_failures": 0,
+    "joinwatch_auto_roles_cleared": 0,
+    "joinwatch_auto_role_punishments": 0,
 }
 
 SCAM_KEYWORDS = [
@@ -263,6 +269,11 @@ class Honeypot(Cog):
             joinwatch_enabled=False,
             joinwatch_channel=None,
             joinwatch_min_age_hours=24,
+            joinwatch_auto_role_enabled=False,
+            joinwatch_auto_role_id=None,
+            joinwatch_auto_role_timer_minutes=1440,
+            joinwatch_auto_role_action="none",
+            joinwatch_pending_roles={},
             baitrole_enabled=False,
             baitrole_id=None,
             baitrole_action="ban",
@@ -303,6 +314,22 @@ class Honeypot(Cog):
         async with self.config.guild(guild).pending_reviews() as pending_reviews:
             pending_reviews.pop(str(review_message_id), None)
 
+    async def _store_joinwatch_pending_role(
+        self,
+        member: discord.Member,
+        role_id: int,
+        expires_at: datetime,
+    ) -> None:
+        async with self.config.guild(member.guild).joinwatch_pending_roles() as pending_roles:
+            pending_roles[str(member.id)] = {
+                "role_id": role_id,
+                "expires_at": expires_at.isoformat(),
+            }
+
+    async def _delete_joinwatch_pending_role(self, guild: discord.Guild, member_id: int) -> None:
+        async with self.config.guild(guild).joinwatch_pending_roles() as pending_roles:
+            pending_roles.pop(str(member_id), None)
+
     def _get_text_channel_or_thread(
         self, guild: discord.Guild, channel_id: int | None
     ) -> discord.TextChannel | discord.Thread | None:
@@ -331,6 +358,15 @@ class Honeypot(Cog):
         if action == "ban" and not permissions.ban_members:
             return _("**Failed:** I do not have the `Ban Members` permission.")
         return None
+
+    async def _is_protected_member(self, member: discord.Member) -> bool:
+        return (
+            member.id in self.bot.owner_ids
+            or await self.bot.is_mod(member)
+            or await self.bot.is_admin(member)
+            or member.guild_permissions.manage_guild
+            or member.top_role >= member.guild.me.top_role
+        )
 
     def _format_bytes(self, size: int) -> str:
         if size >= 1024 * 1024:
@@ -426,11 +462,13 @@ class Honeypot(Cog):
         await super().cog_load()
         self.fake_activity_loop.start()
         self.review_timeout_loop.start()
+        self.joinwatch_auto_role_loop.start()
         self._restore_task = asyncio.create_task(self._restore_pending_reviews())
 
     async def cog_unload(self) -> None:
         self.fake_activity_loop.cancel()
         self.review_timeout_loop.cancel()
+        self.joinwatch_auto_role_loop.cancel()
         if self._restore_task is not None:
             self._restore_task.cancel()
         await super().cog_unload()
@@ -952,6 +990,108 @@ class Honeypot(Cog):
             allowed_mentions=discord.AllowedMentions(roles=True),
         )
 
+    async def _execute_joinwatch_action(
+        self, member: discord.Member, config: dict, reason: str
+    ) -> tuple[str | None, str | None]:
+        action = config.get("joinwatch_auto_role_action", "none")
+        if action not in ("kick", "ban"):
+            return (_("No joinwatch punishment configured."), None)
+        if config.get("dry_run"):
+            await self._increment_stat(member.guild, "dry_run_actions")
+            return (self._dry_run_label(action), None)
+        missing_permission = self._missing_action_permission(member.guild, action)
+        if missing_permission is not None:
+            await self._increment_stat(member.guild, "failed_actions")
+            return (None, missing_permission)
+        try:
+            if action == "kick":
+                await member.kick(reason=reason)
+            elif action == "ban":
+                await member.ban(
+                    reason=reason,
+                    delete_message_days=config.get("ban_delete_message_days", 0),
+                )
+            await self._increment_stat(member.guild, "joinwatch_auto_role_punishments")
+        except discord.HTTPException as exc:
+            await self._increment_stat(member.guild, "failed_actions")
+            return (None, _("**Action failed:**\n") + box(str(exc), lang="py"))
+        try:
+            await modlog.create_case(
+                self.bot,
+                member.guild,
+                datetime.now(timezone.utc),
+                action_type=action,
+                user=member,
+                moderator=member.guild.me,
+                reason=reason,
+            )
+        except Exception:
+            log.exception("Failed to create modlog case in _execute_joinwatch_action")
+        label = _("The member has been kicked.") if action == "kick" else _("The member has been banned.")
+        return (label, None)
+
+    @tasks.loop(minutes=1)
+    async def joinwatch_auto_role_loop(self) -> None:
+        now = datetime.now(timezone.utc)
+        for guild in self.bot.guilds:
+            try:
+                config = await self.config.guild(guild).all()
+                pending_roles = config.get("joinwatch_pending_roles", {})
+                if not pending_roles:
+                    continue
+                logs_channel = self._get_text_channel_or_thread(guild, config.get("logs_channel"))
+                for member_id_str, data in list(pending_roles.items()):
+                    try:
+                        member_id = int(member_id_str)
+                        role_id = int(data["role_id"])
+                        expires_at = datetime.fromisoformat(data["expires_at"])
+                    except (KeyError, TypeError, ValueError):
+                        async with self.config.guild(guild).joinwatch_pending_roles() as stored_pending_roles:
+                            stored_pending_roles.pop(str(member_id_str), None)
+                        continue
+                    if expires_at > now:
+                        continue
+                    member = guild.get_member(member_id)
+                    role = guild.get_role(role_id)
+                    if member is None:
+                        await self._delete_joinwatch_pending_role(guild, member_id)
+                        continue
+                    if role is None or role not in member.roles:
+                        await self._delete_joinwatch_pending_role(guild, member_id)
+                        await self._increment_stat(guild, "joinwatch_auto_roles_cleared")
+                        continue
+                    if await self._is_protected_member(member):
+                        await self._delete_joinwatch_pending_role(guild, member_id)
+                        continue
+                    action_label, failed = await self._execute_joinwatch_action(
+                        member,
+                        config,
+                        reason="Joinwatch auto role timer expired.",
+                    )
+                    await self._delete_joinwatch_pending_role(guild, member_id)
+                    if logs_channel is not None:
+                        embed = discord.Embed(
+                            title=_("Joinwatch auto-role timer expired"),
+                            description=_("{mention} ({id}) still had {role} after the timer expired.").format(
+                                mention=member.mention,
+                                id=member.id,
+                                role=role.mention if role is not None else _("the auto role"),
+                            ),
+                            color=discord.Color.dark_red() if failed else discord.Color.orange(),
+                            timestamp=now,
+                        )
+                        embed.add_field(
+                            name=_("Action:"),
+                            value=failed if failed else action_label,
+                            inline=False,
+                        )
+                        try:
+                            await logs_channel.send(embed=embed)
+                        except discord.HTTPException:
+                            log.debug("Failed to send joinwatch auto-role log for user %s in guild %s", member.id, guild.id)
+            except Exception:
+                log.exception("Failed to process joinwatch auto-role timers for guild %s", guild.id)
+
     # ─── New account join alert ────────────────────────────────────────
 
     @commands.Cog.listener()
@@ -961,13 +1101,13 @@ class Honeypot(Cog):
         if member.bot:
             return
         config = await self.config.guild(member.guild).all()
-        if not config["joinwatch_enabled"] or config["joinwatch_channel"] is None:
+        if not config["joinwatch_enabled"]:
             return
+        await self._increment_stat(member.guild, "joinwatch_total_joins")
         channel = self._get_text_channel_or_thread(member.guild, config["joinwatch_channel"])
-        if channel is None:
-            return
         min_age = timedelta(hours=config["joinwatch_min_age_hours"])
         if member.created_at > datetime.now(timezone.utc) - min_age:
+            await self._increment_stat(member.guild, "joinwatch_young_joins")
             hours = max(1, round((datetime.now(timezone.utc) - member.created_at).total_seconds() / 3600))
             member_label = f"{member.display_name} ({member})"
             embed = discord.Embed(
@@ -980,10 +1120,36 @@ class Honeypot(Cog):
             )
             embed.set_author(name=f"{member.display_name} ({member.id})", icon_url=member.display_avatar)
             embed.set_thumbnail(url=member.display_avatar)
-            try:
-                await channel.send(embed=embed)
-            except discord.HTTPException:
-                log.debug("Failed to send joinwatch alert for user %s in guild %s", member.id, member.guild.id)
+            if config.get("joinwatch_auto_role_enabled") and config.get("joinwatch_auto_role_id") is not None:
+                role = member.guild.get_role(config["joinwatch_auto_role_id"])
+                if role is not None and role not in member.roles and not await self._is_protected_member(member):
+                    try:
+                        await member.add_roles(role, reason="Joinwatch auto role for new account.")
+                        await self._increment_stat(member.guild, "joinwatch_auto_roles")
+                        expires_at = datetime.now(timezone.utc) + timedelta(
+                            minutes=config.get("joinwatch_auto_role_timer_minutes", 1440)
+                        )
+                        await self._store_joinwatch_pending_role(member, role.id, expires_at)
+                        embed.add_field(
+                            name=_("Auto role:"),
+                            value=_("{role} applied until {time}.").format(
+                                role=role.mention,
+                                time=discord.utils.format_dt(expires_at, style="R"),
+                            ),
+                            inline=False,
+                        )
+                    except discord.HTTPException:
+                        await self._increment_stat(member.guild, "joinwatch_auto_role_failures")
+                        embed.add_field(
+                            name=_("Auto role:"),
+                            value=_("I couldn't apply the configured joinwatch auto role."),
+                            inline=False,
+                        )
+            if channel is not None:
+                try:
+                    await channel.send(embed=embed)
+                except discord.HTTPException:
+                    log.debug("Failed to send joinwatch alert for user %s in guild %s", member.id, member.guild.id)
 
     # ─── Baited role trap ─────────────────────────────────────────────
 
@@ -994,6 +1160,20 @@ class Honeypot(Cog):
         if after.bot:
             return
         config = await self.config.guild(after.guild).all()
+        pending_roles = config.get("joinwatch_pending_roles", {})
+        pending_role = pending_roles.get(str(after.id))
+        if pending_role is not None:
+            try:
+                pending_role_id = int(pending_role["role_id"])
+            except (KeyError, TypeError, ValueError):
+                await self._delete_joinwatch_pending_role(after.guild, after.id)
+            else:
+                role_removed = any(role.id == pending_role_id for role in before.roles) and not any(
+                    role.id == pending_role_id for role in after.roles
+                )
+                if role_removed:
+                    await self._delete_joinwatch_pending_role(after.guild, after.id)
+                    await self._increment_stat(after.guild, "joinwatch_auto_roles_cleared")
         if not config["baitrole_enabled"] or config["baitrole_id"] is None:
             return
         bait_role = after.guild.get_role(config["baitrole_id"])
@@ -1484,6 +1664,59 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).joinwatch_min_age_hours.set(hours)
             await ctx.send(_("✅ Joinwatch min age set to {value} hours").format(value=hours))
 
+    @joinwatch.group(name="autorole")
+    async def joinwatch_autorole(self, ctx: commands.Context) -> None:
+        """Automatically role young accounts and punish if the role remains."""
+
+    @joinwatch_autorole.command(name="toggle")
+    async def joinwatch_autorole_toggle(self, ctx: commands.Context, value: bool = None) -> None:
+        """Toggle joinwatch auto role."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).joinwatch_auto_role_enabled()
+            await ctx.send(_("Joinwatch auto role: {value}").format(value=v))
+        else:
+            await self.config.guild(ctx.guild).joinwatch_auto_role_enabled.set(value)
+            await ctx.send(_("✅ Joinwatch auto role set to {value}").format(value=value))
+
+    @joinwatch_autorole.command(name="role")
+    async def joinwatch_autorole_role(self, ctx: commands.Context, role: discord.Role = None) -> None:
+        """Role to apply to young accounts."""
+        if role is None:
+            role_id = await self.config.guild(ctx.guild).joinwatch_auto_role_id()
+            configured_role = ctx.guild.get_role(role_id) if role_id else None
+            await ctx.send(
+                _("Joinwatch auto role: {role}").format(
+                    role=configured_role.mention if configured_role else _("not set"),
+                )
+            )
+        else:
+            await self.config.guild(ctx.guild).joinwatch_auto_role_id.set(role.id)
+            await ctx.send(_("✅ Joinwatch auto role set to {role.mention}").format(role=role))
+
+    @joinwatch_autorole.command(name="timer")
+    async def joinwatch_autorole_timer(self, ctx: commands.Context, minutes: int = None) -> None:
+        """Minutes before punishment if the auto role is still present."""
+        if minutes is None:
+            v = await self.config.guild(ctx.guild).joinwatch_auto_role_timer_minutes()
+            await ctx.send(_("Joinwatch auto role timer: {value} minutes").format(value=v))
+        elif minutes < 1 or minutes > 10080:
+            await ctx.send(_("Timer must be between 1 and 10080 minutes."))
+        else:
+            await self.config.guild(ctx.guild).joinwatch_auto_role_timer_minutes.set(minutes)
+            await ctx.send(_("✅ Joinwatch auto role timer set to {value} minutes").format(value=minutes))
+
+    @joinwatch_autorole.command(name="action")
+    async def joinwatch_autorole_action(self, ctx: commands.Context, value: str = None) -> None:
+        """Action when the auto role is not removed before the timer: none, kick, or ban."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).joinwatch_auto_role_action()
+            await ctx.send(_("Joinwatch auto role action: {value}").format(value=v))
+        elif value not in ("none", "kick", "ban"):
+            await ctx.send(_("Action must be `none`, `kick`, or `ban`."))
+        else:
+            await self.config.guild(ctx.guild).joinwatch_auto_role_action.set(value)
+            await ctx.send(_("✅ Joinwatch auto role action set to {value}").format(value=value))
+
     # ─── bait sub-group ───────────────────────────────────────────────
 
     @honeypot.group()
@@ -1531,6 +1764,10 @@ class Honeypot(Cog):
         stats = DEFAULT_STATS.copy()
         stats.update(await self.config.guild(ctx.guild).stats())
         pending_reviews = await self.config.guild(ctx.guild).pending_reviews()
+        pending_joinwatch_roles = await self.config.guild(ctx.guild).joinwatch_pending_roles()
+        total_joins = stats["joinwatch_total_joins"]
+        young_joins = stats["joinwatch_young_joins"]
+        young_join_rate = (young_joins / total_joins * 100) if total_joins else 0
         sections = {
             "Detection": {
                 "Total detections": stats["detections"],
@@ -1545,6 +1782,16 @@ class Honeypot(Cog):
                 "Ignored reviews": stats["ignored"],
                 "Applied temporary mutes": stats["pending_mutes"],
                 "Failed temporary mutes": stats["pending_mute_failures"],
+            },
+            "Joinwatch": {
+                "Total joins": total_joins,
+                "Young joins": young_joins,
+                "Young join rate": f"{young_join_rate:.1f}%",
+                "Auto roles applied": stats["joinwatch_auto_roles"],
+                "Auto role failures": stats["joinwatch_auto_role_failures"],
+                "Auto roles cleared": stats["joinwatch_auto_roles_cleared"],
+                "Active auto role timers": len(pending_joinwatch_roles),
+                "Auto role punishments": stats["joinwatch_auto_role_punishments"],
             },
             "Actions": {
                 "Kicked users": stats["kicked"],
@@ -1587,6 +1834,12 @@ class Honeypot(Cog):
             checks.append(("Mute role exists", mute_role is not None, "Set `muterole` again."))
             if mute_role is not None:
                 checks.append(("Bot above mute role", me.top_role > mute_role, "Move bot role above mute role."))
+        if config.get("joinwatch_auto_role_enabled"):
+            auto_role_id = config.get("joinwatch_auto_role_id")
+            auto_role = ctx.guild.get_role(auto_role_id) if auto_role_id else None
+            checks.append(("Joinwatch auto role exists", auto_role is not None, "Run `honeypot joinwatch autorole role`."))
+            if auto_role is not None:
+                checks.append(("Bot above joinwatch auto role", me.top_role > auto_role, "Move bot role above the joinwatch auto role."))
         if honeypot_channel is not None:
             perms = honeypot_channel.permissions_for(me)
             checks.append(("Can view", perms.view_channel, "Grant View Channel."))
@@ -1601,7 +1854,7 @@ class Honeypot(Cog):
         guild_perms = me.guild_permissions
         checks.append(("Can kick members", guild_perms.kick_members, "Grant Kick Members."))
         checks.append(("Can ban members", guild_perms.ban_members, "Grant Ban Members."))
-        checks.append(("Can manage roles", guild_perms.manage_roles, "Grant Manage Roles for mute."))
+        checks.append(("Can manage roles", guild_perms.manage_roles, "Grant Manage Roles for mute or joinwatch auto-role."))
         failed = [f"❌ {name} - {hint}" for name, ok, hint in checks if not ok]
         passed = [f"✅ {name}" for name, ok, _hint in checks if ok]
         await ctx.send(_("**Honeypot doctor:**\n{body}").format(body="\n".join(passed + failed)))

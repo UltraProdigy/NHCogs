@@ -107,6 +107,10 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot joinwatch toggle <bool>` | Toggle new-account join alerts |
 | `!honeypot joinwatch channel <channel>` | Channel for join alerts |
 | `!honeypot joinwatch min_age <1-168>` | Max account age in hours to trigger alert |
+| `!honeypot joinwatch autorole toggle <bool>` | Toggle automatic role assignment for young accounts |
+| `!honeypot joinwatch autorole role <role>` | Role to apply to young accounts |
+| `!honeypot joinwatch autorole timer <1-10080>` | Minutes before punishment if the role remains |
+| `!honeypot joinwatch autorole action <none\|kick\|ban>` | Action when the auto role is not removed in time |
 
 ### bait
 
@@ -190,10 +194,34 @@ for review containment mutes. They do not mean those users are still muted.
 does not include the original honeypot message, which is deleted separately as
 part of every detection.
 
+The `Joinwatch` stats section tracks non-bot joins while joinwatch is enabled.
+`Young joins` counts accounts below the configured `joinwatch min_age`
+threshold, and `Young join rate` is `Young joins / Total joins`. Auto-role
+clear and punishment counters are historical; `Active auto role timers` is the
+current number of users still waiting for staff action or timeout.
+
 ## Joinwatch
 
 When a user with an account younger than the configured threshold joins, an embed
-is sent to the joinwatch channel. No buttons, no actions — just an alert.
+is sent to the joinwatch channel. If joinwatch auto-role is enabled, the cog also
+applies the configured role and starts a timer.
+
+Setup:
+
+```ini
+[p]honeypot joinwatch min_age 24
+[p]honeypot joinwatch autorole role @NewAccount
+[p]honeypot joinwatch autorole timer 1440
+[p]honeypot joinwatch autorole action ban
+[p]honeypot joinwatch autorole toggle true
+```
+
+If staff removes the auto role before the timer expires, the timer is cleared and
+no punishment is taken. If the timer expires and the user still has the role, the
+cog applies the configured joinwatch action: `none`, `kick`, or `ban`.
+
+Joinwatch auto-role ignores bot owners, server mods, server admins, users with
+`Manage Server`, and users whose top role is at or above the bot's top role.
 
 ## Bait Role
 
@@ -223,17 +251,14 @@ the bait role is deleted or no bait role is configured, the trap does nothing.
 - Send Messages (in logs, review, and joinwatch channels)
 - Kick Members (if using kick)
 - Ban Members (if using ban)
-- Manage Roles (if using review mute role)
+- Manage Roles (if using review mute role or joinwatch auto-role)
 - Manage Channels (if using `channel create`)
-- Bot role must be above users it punishes and above the mute role
+- Bot role must be above users it punishes, the review mute role, and the joinwatch auto-role
 
 ## Intents
 
-- `GUILD_MEMBERS` (privileged) — required for `on_member_join` (joinwatch)
+- `GUILD_MEMBERS` (privileged) — required for `on_member_join` (joinwatch) and `on_member_update` (joinwatch auto-role and bait role)
 - `MESSAGE_CONTENT` (privileged) — required for `on_message` (detection)
-
-The bait role trap also requires member update events, which are covered by the
-`GUILD_MEMBERS` privileged intent.
 
 Both are enabled by default in RedBot v3.5+.
 
