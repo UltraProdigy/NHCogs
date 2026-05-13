@@ -330,6 +330,15 @@ class Honeypot(Cog):
         async with self.config.guild(guild).joinwatch_pending_roles() as pending_roles:
             pending_roles.pop(str(member_id), None)
 
+    async def _get_member_or_fetch(self, guild: discord.Guild, member_id: int) -> discord.Member | None:
+        member = guild.get_member(member_id)
+        if member is not None:
+            return member
+        try:
+            return await guild.fetch_member(member_id)
+        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+            return None
+
     def _get_text_channel_or_thread(
         self, guild: discord.Guild, channel_id: int | None
     ) -> discord.TextChannel | discord.Thread | None:
@@ -352,20 +361,36 @@ class Honeypot(Cog):
         return _("Dry run: I would not take action.")
 
     def _missing_action_permission(self, guild: discord.Guild, action: str) -> str | None:
-        permissions = guild.me.guild_permissions
+        me = guild.me
+        if me is None:
+            return _("**Failed:** I could not resolve my guild member.")
+        permissions = me.guild_permissions
         if action == "kick" and not permissions.kick_members:
             return _("**Failed:** I do not have the `Kick Members` permission.")
         if action == "ban" and not permissions.ban_members:
             return _("**Failed:** I do not have the `Ban Members` permission.")
         return None
 
+    def _missing_role_assignment_permission(self, guild: discord.Guild, role: discord.Role) -> str | None:
+        me = guild.me
+        if me is None:
+            return _("I could not resolve my guild member.")
+        if not me.guild_permissions.manage_roles:
+            return _("I need `Manage Roles` permission to apply the joinwatch auto role.")
+        if me.top_role <= role:
+            return _("My top role must be above the joinwatch auto role.")
+        return None
+
     async def _is_protected_member(self, member: discord.Member) -> bool:
+        me = member.guild.me
+        if me is None:
+            return True
         return (
             member.id in self.bot.owner_ids
             or await self.bot.is_mod(member)
             or await self.bot.is_admin(member)
             or member.guild_permissions.manage_guild
-            or member.top_role >= member.guild.me.top_role
+            or member.top_role >= me.top_role
         )
 
     def _format_bytes(self, size: int) -> str:
@@ -1051,7 +1076,7 @@ class Honeypot(Cog):
                         continue
                     if expires_at > now:
                         continue
-                    member = guild.get_member(member_id)
+                    member = await self._get_member_or_fetch(guild, member_id)
                     role = guild.get_role(role_id)
                     if member is None:
                         await self._delete_joinwatch_pending_role(guild, member_id)
@@ -1068,7 +1093,14 @@ class Honeypot(Cog):
                         config,
                         reason="Joinwatch auto role timer expired.",
                     )
-                    await self._delete_joinwatch_pending_role(guild, member_id)
+                    if failed:
+                        async with self.config.guild(guild).joinwatch_pending_roles() as stored_pending_roles:
+                            if member_id_str in stored_pending_roles:
+                                stored_pending_roles[member_id_str]["expires_at"] = (
+                                    now + timedelta(minutes=5)
+                                ).isoformat()
+                    else:
+                        await self._delete_joinwatch_pending_role(guild, member_id)
                     if logs_channel is not None:
                         embed = discord.Embed(
                             title=_("Joinwatch auto-role timer expired"),
@@ -1091,6 +1123,10 @@ class Honeypot(Cog):
                             log.debug("Failed to send joinwatch auto-role log for user %s in guild %s", member.id, guild.id)
             except Exception:
                 log.exception("Failed to process joinwatch auto-role timers for guild %s", guild.id)
+
+    @joinwatch_auto_role_loop.before_loop
+    async def before_joinwatch_auto_role(self) -> None:
+        await self.bot.wait_until_red_ready()
 
     # ─── New account join alert ────────────────────────────────────────
 
@@ -1123,28 +1159,37 @@ class Honeypot(Cog):
             if config.get("joinwatch_auto_role_enabled") and config.get("joinwatch_auto_role_id") is not None:
                 role = member.guild.get_role(config["joinwatch_auto_role_id"])
                 if role is not None and role not in member.roles and not await self._is_protected_member(member):
-                    try:
-                        await member.add_roles(role, reason="Joinwatch auto role for new account.")
-                        await self._increment_stat(member.guild, "joinwatch_auto_roles")
-                        expires_at = datetime.now(timezone.utc) + timedelta(
-                            minutes=config.get("joinwatch_auto_role_timer_minutes", 1440)
-                        )
-                        await self._store_joinwatch_pending_role(member, role.id, expires_at)
-                        embed.add_field(
-                            name=_("Auto role:"),
-                            value=_("{role} applied until {time}.").format(
-                                role=role.mention,
-                                time=discord.utils.format_dt(expires_at, style="R"),
-                            ),
-                            inline=False,
-                        )
-                    except discord.HTTPException:
+                    role_permission_error = self._missing_role_assignment_permission(member.guild, role)
+                    if role_permission_error is not None:
                         await self._increment_stat(member.guild, "joinwatch_auto_role_failures")
                         embed.add_field(
                             name=_("Auto role:"),
-                            value=_("I couldn't apply the configured joinwatch auto role."),
+                            value=role_permission_error,
                             inline=False,
                         )
+                    else:
+                        try:
+                            await member.add_roles(role, reason="Joinwatch auto role for new account.")
+                            await self._increment_stat(member.guild, "joinwatch_auto_roles")
+                            expires_at = datetime.now(timezone.utc) + timedelta(
+                                minutes=config.get("joinwatch_auto_role_timer_minutes", 1440)
+                            )
+                            await self._store_joinwatch_pending_role(member, role.id, expires_at)
+                            embed.add_field(
+                                name=_("Auto role:"),
+                                value=_("{role} applied until {time}.").format(
+                                    role=role.mention,
+                                    time=discord.utils.format_dt(expires_at, style="R"),
+                                ),
+                                inline=False,
+                            )
+                        except discord.HTTPException:
+                            await self._increment_stat(member.guild, "joinwatch_auto_role_failures")
+                            embed.add_field(
+                                name=_("Auto role:"),
+                                value=_("I couldn't apply the configured joinwatch auto role."),
+                                inline=False,
+                            )
             if channel is not None:
                 try:
                     await channel.send(embed=embed)
@@ -1690,6 +1735,9 @@ class Honeypot(Cog):
                 )
             )
         else:
+            role_permission_error = self._missing_role_assignment_permission(ctx.guild, role)
+            if role_permission_error is not None:
+                raise commands.UserFeedbackCheckFailure(role_permission_error)
             await self.config.guild(ctx.guild).joinwatch_auto_role_id.set(role.id)
             await ctx.send(_("✅ Joinwatch auto role set to {role.mention}").format(role=role))
 
