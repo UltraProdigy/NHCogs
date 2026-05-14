@@ -267,6 +267,7 @@ class Honeypot(Cog):
             scam_keywords=SCAM_KEYWORDS.copy(),
             attachment_patterns=DEFAULT_ATTACHMENT_PATTERNS.copy(),
             joinwatch_enabled=False,
+            joinwatch_alert_enabled=True,
             joinwatch_channel=None,
             joinwatch_min_age_hours=24,
             joinwatch_auto_role_enabled=False,
@@ -1214,7 +1215,7 @@ class Honeypot(Cog):
                                 value=_("I couldn't apply the configured joinwatch auto role."),
                                 inline=False,
                             )
-            if channel is not None:
+            if config.get("joinwatch_alert_enabled", True) and channel is not None:
                 try:
                     await channel.send(embed=embed)
                 except discord.HTTPException:
@@ -1721,17 +1722,31 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).joinwatch_channel.set(target.id)
             await ctx.send(_("✅ Joinwatch channel set to {channel.mention}").format(channel=target))
 
-    @joinwatch.command()
-    async def min_age(self, ctx: commands.Context, hours: int = None) -> None:
+    @joinwatch.group(name="alert")
+    async def joinwatch_alert(self, ctx: commands.Context) -> None:
+        """Configure joinwatch alert messages."""
+
+    @joinwatch_alert.command(name="toggle")
+    async def joinwatch_alert_toggle(self, ctx: commands.Context, value: bool = None) -> None:
+        """Toggle joinwatch alert messages."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).joinwatch_alert_enabled()
+            await ctx.send(_("Joinwatch alerts: {value}").format(value=v))
+        else:
+            await self.config.guild(ctx.guild).joinwatch_alert_enabled.set(value)
+            await ctx.send(_("✅ Joinwatch alerts set to {value}").format(value=value))
+
+    @joinwatch.command(name="max_age")
+    async def max_age(self, ctx: commands.Context, hours: int = None) -> None:
         """Max account age in hours to trigger alert (default 24)."""
         if hours is None:
             v = await self.config.guild(ctx.guild).joinwatch_min_age_hours()
-            await ctx.send(_("Joinwatch min age: {value} hours").format(value=v))
+            await ctx.send(_("Joinwatch max age: {value} hours").format(value=v))
         elif hours < 1 or hours > 168:
             await ctx.send(_("Hours must be between 1 and 168 (1 week)."))
         else:
             await self.config.guild(ctx.guild).joinwatch_min_age_hours.set(hours)
-            await ctx.send(_("✅ Joinwatch min age set to {value} hours").format(value=hours))
+            await ctx.send(_("✅ Joinwatch max age set to {value} hours").format(value=hours))
 
     @joinwatch.group(name="autorole")
     async def joinwatch_autorole(self, ctx: commands.Context) -> None:
@@ -1957,8 +1972,9 @@ class Honeypot(Cog):
         lines = [
             _("Joinwatch:"),
             f"  {_('Enabled')}: {self._format_bool_setting(config.get('joinwatch_enabled', False))}",
+            f"  {_('Alerts')}: {self._format_bool_setting(config.get('joinwatch_alert_enabled', True))}",
             f"  {_('Channel')}: {self._format_channel_setting(ctx.guild, config.get('joinwatch_channel'))}",
-            f"  {_('Minimum account age')}: {_('{hours} hours').format(hours=config.get('joinwatch_min_age_hours'))}",
+            f"  {_('Maximum account age')}: {_('{hours} hours').format(hours=config.get('joinwatch_min_age_hours'))}",
             "",
             _("Auto role:"),
             f"  {_('Enabled')}: {self._format_bool_setting(config.get('joinwatch_auto_role_enabled', False))}",
@@ -2103,6 +2119,12 @@ class Honeypot(Cog):
             checks.append(("Joinwatch auto role exists", auto_role is not None, "Run `honeypot joinwatch autorole role`."))
             if auto_role is not None:
                 checks.append(("Bot above joinwatch auto role", me.top_role > auto_role, "Move bot role above the joinwatch auto role."))
+        if config.get("joinwatch_enabled") and config.get("joinwatch_alert_enabled", True):
+            joinwatch_channel = self._get_text_channel_or_thread(ctx.guild, config.get("joinwatch_channel"))
+            checks.append(("Joinwatch alert channel exists", joinwatch_channel is not None, "Run `honeypot joinwatch channel`."))
+            if joinwatch_channel is not None:
+                perms = joinwatch_channel.permissions_for(me)
+                checks.append(("Can send joinwatch alerts", perms.send_messages, "Grant Send Messages."))
         if honeypot_channel is not None:
             perms = honeypot_channel.permissions_for(me)
             checks.append(("Can view", perms.view_channel, "Grant View Channel."))
