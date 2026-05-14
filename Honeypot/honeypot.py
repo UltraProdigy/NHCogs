@@ -353,6 +353,30 @@ class Honeypot(Cog):
             return channel
         return None
 
+    def _format_channel_setting(self, guild: discord.Guild, channel_id: int | None) -> str:
+        channel = self._get_text_channel_or_thread(guild, channel_id)
+        if channel is not None:
+            return f"{channel.mention} ({channel.id})"
+        return _("not set") if channel_id is None else _("missing ({id})").format(id=channel_id)
+
+    def _format_role_setting(self, guild: discord.Guild, role_id: int | None) -> str:
+        role = guild.get_role(role_id) if role_id else None
+        if role is not None:
+            return f"{role.mention} ({role.id})"
+        return _("not set") if role_id is None else _("missing ({id})").format(id=role_id)
+
+    def _format_bool_setting(self, value: bool) -> str:
+        return _("enabled") if value else _("disabled")
+
+    async def _send_config_dump(
+        self,
+        ctx: commands.Context,
+        title: str,
+        entries: list[tuple[str, typing.Any]],
+    ) -> None:
+        lines = [f"{label}: {value}" for label, value in entries]
+        await ctx.send(_("{title}:\n").format(title=title) + box("\n".join(lines)))
+
     def _dry_run_label(self, action: str) -> str:
         if action == "ban":
             return _("Dry run: I would ban this member.")
@@ -1803,6 +1827,212 @@ class Honeypot(Cog):
         else:
             await self.config.guild(ctx.guild).baitrole_action.set(value)
             await ctx.send(_("✅ Bait action set to {value}").format(value=value))
+
+    # ─── config dump ───────────────────────────────────────────────────
+
+    @honeypot.group(name="config")
+    async def config_dump(self, ctx: commands.Context) -> None:
+        """Show current Honeypot configuration by section."""
+
+    @config_dump.command(name="core")
+    async def config_core(self, ctx: commands.Context) -> None:
+        """Show core configuration."""
+        config = await self.config.guild(ctx.guild).all()
+        await self._send_config_dump(
+            ctx,
+            _("Core config"),
+            [
+                (_("Enabled"), self._format_bool_setting(config.get("enabled", False))),
+                (_("Action"), config.get("action") or _("not set")),
+                (_("Fallback action"), config.get("fallback_action")),
+                (_("Dry run"), self._format_bool_setting(config.get("dry_run", False))),
+                (_("Whitelist mode"), config.get("whitelist_mode")),
+            ],
+        )
+
+    @config_dump.command(name="channel")
+    async def config_channel(self, ctx: commands.Context) -> None:
+        """Show channel configuration."""
+        config = await self.config.guild(ctx.guild).all()
+        await self._send_config_dump(
+            ctx,
+            _("Channel config"),
+            [
+                (_("Honeypot channel"), self._format_channel_setting(ctx.guild, config.get("honeypot_channel"))),
+                (_("Logs channel"), self._format_channel_setting(ctx.guild, config.get("logs_channel"))),
+                (_("Ping role"), self._format_role_setting(ctx.guild, config.get("ping_role"))),
+            ],
+        )
+
+    @config_dump.command(name="punishment")
+    async def config_punishment(self, ctx: commands.Context) -> None:
+        """Show punishment configuration."""
+        config = await self.config.guild(ctx.guild).all()
+        await self._send_config_dump(
+            ctx,
+            _("Punishment config"),
+            [
+                (_("Mute role"), self._format_role_setting(ctx.guild, config.get("mute_role"))),
+                (_("Ban delete message days"), config.get("ban_delete_message_days")),
+            ],
+        )
+
+    @config_dump.command(name="purge")
+    async def config_purge(self, ctx: commands.Context) -> None:
+        """Show purge configuration."""
+        config = await self.config.guild(ctx.guild).all()
+        await self._send_config_dump(
+            ctx,
+            _("Purge config"),
+            [
+                (_("Enabled"), self._format_bool_setting(config.get("purge_enabled", False))),
+                (_("Minutes"), config.get("purge_minutes")),
+            ],
+        )
+
+    @config_dump.command(name="fakeactivity")
+    async def config_fakeactivity(self, ctx: commands.Context) -> None:
+        """Show fake activity configuration."""
+        config = await self.config.guild(ctx.guild).all()
+        messages = config.get("fake_activity_messages") or []
+        await self._send_config_dump(
+            ctx,
+            _("Fake activity config"),
+            [
+                (_("Enabled"), self._format_bool_setting(config.get("fake_activity_enabled", False))),
+                (_("Interval"), _("{minutes} minutes").format(minutes=config.get("fake_activity_interval"))),
+                (_("Custom messages"), len(messages)),
+            ],
+        )
+
+    @config_dump.command(name="review")
+    async def config_review(self, ctx: commands.Context) -> None:
+        """Show review configuration."""
+        config = await self.config.guild(ctx.guild).all()
+        await self._send_config_dump(
+            ctx,
+            _("Review config"),
+            [
+                (_("Enabled"), self._format_bool_setting(config.get("review_enabled", False))),
+                (_("Channel"), self._format_channel_setting(ctx.guild, config.get("review_channel"))),
+                (_("Timeout"), _("{minutes} minutes").format(minutes=config.get("review_timeout_minutes"))),
+                (_("Pending reviews"), len(config.get("pending_reviews", {}))),
+            ],
+        )
+
+    @config_dump.command(name="roles")
+    async def config_roles(self, ctx: commands.Context) -> None:
+        """Show whitelisted role configuration."""
+        config = await self.config.guild(ctx.guild).all()
+        role_ids = config.get("whitelisted_roles", [])
+        roles = [self._format_role_setting(ctx.guild, role_id) for role_id in role_ids]
+        await self._send_config_dump(
+            ctx,
+            _("Roles config"),
+            [
+                (_("Whitelist mode"), config.get("whitelist_mode")),
+                (_("Whitelisted roles"), ", ".join(roles) if roles else _("none")),
+            ],
+        )
+
+    @config_dump.command(name="keywords")
+    async def config_keywords(self, ctx: commands.Context) -> None:
+        """Show keyword configuration counts."""
+        config = await self.config.guild(ctx.guild).all()
+        keywords = config.get("scam_keywords") or []
+        attachment_patterns = config.get("attachment_patterns") or []
+        await self._send_config_dump(
+            ctx,
+            _("Keywords config"),
+            [
+                (_("Scam keywords"), len(keywords)),
+                (_("Attachment patterns"), len(attachment_patterns)),
+            ],
+        )
+
+    @config_dump.group(name="joinwatch")
+    async def config_joinwatch(self, ctx: commands.Context) -> None:
+        """Show joinwatch configuration."""
+
+    @config_joinwatch.command(name="main")
+    async def config_joinwatch_main(self, ctx: commands.Context) -> None:
+        """Show main joinwatch configuration."""
+        config = await self.config.guild(ctx.guild).all()
+        await self._send_config_dump(
+            ctx,
+            _("Joinwatch config"),
+            [
+                (_("Enabled"), self._format_bool_setting(config.get("joinwatch_enabled", False))),
+                (_("Channel"), self._format_channel_setting(ctx.guild, config.get("joinwatch_channel"))),
+                (_("Minimum account age"), _("{hours} hours").format(hours=config.get("joinwatch_min_age_hours"))),
+            ],
+        )
+
+    @config_joinwatch.command(name="autorole")
+    async def config_joinwatch_autorole(self, ctx: commands.Context) -> None:
+        """Show joinwatch auto-role configuration."""
+        config = await self.config.guild(ctx.guild).all()
+        await self._send_config_dump(
+            ctx,
+            _("Joinwatch auto-role config"),
+            [
+                (_("Enabled"), self._format_bool_setting(config.get("joinwatch_auto_role_enabled", False))),
+                (_("Role"), self._format_role_setting(ctx.guild, config.get("joinwatch_auto_role_id"))),
+                (_("Timer"), _("{minutes} minutes").format(minutes=config.get("joinwatch_auto_role_timer_minutes"))),
+                (_("Action"), config.get("joinwatch_auto_role_action")),
+                (_("Active timers"), len(config.get("joinwatch_pending_roles", {}))),
+            ],
+        )
+
+    @config_dump.command(name="bait")
+    async def config_bait(self, ctx: commands.Context) -> None:
+        """Show bait role configuration."""
+        config = await self.config.guild(ctx.guild).all()
+        await self._send_config_dump(
+            ctx,
+            _("Bait config"),
+            [
+                (_("Enabled"), self._format_bool_setting(config.get("baitrole_enabled", False))),
+                (_("Role"), self._format_role_setting(ctx.guild, config.get("baitrole_id"))),
+                (_("Action"), config.get("baitrole_action")),
+            ],
+        )
+
+    @config_dump.command(name="stats")
+    async def config_stats(self, ctx: commands.Context) -> None:
+        """Show stored stats and pending object counts."""
+        config = await self.config.guild(ctx.guild).all()
+        stats = DEFAULT_STATS.copy()
+        stats.update(config.get("stats", {}))
+        await self._send_config_dump(
+            ctx,
+            _("Stats config"),
+            [
+                (_("Stored stat keys"), len(stats)),
+                (_("Pending reviews"), len(config.get("pending_reviews", {}))),
+                (_("Pending joinwatch auto roles"), len(config.get("joinwatch_pending_roles", {}))),
+            ],
+        )
+
+    @config_dump.command(name="all")
+    async def config_all(self, ctx: commands.Context) -> None:
+        """Show a compact summary of all configuration sections."""
+        config = await self.config.guild(ctx.guild).all()
+        await self._send_config_dump(
+            ctx,
+            _("Honeypot config summary"),
+            [
+                (_("Core"), self._format_bool_setting(config.get("enabled", False))),
+                (_("Honeypot channel"), self._format_channel_setting(ctx.guild, config.get("honeypot_channel"))),
+                (_("Logs channel"), self._format_channel_setting(ctx.guild, config.get("logs_channel"))),
+                (_("Review"), self._format_bool_setting(config.get("review_enabled", False))),
+                (_("Joinwatch"), self._format_bool_setting(config.get("joinwatch_enabled", False))),
+                (_("Joinwatch auto role"), self._format_bool_setting(config.get("joinwatch_auto_role_enabled", False))),
+                (_("Bait role"), self._format_bool_setting(config.get("baitrole_enabled", False))),
+                (_("Pending reviews"), len(config.get("pending_reviews", {}))),
+                (_("Pending joinwatch auto roles"), len(config.get("joinwatch_pending_roles", {}))),
+            ],
+        )
 
     # ─── stats ────────────────────────────────────────────────────────
 

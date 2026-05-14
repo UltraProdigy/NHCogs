@@ -124,6 +124,19 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 
 | Command | Description |
 |---------|-------------|
+| `!honeypot config all` | Show a compact summary of all configuration sections |
+| `!honeypot config core` | Show core settings |
+| `!honeypot config channel` | Show channel and ping role settings |
+| `!honeypot config punishment` | Show punishment settings |
+| `!honeypot config purge` | Show purge settings |
+| `!honeypot config fakeactivity` | Show fake activity settings |
+| `!honeypot config review` | Show review settings and pending review count |
+| `!honeypot config roles` | Show whitelist role settings |
+| `!honeypot config keywords` | Show keyword and attachment-pattern counts |
+| `!honeypot config joinwatch main` | Show joinwatch settings |
+| `!honeypot config joinwatch autorole` | Show joinwatch auto-role settings |
+| `!honeypot config bait` | Show bait role settings |
+| `!honeypot config stats` | Show stored stat and pending object counts |
 | `!honeypot stats` | Show detection statistics |
 | `!honeypot resetstats` | Reset statistics |
 | `!honeypot doctor` | Check config, channels, and permissions |
@@ -199,6 +212,13 @@ The `Joinwatch` stats section tracks non-bot joins while joinwatch is enabled.
 threshold, and `Young join rate` is `Young joins / Total joins`. Auto-role
 clear and punishment counters are historical; `Active auto role timers` is the
 current number of users still waiting for staff action or timeout.
+
+## Config Dumps
+
+Use `!honeypot config <section>` to inspect current settings without dumping raw
+internal data. Config dumps resolve channels and roles when possible, show
+missing IDs when objects were deleted, and summarize pending reviews or
+joinwatch timers by count instead of exposing message contents.
 
 ## Joinwatch
 
