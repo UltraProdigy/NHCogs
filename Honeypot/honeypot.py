@@ -1950,39 +1950,24 @@ class Honeypot(Cog):
             ],
         )
 
-    @config_dump.group(name="joinwatch")
+    @config_dump.command(name="joinwatch")
     async def config_joinwatch(self, ctx: commands.Context) -> None:
         """Show joinwatch configuration."""
-
-    @config_joinwatch.command(name="main")
-    async def config_joinwatch_main(self, ctx: commands.Context) -> None:
-        """Show main joinwatch configuration."""
         config = await self.config.guild(ctx.guild).all()
-        await self._send_config_dump(
-            ctx,
-            _("Joinwatch config"),
-            [
-                (_("Enabled"), self._format_bool_setting(config.get("joinwatch_enabled", False))),
-                (_("Channel"), self._format_channel_setting(ctx.guild, config.get("joinwatch_channel"))),
-                (_("Minimum account age"), _("{hours} hours").format(hours=config.get("joinwatch_min_age_hours"))),
-            ],
-        )
-
-    @config_joinwatch.command(name="autorole")
-    async def config_joinwatch_autorole(self, ctx: commands.Context) -> None:
-        """Show joinwatch auto-role configuration."""
-        config = await self.config.guild(ctx.guild).all()
-        await self._send_config_dump(
-            ctx,
-            _("Joinwatch auto-role config"),
-            [
-                (_("Enabled"), self._format_bool_setting(config.get("joinwatch_auto_role_enabled", False))),
-                (_("Role"), self._format_role_setting(ctx.guild, config.get("joinwatch_auto_role_id"))),
-                (_("Timer"), _("{minutes} minutes").format(minutes=config.get("joinwatch_auto_role_timer_minutes"))),
-                (_("Action"), config.get("joinwatch_auto_role_action")),
-                (_("Active timers"), len(config.get("joinwatch_pending_roles", {}))),
-            ],
-        )
+        lines = [
+            _("Joinwatch:"),
+            f"  {_('Enabled')}: {self._format_bool_setting(config.get('joinwatch_enabled', False))}",
+            f"  {_('Channel')}: {self._format_channel_setting(ctx.guild, config.get('joinwatch_channel'))}",
+            f"  {_('Minimum account age')}: {_('{hours} hours').format(hours=config.get('joinwatch_min_age_hours'))}",
+            "",
+            _("Auto role:"),
+            f"  {_('Enabled')}: {self._format_bool_setting(config.get('joinwatch_auto_role_enabled', False))}",
+            f"  {_('Role')}: {self._format_role_setting(ctx.guild, config.get('joinwatch_auto_role_id'))}",
+            f"  {_('Timer')}: {_('{minutes} minutes').format(minutes=config.get('joinwatch_auto_role_timer_minutes'))}",
+            f"  {_('Action')}: {config.get('joinwatch_auto_role_action')}",
+            f"  {_('Active timers')}: {len(config.get('joinwatch_pending_roles', {}))}",
+        ]
+        await ctx.send(_("Joinwatch config:\n") + box("\n".join(lines)))
 
     @config_dump.command(name="bait")
     async def config_bait(self, ctx: commands.Context) -> None:

@@ -133,8 +133,7 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot config review` | Show review settings and pending review count |
 | `!honeypot config roles` | Show whitelist role settings |
 | `!honeypot config keywords` | Show keyword and attachment-pattern counts |
-| `!honeypot config joinwatch main` | Show joinwatch settings |
-| `!honeypot config joinwatch autorole` | Show joinwatch auto-role settings |
+| `!honeypot config joinwatch` | Show joinwatch and joinwatch auto-role settings |
 | `!honeypot config bait` | Show bait role settings |
 | `!honeypot config stats` | Show stored stat and pending object counts |
 | `!honeypot stats` | Show detection statistics |
