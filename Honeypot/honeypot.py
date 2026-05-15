@@ -325,11 +325,13 @@ class Honeypot(Cog):
         member: discord.Member,
         role_id: int,
         expires_at: datetime,
+        applied_at: datetime | None = None,
         alert_channel_id: int | None = None,
         alert_message_id: int | None = None,
     ) -> None:
         pending_role = {
             "role_id": role_id,
+            "applied_at": (applied_at or datetime.now(timezone.utc)).isoformat(),
             "expires_at": expires_at.isoformat(),
         }
         if alert_channel_id is not None and alert_message_id is not None:
@@ -417,6 +419,72 @@ class Honeypot(Cog):
             await message.edit(embed=embed)
         except discord.HTTPException:
             log.debug("Failed to edit joinwatch alert message %s in guild %s", message_id, guild.id)
+
+    async def _reschedule_joinwatch_pending_roles(
+        self,
+        guild: discord.Guild,
+        old_timer_minutes: int,
+        new_timer_minutes: int,
+    ) -> int:
+        alert_updates: list[tuple[dict, int, datetime]] = []
+        updated = 0
+        async with self.config.guild(guild).joinwatch_pending_roles() as pending_roles:
+            for data in pending_roles.values():
+                try:
+                    role_id = int(data["role_id"])
+                    if data.get("applied_at") is not None:
+                        applied_at = datetime.fromisoformat(data["applied_at"])
+                    else:
+                        old_expires_at = datetime.fromisoformat(data["expires_at"])
+                        applied_at = old_expires_at - timedelta(minutes=old_timer_minutes)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                expires_at = applied_at + timedelta(minutes=new_timer_minutes)
+                data["applied_at"] = applied_at.isoformat()
+                data["expires_at"] = expires_at.isoformat()
+                alert_updates.append((dict(data), role_id, expires_at))
+                updated += 1
+        for data, role_id, expires_at in alert_updates:
+            role = guild.get_role(role_id)
+            if role is None:
+                continue
+            await self._edit_joinwatch_alert_auto_role(
+                guild,
+                data,
+                _("{role} applied until {time}.").format(
+                    role=role.mention,
+                    time=discord.utils.format_dt(expires_at, style="R"),
+                ),
+            )
+        return updated
+
+    async def _refresh_joinwatch_pending_role_alerts(
+        self,
+        guild: discord.Guild,
+        timer_minutes: int,
+    ) -> None:
+        pending_roles = await self.config.guild(guild).joinwatch_pending_roles()
+        for data in list(pending_roles.values()):
+            try:
+                role_id = int(data["role_id"])
+                if data.get("applied_at") is not None:
+                    applied_at = datetime.fromisoformat(data["applied_at"])
+                    expires_at = applied_at + timedelta(minutes=timer_minutes)
+                else:
+                    expires_at = datetime.fromisoformat(data["expires_at"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            role = guild.get_role(role_id)
+            if role is None:
+                continue
+            await self._edit_joinwatch_alert_auto_role(
+                guild,
+                data,
+                _("{role} applied until {time}.").format(
+                    role=role.mention,
+                    time=discord.utils.format_dt(expires_at, style="R"),
+                ),
+            )
 
     async def _get_member_or_fetch(self, guild: discord.Guild, member_id: int) -> discord.Member | None:
         member = guild.get_member(member_id)
@@ -1229,6 +1297,7 @@ class Honeypot(Cog):
                         member,
                         role.id,
                         expires_at,
+                        applied_at=now,
                         alert_channel_id=data.get("alert_channel_id"),
                         alert_message_id=data.get("alert_message_id"),
                     )
@@ -1245,6 +1314,11 @@ class Honeypot(Cog):
                     try:
                         member_id = int(member_id_str)
                         role_id = int(data["role_id"])
+                    except (KeyError, TypeError, ValueError):
+                        async with self.config.guild(guild).joinwatch_pending_roles() as stored_pending_roles:
+                            stored_pending_roles.pop(str(member_id_str), None)
+                        continue
+                    try:
                         expires_at = datetime.fromisoformat(data["expires_at"])
                     except (KeyError, TypeError, ValueError):
                         async with self.config.guild(guild).joinwatch_pending_roles() as stored_pending_roles:
@@ -1275,7 +1349,7 @@ class Honeypot(Cog):
                     action_label, failed = await self._execute_joinwatch_action(
                         member,
                         config,
-                        reason="Joinwatch auto role timer expired.",
+                        reason="Suspicious Account",
                     )
                     if failed:
                         async with self.config.guild(guild).joinwatch_pending_roles() as stored_pending_roles:
@@ -1384,7 +1458,12 @@ class Honeypot(Cog):
                                 expires_at = now + timedelta(
                                     minutes=config.get("joinwatch_auto_role_timer_minutes", 1440)
                                 )
-                                await self._store_joinwatch_pending_role(member, role.id, expires_at)
+                                await self._store_joinwatch_pending_role(
+                                    member,
+                                    role.id,
+                                    expires_at,
+                                    applied_at=now,
+                                )
                                 embed.add_field(
                                     name=_("Auto role:"),
                                     value=_("{role} applied until {time}.").format(
@@ -1993,8 +2072,16 @@ class Honeypot(Cog):
         elif minutes < 1 or minutes > 10080:
             await ctx.send(_("Timer must be between 1 and 10080 minutes."))
         else:
+            old_minutes = await self.config.guild(ctx.guild).joinwatch_auto_role_timer_minutes()
             await self.config.guild(ctx.guild).joinwatch_auto_role_timer_minutes.set(minutes)
-            await ctx.send(_("✅ Joinwatch auto role timer set to {value} minutes").format(value=minutes))
+            updated = await self._reschedule_joinwatch_pending_roles(ctx.guild, old_minutes, minutes)
+            await self.joinwatch_auto_role_loop()
+            await ctx.send(
+                _("✅ Joinwatch auto role timer set to {value} minutes. Updated {count} active timer(s).").format(
+                    value=minutes,
+                    count=updated,
+                )
+            )
 
     @joinwatch_autorole.command(name="action")
     async def joinwatch_autorole_action(self, ctx: commands.Context, value: str = None) -> None:

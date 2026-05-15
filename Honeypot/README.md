@@ -254,6 +254,9 @@ Setup:
 If staff removes the auto role before the timer expires, the timer is cleared and
 no punishment is taken. If the timer expires and the user still has the role, the
 cog applies the configured joinwatch action: `none`, `kick`, or `ban`.
+Changing `joinwatch autorole timer` recalculates active timers immediately. If
+the new timer is already expired for a user, the normal timeout action is handled
+right away.
 
 Joinwatch auto-role ignores bot owners, server mods, server admins, users with
 `Manage Server`, and users whose top role is at or above the bot's top role.
