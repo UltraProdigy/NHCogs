@@ -2105,26 +2105,22 @@ class Honeypot(Cog):
             return
 
         now = datetime.now(timezone.utc)
-        action = config.get("joinwatch_auto_role_action", "none")
         invalid = 0
         entries: list[tuple[datetime, str]] = []
         for member_id_str, data in pending_roles.items():
             try:
                 member_id = int(member_id_str)
-                role_id = int(data["role_id"])
                 expires_at = datetime.fromisoformat(data["expires_at"])
             except (KeyError, TypeError, ValueError):
                 invalid += 1
                 continue
 
             member = await self._get_member_or_fetch(ctx.guild, member_id)
-            role = ctx.guild.get_role(role_id)
             member_label = (
                 f"{member.display_name} ({member.id})"
                 if member is not None
                 else _("Unknown member ({id})").format(id=member_id)
             )
-            role_label = role.name if role is not None else _("Deleted role ({id})").format(id=role_id)
             applied_at = None
             if data.get("applied_at") is not None:
                 try:
@@ -2145,11 +2141,9 @@ class Honeypot(Cog):
                 (
                     expires_at,
                     _(
-                        "{member} | role: {role} | action: {action} | deadline: {deadline} | applied: {applied}"
+                        "{member} | deadline: {deadline} | applied: {applied}"
                     ).format(
                         member=member_label,
-                        role=role_label,
-                        action=action,
                         deadline=deadline,
                         applied=applied,
                     ),
@@ -2161,12 +2155,9 @@ class Honeypot(Cog):
             return
 
         entries.sort(key=lambda item: item[0])
-        header = _("Joinwatch active punishment timers: {count}\nConfigured action: {action}").format(
+        header = _("Joinwatch active punishment timers: {count}").format(
             count=len(entries),
-            action=action,
         )
-        if action != "ban":
-            header += _("\nNote: current action is not `ban`.")
         if invalid:
             header += _("\nSkipped invalid timer entries: {count}").format(count=invalid)
         lines = [header, ""]
