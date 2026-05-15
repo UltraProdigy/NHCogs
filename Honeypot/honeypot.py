@@ -325,16 +325,36 @@ class Honeypot(Cog):
         member: discord.Member,
         role_id: int,
         expires_at: datetime,
+        alert_channel_id: int | None = None,
+        alert_message_id: int | None = None,
     ) -> None:
+        pending_role = {
+            "role_id": role_id,
+            "expires_at": expires_at.isoformat(),
+        }
+        if alert_channel_id is not None and alert_message_id is not None:
+            pending_role["alert_channel_id"] = alert_channel_id
+            pending_role["alert_message_id"] = alert_message_id
         async with self.config.guild(member.guild).joinwatch_pending_roles() as pending_roles:
-            pending_roles[str(member.id)] = {
-                "role_id": role_id,
-                "expires_at": expires_at.isoformat(),
-            }
+            pending_roles[str(member.id)] = pending_role
 
     async def _delete_joinwatch_pending_role(self, guild: discord.Guild, member_id: int) -> None:
         async with self.config.guild(guild).joinwatch_pending_roles() as pending_roles:
             pending_roles.pop(str(member_id), None)
+
+    async def _store_joinwatch_pending_role_alert(
+        self,
+        guild: discord.Guild,
+        member_id: int,
+        channel_id: int,
+        message_id: int,
+    ) -> None:
+        async with self.config.guild(guild).joinwatch_pending_roles() as pending_roles:
+            pending_role = pending_roles.get(str(member_id))
+            if pending_role is None:
+                return
+            pending_role["alert_channel_id"] = channel_id
+            pending_role["alert_message_id"] = message_id
 
     async def _store_joinwatch_pending_assignment(
         self,
@@ -351,6 +371,52 @@ class Honeypot(Cog):
     async def _delete_joinwatch_pending_assignment(self, guild: discord.Guild, member_id: int) -> None:
         async with self.config.guild(guild).joinwatch_pending_role_assignments() as pending_assignments:
             pending_assignments.pop(str(member_id), None)
+
+    async def _store_joinwatch_pending_assignment_alert(
+        self,
+        guild: discord.Guild,
+        member_id: int,
+        channel_id: int,
+        message_id: int,
+    ) -> None:
+        async with self.config.guild(guild).joinwatch_pending_role_assignments() as pending_assignments:
+            pending_assignment = pending_assignments.get(str(member_id))
+            if pending_assignment is None:
+                return
+            pending_assignment["alert_channel_id"] = channel_id
+            pending_assignment["alert_message_id"] = message_id
+
+    async def _edit_joinwatch_alert_auto_role(
+        self,
+        guild: discord.Guild,
+        pending_assignment: dict,
+        value: str,
+    ) -> None:
+        channel_id = pending_assignment.get("alert_channel_id")
+        message_id = pending_assignment.get("alert_message_id")
+        if channel_id is None or message_id is None:
+            return
+        channel = self._get_text_channel_or_thread(guild, channel_id)
+        if channel is None:
+            return
+        try:
+            message = await channel.fetch_message(int(message_id))
+        except (discord.HTTPException, discord.NotFound, discord.Forbidden, TypeError, ValueError):
+            return
+        if not message.embeds:
+            return
+        embed = discord.Embed.from_dict(message.embeds[0].to_dict())
+        field_name = _("Auto role:")
+        for index, field in enumerate(embed.fields):
+            if field.name == field_name:
+                embed.set_field_at(index, name=field.name, value=value, inline=field.inline)
+                break
+        else:
+            embed.add_field(name=field_name, value=value, inline=False)
+        try:
+            await message.edit(embed=embed)
+        except discord.HTTPException:
+            log.debug("Failed to edit joinwatch alert message %s in guild %s", message_id, guild.id)
 
     async def _get_member_or_fetch(self, guild: discord.Guild, member_id: int) -> discord.Member | None:
         member = guild.get_member(member_id)
@@ -1159,7 +1225,21 @@ class Honeypot(Cog):
                     expires_at = now + timedelta(
                         minutes=config.get("joinwatch_auto_role_timer_minutes", 1440)
                     )
-                    await self._store_joinwatch_pending_role(member, role.id, expires_at)
+                    await self._store_joinwatch_pending_role(
+                        member,
+                        role.id,
+                        expires_at,
+                        alert_channel_id=data.get("alert_channel_id"),
+                        alert_message_id=data.get("alert_message_id"),
+                    )
+                    await self._edit_joinwatch_alert_auto_role(
+                        guild,
+                        data,
+                        _("{role} applied until {time}.").format(
+                            role=role.mention,
+                            time=discord.utils.format_dt(expires_at, style="R"),
+                        ),
+                    )
                     await self._delete_joinwatch_pending_assignment(guild, member_id)
                 for member_id_str, data in list(pending_roles.items()):
                     try:
@@ -1177,7 +1257,15 @@ class Honeypot(Cog):
                     if member is None:
                         await self._delete_joinwatch_pending_role(guild, member_id)
                         continue
-                    if role is None or role not in member.roles:
+                    if role is None:
+                        await self._delete_joinwatch_pending_role(guild, member_id)
+                        continue
+                    if role not in member.roles:
+                        await self._edit_joinwatch_alert_auto_role(
+                            guild,
+                            data,
+                            _("Role manually removed."),
+                        )
                         await self._delete_joinwatch_pending_role(guild, member_id)
                         await self._increment_stat(guild, "joinwatch_auto_roles_cleared")
                         continue
@@ -1196,6 +1284,12 @@ class Honeypot(Cog):
                                     now + timedelta(minutes=5)
                                 ).isoformat()
                     else:
+                        if config.get("joinwatch_auto_role_action") == "ban":
+                            await self._edit_joinwatch_alert_auto_role(guild, data, _("Banned."))
+                        elif config.get("joinwatch_auto_role_action") == "kick":
+                            await self._edit_joinwatch_alert_auto_role(guild, data, _("Kicked."))
+                        else:
+                            await self._edit_joinwatch_alert_auto_role(guild, data, _("Timer expired."))
                         await self._delete_joinwatch_pending_role(guild, member_id)
                     if logs_channel is not None:
                         embed = discord.Embed(
@@ -1308,7 +1402,21 @@ class Honeypot(Cog):
                                 )
             if config.get("joinwatch_alert_enabled", True) and channel is not None:
                 try:
-                    await channel.send(embed=embed)
+                    alert_message = await channel.send(embed=embed)
+                    if config.get("joinwatch_auto_role_random_delay_enabled", False):
+                        await self._store_joinwatch_pending_assignment_alert(
+                            member.guild,
+                            member.id,
+                            alert_message.channel.id,
+                            alert_message.id,
+                        )
+                    else:
+                        await self._store_joinwatch_pending_role_alert(
+                            member.guild,
+                            member.id,
+                            alert_message.channel.id,
+                            alert_message.id,
+                        )
                 except discord.HTTPException:
                     log.debug("Failed to send joinwatch alert for user %s in guild %s", member.id, member.guild.id)
 
@@ -1333,6 +1441,11 @@ class Honeypot(Cog):
                     role.id == pending_role_id for role in after.roles
                 )
                 if role_removed:
+                    await self._edit_joinwatch_alert_auto_role(
+                        after.guild,
+                        pending_role,
+                        _("Role manually removed."),
+                    )
                     await self._delete_joinwatch_pending_role(after.guild, after.id)
                     await self._increment_stat(after.guild, "joinwatch_auto_roles_cleared")
         if not config["baitrole_enabled"] or config["baitrole_id"] is None:
