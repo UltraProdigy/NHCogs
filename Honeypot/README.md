@@ -112,6 +112,7 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot joinwatch autorole role <role>` | Role to apply to young accounts |
 | `!honeypot joinwatch autorole timer <1-10080>` | Minutes before punishment if the role remains |
 | `!honeypot joinwatch autorole action <none\|kick\|ban>` | Action when the auto role is not removed in time |
+| `!honeypot joinwatch autorole bantimers` | List active auto-role punishment timers |
 | `!honeypot joinwatch autorole randomize toggle <bool>` | Toggle randomized delay before the auto role is applied |
 | `!honeypot joinwatch autorole randomize min_time <1-10080>` | Minimum minutes before applying the auto role |
 | `!honeypot joinwatch autorole randomize max_time <1-10080>` | Maximum minutes before applying the auto role |

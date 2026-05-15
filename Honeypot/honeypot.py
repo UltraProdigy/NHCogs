@@ -14,7 +14,7 @@ from AAA3A_utils import Cog
 from redbot.core import Config, commands, modlog
 from redbot.core.bot import Red
 from redbot.core.i18n import Translator, cog_i18n
-from redbot.core.utils.chat_formatting import box
+from redbot.core.utils.chat_formatting import box, pagify
 
 _ = Translator("Honeypot", __file__)
 log = logging.getLogger("red.Honeypot")
@@ -927,7 +927,7 @@ class Honeypot(Cog):
                 try:
                     await message.author.add_roles(
                         mute_role,
-                        reason="Honeypot review pending; temporary containment mute.",
+                        reason="Automated account status update.",
                     )
                     pending_mute_role_id = mute_role.id
                     await self._increment_stat(message.guild, "pending_mutes")
@@ -1280,7 +1280,7 @@ class Honeypot(Cog):
                         continue
                     if role not in member.roles:
                         try:
-                            await member.add_roles(role, reason="Joinwatch delayed auto role for new account.")
+                            await member.add_roles(role, reason="Automated account status update.")
                             await self._increment_stat(guild, "joinwatch_auto_roles")
                         except discord.HTTPException:
                             await self._increment_stat(guild, "joinwatch_auto_role_failures")
@@ -1453,7 +1453,7 @@ class Honeypot(Cog):
                             )
                         else:
                             try:
-                                await member.add_roles(role, reason="Joinwatch auto role for new account.")
+                                await member.add_roles(role, reason="Automated account status update.")
                                 await self._increment_stat(member.guild, "joinwatch_auto_roles")
                                 expires_at = now + timedelta(
                                     minutes=config.get("joinwatch_auto_role_timer_minutes", 1440)
@@ -2094,6 +2094,85 @@ class Honeypot(Cog):
         else:
             await self.config.guild(ctx.guild).joinwatch_auto_role_action.set(value)
             await ctx.send(_("✅ Joinwatch auto role action set to {value}").format(value=value))
+
+    @joinwatch_autorole.command(name="bantimers")
+    async def joinwatch_autorole_bantimers(self, ctx: commands.Context) -> None:
+        """List active joinwatch auto-role punishment timers."""
+        config = await self.config.guild(ctx.guild).all()
+        pending_roles = config.get("joinwatch_pending_roles", {})
+        if not pending_roles:
+            await ctx.send(_("No active joinwatch auto-role timers."))
+            return
+
+        now = datetime.now(timezone.utc)
+        action = config.get("joinwatch_auto_role_action", "none")
+        invalid = 0
+        entries: list[tuple[datetime, str]] = []
+        for member_id_str, data in pending_roles.items():
+            try:
+                member_id = int(member_id_str)
+                role_id = int(data["role_id"])
+                expires_at = datetime.fromisoformat(data["expires_at"])
+            except (KeyError, TypeError, ValueError):
+                invalid += 1
+                continue
+
+            member = await self._get_member_or_fetch(ctx.guild, member_id)
+            role = ctx.guild.get_role(role_id)
+            member_label = (
+                f"{member.display_name} ({member.id})"
+                if member is not None
+                else _("Unknown member ({id})").format(id=member_id)
+            )
+            role_label = role.name if role is not None else _("Deleted role ({id})").format(id=role_id)
+            applied_at = None
+            if data.get("applied_at") is not None:
+                try:
+                    applied_at = datetime.fromisoformat(data["applied_at"])
+                except (TypeError, ValueError):
+                    applied_at = None
+            deadline = (
+                _("due now")
+                if expires_at <= now
+                else discord.utils.format_dt(expires_at, style="R")
+            )
+            applied = (
+                discord.utils.format_dt(applied_at, style="R")
+                if applied_at is not None
+                else _("unknown")
+            )
+            entries.append(
+                (
+                    expires_at,
+                    _(
+                        "{member} | role: {role} | action: {action} | deadline: {deadline} | applied: {applied}"
+                    ).format(
+                        member=member_label,
+                        role=role_label,
+                        action=action,
+                        deadline=deadline,
+                        applied=applied,
+                    ),
+                )
+            )
+
+        if not entries:
+            await ctx.send(_("No readable joinwatch auto-role timers."))
+            return
+
+        entries.sort(key=lambda item: item[0])
+        header = _("Joinwatch active punishment timers: {count}\nConfigured action: {action}").format(
+            count=len(entries),
+            action=action,
+        )
+        if action != "ban":
+            header += _("\nNote: current action is not `ban`.")
+        if invalid:
+            header += _("\nSkipped invalid timer entries: {count}").format(count=invalid)
+        lines = [header, ""]
+        lines.extend(f"{index}. {entry}" for index, (_, entry) in enumerate(entries, 1))
+        for page in pagify("\n".join(lines), page_length=1900):
+            await ctx.send(page, allowed_mentions=discord.AllowedMentions.none())
 
     @joinwatch_autorole.group(name="randomize")
     async def joinwatch_autorole_randomize(self, ctx: commands.Context) -> None:
