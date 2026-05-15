@@ -43,6 +43,7 @@ DEFAULT_STATS = {
     "purged_messages": 0,
     "joinwatch_total_joins": 0,
     "joinwatch_young_joins": 0,
+    "joinwatch_auto_roles_scheduled": 0,
     "joinwatch_auto_roles": 0,
     "joinwatch_auto_role_failures": 0,
     "joinwatch_auto_roles_cleared": 0,
@@ -274,6 +275,10 @@ class Honeypot(Cog):
             joinwatch_auto_role_id=None,
             joinwatch_auto_role_timer_minutes=1440,
             joinwatch_auto_role_action="none",
+            joinwatch_auto_role_random_delay_enabled=False,
+            joinwatch_auto_role_random_delay_min_minutes=1,
+            joinwatch_auto_role_random_delay_max_minutes=10,
+            joinwatch_pending_role_assignments={},
             joinwatch_pending_roles={},
             baitrole_enabled=False,
             baitrole_id=None,
@@ -330,6 +335,22 @@ class Honeypot(Cog):
     async def _delete_joinwatch_pending_role(self, guild: discord.Guild, member_id: int) -> None:
         async with self.config.guild(guild).joinwatch_pending_roles() as pending_roles:
             pending_roles.pop(str(member_id), None)
+
+    async def _store_joinwatch_pending_assignment(
+        self,
+        member: discord.Member,
+        role_id: int,
+        apply_at: datetime,
+    ) -> None:
+        async with self.config.guild(member.guild).joinwatch_pending_role_assignments() as pending_assignments:
+            pending_assignments[str(member.id)] = {
+                "role_id": role_id,
+                "apply_at": apply_at.isoformat(),
+            }
+
+    async def _delete_joinwatch_pending_assignment(self, guild: discord.Guild, member_id: int) -> None:
+        async with self.config.guild(guild).joinwatch_pending_role_assignments() as pending_assignments:
+            pending_assignments.pop(str(member_id), None)
 
     async def _get_member_or_fetch(self, guild: discord.Guild, member_id: int) -> discord.Member | None:
         member = guild.get_member(member_id)
@@ -1086,10 +1107,60 @@ class Honeypot(Cog):
         for guild in self.bot.guilds:
             try:
                 config = await self.config.guild(guild).all()
+                pending_assignments = config.get("joinwatch_pending_role_assignments", {})
                 pending_roles = config.get("joinwatch_pending_roles", {})
-                if not pending_roles:
+                if pending_assignments and not config.get("joinwatch_auto_role_enabled", False):
+                    async with self.config.guild(guild).joinwatch_pending_role_assignments() as stored_assignments:
+                        stored_assignments.clear()
+                    pending_assignments = {}
+                if not pending_assignments and not pending_roles:
                     continue
                 logs_channel = self._get_text_channel_or_thread(guild, config.get("logs_channel"))
+                for member_id_str, data in list(pending_assignments.items()):
+                    try:
+                        member_id = int(member_id_str)
+                        role_id = int(data["role_id"])
+                        apply_at = datetime.fromisoformat(data["apply_at"])
+                    except (KeyError, TypeError, ValueError):
+                        async with self.config.guild(guild).joinwatch_pending_role_assignments() as stored_assignments:
+                            stored_assignments.pop(str(member_id_str), None)
+                        continue
+                    if apply_at > now:
+                        continue
+                    member = await self._get_member_or_fetch(guild, member_id)
+                    role = guild.get_role(role_id)
+                    if member is None or role is None:
+                        await self._delete_joinwatch_pending_assignment(guild, member_id)
+                        continue
+                    if await self._is_protected_member(member):
+                        await self._delete_joinwatch_pending_assignment(guild, member_id)
+                        continue
+                    role_permission_error = self._missing_role_assignment_permission(guild, role)
+                    if role_permission_error is not None:
+                        await self._increment_stat(guild, "joinwatch_auto_role_failures")
+                        async with self.config.guild(guild).joinwatch_pending_role_assignments() as stored_assignments:
+                            if member_id_str in stored_assignments:
+                                stored_assignments[member_id_str]["apply_at"] = (
+                                    now + timedelta(minutes=5)
+                                ).isoformat()
+                        continue
+                    if role not in member.roles:
+                        try:
+                            await member.add_roles(role, reason="Joinwatch delayed auto role for new account.")
+                            await self._increment_stat(guild, "joinwatch_auto_roles")
+                        except discord.HTTPException:
+                            await self._increment_stat(guild, "joinwatch_auto_role_failures")
+                            async with self.config.guild(guild).joinwatch_pending_role_assignments() as stored_assignments:
+                                if member_id_str in stored_assignments:
+                                    stored_assignments[member_id_str]["apply_at"] = (
+                                        now + timedelta(minutes=5)
+                                    ).isoformat()
+                            continue
+                    expires_at = now + timedelta(
+                        minutes=config.get("joinwatch_auto_role_timer_minutes", 1440)
+                    )
+                    await self._store_joinwatch_pending_role(member, role.id, expires_at)
+                    await self._delete_joinwatch_pending_assignment(guild, member_id)
                 for member_id_str, data in list(pending_roles.items()):
                     try:
                         member_id = int(member_id_str)
@@ -1166,10 +1237,11 @@ class Honeypot(Cog):
             return
         await self._increment_stat(member.guild, "joinwatch_total_joins")
         channel = self._get_text_channel_or_thread(member.guild, config["joinwatch_channel"])
+        now = datetime.now(timezone.utc)
         min_age = timedelta(hours=config["joinwatch_min_age_hours"])
-        if member.created_at > datetime.now(timezone.utc) - min_age:
+        if member.created_at > now - min_age:
             await self._increment_stat(member.guild, "joinwatch_young_joins")
-            hours = max(1, round((datetime.now(timezone.utc) - member.created_at).total_seconds() / 3600))
+            hours = max(1, round((now - member.created_at).total_seconds() / 3600))
             member_label = f"{member.display_name} ({member})"
             embed = discord.Embed(
                 title=_("New account joined"),
@@ -1177,7 +1249,7 @@ class Honeypot(Cog):
                     member=member_label, mention=member.mention, id=member.id, hours=hours,
                 ),
                 color=discord.Color.orange(),
-                timestamp=member.joined_at or datetime.now(timezone.utc),
+                timestamp=member.joined_at or now,
             )
             embed.set_author(name=f"{member.display_name} ({member.id})", icon_url=member.display_avatar)
             embed.set_thumbnail(url=member.display_avatar)
@@ -1193,28 +1265,47 @@ class Honeypot(Cog):
                             inline=False,
                         )
                     else:
-                        try:
-                            await member.add_roles(role, reason="Joinwatch auto role for new account.")
-                            await self._increment_stat(member.guild, "joinwatch_auto_roles")
-                            expires_at = datetime.now(timezone.utc) + timedelta(
-                                minutes=config.get("joinwatch_auto_role_timer_minutes", 1440)
+                        if config.get("joinwatch_auto_role_random_delay_enabled", False):
+                            min_delay = max(1, int(config.get("joinwatch_auto_role_random_delay_min_minutes", 1)))
+                            max_delay = max(
+                                min_delay,
+                                int(config.get("joinwatch_auto_role_random_delay_max_minutes", 10)),
                             )
-                            await self._store_joinwatch_pending_role(member, role.id, expires_at)
+                            delay_minutes = random.randint(min_delay, max_delay)
+                            apply_at = now + timedelta(minutes=delay_minutes)
+                            await self._store_joinwatch_pending_assignment(member, role.id, apply_at)
+                            await self._increment_stat(member.guild, "joinwatch_auto_roles_scheduled")
                             embed.add_field(
                                 name=_("Auto role:"),
-                                value=_("{role} applied until {time}.").format(
+                                value=_("{role} scheduled for {time}.").format(
                                     role=role.mention,
-                                    time=discord.utils.format_dt(expires_at, style="R"),
+                                    time=discord.utils.format_dt(apply_at, style="R"),
                                 ),
                                 inline=False,
                             )
-                        except discord.HTTPException:
-                            await self._increment_stat(member.guild, "joinwatch_auto_role_failures")
-                            embed.add_field(
-                                name=_("Auto role:"),
-                                value=_("I couldn't apply the configured joinwatch auto role."),
-                                inline=False,
-                            )
+                        else:
+                            try:
+                                await member.add_roles(role, reason="Joinwatch auto role for new account.")
+                                await self._increment_stat(member.guild, "joinwatch_auto_roles")
+                                expires_at = now + timedelta(
+                                    minutes=config.get("joinwatch_auto_role_timer_minutes", 1440)
+                                )
+                                await self._store_joinwatch_pending_role(member, role.id, expires_at)
+                                embed.add_field(
+                                    name=_("Auto role:"),
+                                    value=_("{role} applied until {time}.").format(
+                                        role=role.mention,
+                                        time=discord.utils.format_dt(expires_at, style="R"),
+                                    ),
+                                    inline=False,
+                                )
+                            except discord.HTTPException:
+                                await self._increment_stat(member.guild, "joinwatch_auto_role_failures")
+                                embed.add_field(
+                                    name=_("Auto role:"),
+                                    value=_("I couldn't apply the configured joinwatch auto role."),
+                                    inline=False,
+                                )
             if config.get("joinwatch_alert_enabled", True) and channel is not None:
                 try:
                     await channel.send(embed=embed)
@@ -1804,6 +1895,71 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).joinwatch_auto_role_action.set(value)
             await ctx.send(_("✅ Joinwatch auto role action set to {value}").format(value=value))
 
+    @joinwatch_autorole.group(name="randomize")
+    async def joinwatch_autorole_randomize(self, ctx: commands.Context) -> None:
+        """Randomize when the joinwatch auto role is applied."""
+
+    @joinwatch_autorole_randomize.command(name="toggle")
+    async def joinwatch_autorole_randomize_toggle(
+        self, ctx: commands.Context, value: bool = None
+    ) -> None:
+        """Toggle randomized delay before applying the auto role."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_enabled()
+            await ctx.send(_("Joinwatch auto role randomized delay: {value}").format(value=v))
+        else:
+            await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_enabled.set(value)
+            await ctx.send(_("✅ Joinwatch auto role randomized delay set to {value}").format(value=value))
+
+    @joinwatch_autorole_randomize.command(name="min_time")
+    async def joinwatch_autorole_randomize_min_time(
+        self, ctx: commands.Context, minutes: int = None
+    ) -> None:
+        """Minimum minutes before applying the auto role."""
+        if minutes is None:
+            v = await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_min_minutes()
+            await ctx.send(_("Joinwatch auto role randomized minimum: {value} minutes").format(value=v))
+        elif minutes < 1 or minutes > 10080:
+            await ctx.send(_("Minimum delay must be between 1 and 10080 minutes."))
+        else:
+            current_max = await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_max_minutes()
+            await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_min_minutes.set(minutes)
+            if minutes > current_max:
+                await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_max_minutes.set(minutes)
+                await ctx.send(
+                    _("✅ Joinwatch randomized delay minimum and maximum set to {value} minutes").format(
+                        value=minutes,
+                    )
+                )
+            else:
+                await ctx.send(
+                    _("✅ Joinwatch randomized delay minimum set to {value} minutes").format(
+                        value=minutes,
+                    )
+                )
+
+    @joinwatch_autorole_randomize.command(name="max_time")
+    async def joinwatch_autorole_randomize_max_time(
+        self, ctx: commands.Context, minutes: int = None
+    ) -> None:
+        """Maximum minutes before applying the auto role."""
+        if minutes is None:
+            v = await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_max_minutes()
+            await ctx.send(_("Joinwatch auto role randomized maximum: {value} minutes").format(value=v))
+        elif minutes < 1 or minutes > 10080:
+            await ctx.send(_("Maximum delay must be between 1 and 10080 minutes."))
+        else:
+            current_min = await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_min_minutes()
+            if minutes < current_min:
+                await ctx.send(
+                    _("Maximum delay must be greater than or equal to the current minimum ({value} minutes).").format(
+                        value=current_min,
+                    )
+                )
+                return
+            await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_max_minutes.set(minutes)
+            await ctx.send(_("✅ Joinwatch randomized delay maximum set to {value} minutes").format(value=minutes))
+
     # ─── bait sub-group ───────────────────────────────────────────────
 
     @honeypot.group()
@@ -1981,6 +2137,9 @@ class Honeypot(Cog):
             f"  {_('Role')}: {self._format_role_setting(ctx.guild, config.get('joinwatch_auto_role_id'))}",
             f"  {_('Timer')}: {_('{minutes} minutes').format(minutes=config.get('joinwatch_auto_role_timer_minutes'))}",
             f"  {_('Action')}: {config.get('joinwatch_auto_role_action')}",
+            f"  {_('Randomized delay')}: {self._format_bool_setting(config.get('joinwatch_auto_role_random_delay_enabled', False))}",
+            f"  {_('Delay range')}: {_('{min} to {max} minutes').format(min=config.get('joinwatch_auto_role_random_delay_min_minutes', 1), max=config.get('joinwatch_auto_role_random_delay_max_minutes', 10))}",
+            f"  {_('Scheduled applications')}: {len(config.get('joinwatch_pending_role_assignments', {}))}",
             f"  {_('Active timers')}: {len(config.get('joinwatch_pending_roles', {}))}",
         ]
         await ctx.send(_("Joinwatch config:\n") + box("\n".join(lines)))
@@ -2011,6 +2170,7 @@ class Honeypot(Cog):
             [
                 (_("Stored stat keys"), len(stats)),
                 (_("Pending reviews"), len(config.get("pending_reviews", {}))),
+                (_("Scheduled joinwatch auto roles"), len(config.get("joinwatch_pending_role_assignments", {}))),
                 (_("Pending joinwatch auto roles"), len(config.get("joinwatch_pending_roles", {}))),
             ],
         )
@@ -2031,6 +2191,7 @@ class Honeypot(Cog):
                 (_("Joinwatch auto role"), self._format_bool_setting(config.get("joinwatch_auto_role_enabled", False))),
                 (_("Bait role"), self._format_bool_setting(config.get("baitrole_enabled", False))),
                 (_("Pending reviews"), len(config.get("pending_reviews", {}))),
+                (_("Scheduled joinwatch auto roles"), len(config.get("joinwatch_pending_role_assignments", {}))),
                 (_("Pending joinwatch auto roles"), len(config.get("joinwatch_pending_roles", {}))),
             ],
         )
@@ -2043,6 +2204,7 @@ class Honeypot(Cog):
         stats = DEFAULT_STATS.copy()
         stats.update(await self.config.guild(ctx.guild).stats())
         pending_reviews = await self.config.guild(ctx.guild).pending_reviews()
+        pending_joinwatch_assignments = await self.config.guild(ctx.guild).joinwatch_pending_role_assignments()
         pending_joinwatch_roles = await self.config.guild(ctx.guild).joinwatch_pending_roles()
         total_joins = stats["joinwatch_total_joins"]
         young_joins = stats["joinwatch_young_joins"]
@@ -2066,6 +2228,8 @@ class Honeypot(Cog):
                 "Total joins": total_joins,
                 "Young joins": young_joins,
                 "Young join rate": f"{young_join_rate:.1f}%",
+                "Auto roles scheduled": stats["joinwatch_auto_roles_scheduled"],
+                "Scheduled auto roles": len(pending_joinwatch_assignments),
                 "Auto roles applied": stats["joinwatch_auto_roles"],
                 "Auto role failures": stats["joinwatch_auto_role_failures"],
                 "Auto roles cleared": stats["joinwatch_auto_roles_cleared"],

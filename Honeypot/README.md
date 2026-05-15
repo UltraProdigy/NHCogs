@@ -112,6 +112,9 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot joinwatch autorole role <role>` | Role to apply to young accounts |
 | `!honeypot joinwatch autorole timer <1-10080>` | Minutes before punishment if the role remains |
 | `!honeypot joinwatch autorole action <none\|kick\|ban>` | Action when the auto role is not removed in time |
+| `!honeypot joinwatch autorole randomize toggle <bool>` | Toggle randomized delay before the auto role is applied |
+| `!honeypot joinwatch autorole randomize min_time <1-10080>` | Minimum minutes before applying the auto role |
+| `!honeypot joinwatch autorole randomize max_time <1-10080>` | Maximum minutes before applying the auto role |
 
 ### bait
 
@@ -210,8 +213,10 @@ part of every detection.
 The `Joinwatch` stats section tracks non-bot joins while joinwatch is enabled.
 `Young joins` counts accounts below the configured `joinwatch max_age`
 threshold, and `Young join rate` is `Young joins / Total joins`. Auto-role
-clear and punishment counters are historical; `Active auto role timers` is the
-current number of users still waiting for staff action or timeout.
+scheduled, clear, and punishment counters are historical. `Scheduled auto roles`
+is the current number of delayed role applications waiting to run, and
+`Active auto role timers` is the current number of users still waiting for staff
+action or timeout after the role was applied.
 
 ## Config Dumps
 
@@ -227,12 +232,20 @@ is sent to the joinwatch channel when alerts are enabled. If joinwatch auto-role
 is enabled, the cog also applies the configured role and starts a timer. Auto-role
 can run even when alert messages are disabled.
 
+Randomized auto-role delay can be enabled to avoid applying the shadowban role at
+the exact join moment. When enabled, the cog schedules the role for a random time
+between `min_time` and `max_time`. The punishment timer starts only after the role
+is actually applied, not when the account joins.
+
 Setup:
 
 ```ini
 [p]honeypot joinwatch max_age 24
 [p]honeypot joinwatch alert toggle true
 [p]honeypot joinwatch autorole role @NewAccount
+[p]honeypot joinwatch autorole randomize min_time 5
+[p]honeypot joinwatch autorole randomize max_time 30
+[p]honeypot joinwatch autorole randomize toggle true
 [p]honeypot joinwatch autorole timer 1440
 [p]honeypot joinwatch autorole action ban
 [p]honeypot joinwatch autorole toggle true
