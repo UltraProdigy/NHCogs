@@ -206,6 +206,9 @@ of unresolved review messages.
 
 `Applied temporary mutes` and `Failed temporary mutes` are historical counters
 for review containment mutes. They do not mean those users are still muted.
+The review mute role may be the same role as joinwatch auto-role. If that user
+has an active joinwatch auto-role timer, review cleanup leaves the role in place
+so it does not accidentally clear the joinwatch hold.
 
 `Purged messages` counts extra recent messages removed by the purge step. It
 does not include the original honeypot message, which is deleted separately as

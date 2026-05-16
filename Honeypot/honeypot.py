@@ -158,9 +158,12 @@ class ReviewView(discord.ui.View):
             if self.pending_mute_role_id is not None:
                 mute_role = guild.get_role(self.pending_mute_role_id)
                 if mute_role is not None and mute_role in member.roles:
-                    try:
-                        await member.remove_roles(mute_role, reason=_("Honeypot review ignored; removing pending mute."))
-                    except discord.HTTPException:
+                    removed = await self.cog._remove_review_mute_role(
+                        member,
+                        mute_role,
+                        _("Honeypot review ignored; removing pending mute."),
+                    )
+                    if not removed:
                         return (_("I couldn't remove the temporary mute role. Check my role permissions."), None)
             await self.cog._increment_stat(guild, "ignored")
             return (None, _("Ignored (no action)"))
@@ -170,9 +173,12 @@ class ReviewView(discord.ui.View):
             if self.pending_mute_role_id is not None:
                 mute_role = guild.get_role(self.pending_mute_role_id)
                 if mute_role is not None and mute_role in member.roles:
-                    try:
-                        await member.remove_roles(mute_role, reason=_("Honeypot dry-run review completed; removing pending mute."))
-                    except discord.HTTPException:
+                    removed = await self.cog._remove_review_mute_role(
+                        member,
+                        mute_role,
+                        _("Honeypot dry-run review completed; removing pending mute."),
+                    )
+                    if not removed:
                         return (_("I couldn't remove the temporary mute role. Check my role permissions."), None)
             await self.cog._increment_stat(guild, "dry_run_actions")
             return (None, self.cog._dry_run_label(action))
@@ -184,9 +190,12 @@ class ReviewView(discord.ui.View):
             if self.pending_mute_role_id is not None:
                 mute_role = guild.get_role(self.pending_mute_role_id)
                 if mute_role is not None and mute_role in member.roles:
-                    try:
-                        await member.remove_roles(mute_role, reason=_("Removing pending mute before {action}.").format(action=action))
-                    except discord.HTTPException:
+                    removed = await self.cog._remove_review_mute_role(
+                        member,
+                        mute_role,
+                        _("Removing pending mute before {action}.").format(action=action),
+                    )
+                    if not removed:
                         log.debug("Failed to remove pending mute role before %s for user %s", action, self.target_id)
             if action == "kick":
                 await member.kick(reason=reason)
@@ -319,6 +328,35 @@ class Honeypot(Cog):
             return
         async with self.config.guild(guild).pending_reviews() as pending_reviews:
             pending_reviews.pop(str(review_message_id), None)
+
+    async def _is_joinwatch_active_role(
+        self,
+        guild: discord.Guild,
+        member_id: int,
+        role_id: int,
+    ) -> bool:
+        pending_roles = await self.config.guild(guild).joinwatch_pending_roles()
+        pending_role = pending_roles.get(str(member_id))
+        if pending_role is None:
+            return False
+        try:
+            return int(pending_role["role_id"]) == role_id
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    async def _remove_review_mute_role(
+        self,
+        member: discord.Member,
+        role: discord.Role,
+        reason: str,
+    ) -> bool:
+        if await self._is_joinwatch_active_role(member.guild, member.id, role.id):
+            return True
+        try:
+            await member.remove_roles(role, reason=reason)
+        except discord.HTTPException:
+            return False
+        return True
 
     async def _store_joinwatch_pending_role(
         self,
@@ -784,9 +822,12 @@ class Honeypot(Cog):
         if member is not None and view.pending_mute_role_id is not None:
             mute_role = guild.get_role(view.pending_mute_role_id)
             if mute_role is not None and mute_role in member.roles:
-                try:
-                    await member.remove_roles(mute_role, reason="Honeypot review expired; removing pending mute.")
-                except discord.HTTPException:
+                removed = await self._remove_review_mute_role(
+                    member,
+                    mute_role,
+                    "Honeypot review expired; removing pending mute.",
+                )
+                if not removed:
                     log.debug("Failed to remove mute role on expired review for user %s in guild %s", view.target_id, guild.id)
         view._disable_all()
         embed = view.review_message.embeds[0] if view.review_message and view.review_message.embeds else None
