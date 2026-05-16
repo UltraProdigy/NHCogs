@@ -141,7 +141,8 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot config joinwatch` | Show joinwatch and joinwatch auto-role settings |
 | `!honeypot config bait` | Show bait role settings |
 | `!honeypot config stats` | Show stored stat and pending object counts |
-| `!honeypot stats` | Show detection statistics |
+| `!honeypot stats` | Show public-safe safety statistics |
+| `!honeypot modstats` | Show detailed moderator statistics |
 | `!honeypot resetstats` | Reset statistics |
 | `!honeypot doctor` | Check config, channels, and permissions |
 
@@ -198,11 +199,15 @@ Default attachment patterns: `^image ?\(\d+\)$` (matches `image(1)`, `image (2)`
 
 ## Stats
 
-`Total detections` counts every non-exempt message caught in the honeypot
-channel. `Suspicious detections` counts only detections matching
-suspicious-account, keyword, or attachment rules. `Reviews sent` counts cases
-sent to moderator review, while `Active pending reviews` is the current number
-of unresolved review messages.
+`stats` is intended to be safe for broader visibility. It shows only a compact
+summary: messages, automatic bans, sent-for-review cases, manual bans,
+shadowbans, and automated shadowban bans.
+
+`modstats` is the detailed moderator view. `Total detections` counts every
+non-exempt message caught in the honeypot channel. `Suspicious detections`
+counts only detections matching suspicious-account, keyword, or attachment
+rules. `Reviews sent` counts cases sent to moderator review, while `Active
+pending reviews` is the current number of unresolved review messages.
 
 `Applied temporary mutes` and `Failed temporary mutes` are historical counters
 for review containment mutes. They do not mean those users are still muted.

@@ -35,6 +35,8 @@ DEFAULT_STATS = {
     "ignored": 0,
     "kicked": 0,
     "banned": 0,
+    "automatic_bans": 0,
+    "manual_bans": 0,
     "failed_actions": 0,
     "dry_run_actions": 0,
     "whitelisted": 0,
@@ -48,6 +50,7 @@ DEFAULT_STATS = {
     "joinwatch_auto_role_failures": 0,
     "joinwatch_auto_roles_cleared": 0,
     "joinwatch_auto_role_punishments": 0,
+    "joinwatch_auto_role_bans": 0,
 }
 
 SCAM_KEYWORDS = [
@@ -206,6 +209,7 @@ class ReviewView(discord.ui.View):
                 await member.ban(reason=reason, delete_message_days=config.get("ban_delete_message_days", 0))
                 await self._create_modlog_case(guild, member, action, reason)
                 await self.cog._increment_stat(guild, "banned")
+                await self.cog._increment_stat(guild, "manual_bans")
                 return (None, _("Banned"))
         except discord.HTTPException:
             await self.cog._increment_stat(guild, "failed_actions")
@@ -927,6 +931,7 @@ class Honeypot(Cog):
                     delete_message_days=config["ban_delete_message_days"],
                 )
                 await self._increment_stat(message.guild, "banned")
+                await self._increment_stat(message.guild, "automatic_bans")
         except discord.HTTPException as e:
             await self._increment_stat(message.guild, "failed_actions")
             return (None, _("**Action failed:**\n") + box(str(e), lang="py"))
@@ -1257,6 +1262,7 @@ class Honeypot(Cog):
                     reason=reason,
                     delete_message_days=config.get("ban_delete_message_days", 0),
                 )
+                await self._increment_stat(member.guild, "joinwatch_auto_role_bans")
             await self._increment_stat(member.guild, "joinwatch_auto_role_punishments")
         except discord.HTTPException as exc:
             await self._increment_stat(member.guild, "failed_actions")
@@ -1587,8 +1593,11 @@ class Honeypot(Cog):
             try:
                 if action == "ban":
                     await after.ban(reason=reason)
+                    await self._increment_stat(after.guild, "banned")
+                    await self._increment_stat(after.guild, "automatic_bans")
                 elif action == "kick":
                     await after.kick(reason=reason)
+                    await self._increment_stat(after.guild, "kicked")
             except discord.HTTPException:
                 log.warning("Failed to %s bait-role target %s in guild %s", action, after.id, after.guild.id)
             logs_channel_id = config.get("logs_channel")
@@ -2509,9 +2518,9 @@ class Honeypot(Cog):
 
     # ─── stats ────────────────────────────────────────────────────────
 
-    @honeypot.command(name="stats")
-    async def honeypot_stats(self, ctx: commands.Context) -> None:
-        """Show honeypot statistics."""
+    @honeypot.command(name="modstats")
+    async def honeypot_mod_stats(self, ctx: commands.Context) -> None:
+        """Show detailed honeypot statistics for moderators."""
         stats = DEFAULT_STATS.copy()
         stats.update(await self.config.guild(ctx.guild).stats())
         pending_reviews = await self.config.guild(ctx.guild).pending_reviews()
@@ -2550,6 +2559,8 @@ class Honeypot(Cog):
             "Actions": {
                 "Kicked users": stats["kicked"],
                 "Banned users": stats["banned"],
+                "Automatic bans": stats["automatic_bans"],
+                "Manual bans": stats["manual_bans"],
                 "Failed actions": stats["failed_actions"],
                 "Dry-run actions": stats["dry_run_actions"],
             },
@@ -2561,6 +2572,22 @@ class Honeypot(Cog):
             lines.append(f"{section}:")
             lines.extend(f"  {label}: {value}" for label, value in values.items())
         await ctx.send(_("**Honeypot stats:**\n") + box("\n".join(lines)))
+
+    @honeypot.command(name="stats")
+    async def honeypot_stats(self, ctx: commands.Context) -> None:
+        """Show public-safe honeypot statistics."""
+        stats = DEFAULT_STATS.copy()
+        stats.update(await self.config.guild(ctx.guild).stats())
+        lines = [
+            _("Community safety:"),
+            f"  {_('Messages')}: {stats['detections']}",
+            f"  {_('Automatic Bans')}: {stats['automatic_bans']}",
+            f"  {_('Sent for Review')}: {stats['reviewed']}",
+            f"  {_('Manual Bans')}: {stats['manual_bans']}",
+            f"  {_('Shadowbans')}: {stats['joinwatch_auto_roles']}",
+            f"  {_('Automated Shadowban Bans')}: {stats['joinwatch_auto_role_bans']}",
+        ]
+        await ctx.send(_("**Server safety stats:**\n") + box("\n".join(lines)))
 
     @honeypot.command(name="resetstats")
     async def honeypot_reset_stats(self, ctx: commands.Context) -> None:
