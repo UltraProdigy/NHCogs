@@ -2578,14 +2578,16 @@ class Honeypot(Cog):
         """Show public-safe honeypot statistics."""
         stats = DEFAULT_STATS.copy()
         stats.update(await self.config.guild(ctx.guild).stats())
+        shadowban_bans = stats["joinwatch_auto_role_punishments"]
+        non_shadowban_bans = max(0, stats["banned"] - shadowban_bans)
         lines = [
             _("Community safety:"),
             f"  {_('Messages')}: {stats['detections']}",
-            f"  {_('Automatic Bans')}: {stats['automatic_bans']}",
+            f"  {_('Automatic Bans')}: {non_shadowban_bans}",
             f"  {_('Sent for Review')}: {stats['reviewed']}",
-            f"  {_('Manual Bans')}: {stats['manual_bans']}",
+            f"  {_('Manual Bans')}: {non_shadowban_bans}",
             f"  {_('Shadowbans')}: {stats['joinwatch_auto_roles']}",
-            f"  {_('Automated Shadowban Bans')}: {stats['joinwatch_auto_role_bans']}",
+            f"  {_('Automated Shadowban Bans')}: {shadowban_bans}",
         ]
         await ctx.send(_("**Server safety stats:**\n") + box("\n".join(lines)))
 
