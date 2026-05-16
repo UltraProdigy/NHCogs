@@ -200,8 +200,8 @@ Default attachment patterns: `^image ?\(\d+\)$` (matches `image(1)`, `image (2)`
 ## Stats
 
 `stats` is intended to be safe for broader visibility. It shows only a compact
-summary: messages, automatic bans, sent-for-review cases, manual bans,
-shadowbans, and automated shadowban bans.
+summary: messages, bans, sent-for-review cases, shadowbans, and automated
+shadowban bans.
 
 `modstats` is the detailed moderator view. `Total detections` counts every
 non-exempt message caught in the honeypot channel. `Suspicious detections`
