@@ -533,6 +533,12 @@ class Honeypot(Cog):
         except (discord.HTTPException, discord.NotFound, discord.Forbidden):
             return None
 
+    async def _get_user_or_object(self, user_id: int) -> discord.User | discord.Object:
+        try:
+            return await self.bot.fetch_user(user_id)
+        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+            return discord.Object(id=user_id)
+
     def _get_text_channel_or_thread(
         self, guild: discord.Guild, channel_id: int | None
     ) -> discord.TextChannel | discord.Thread | None:
@@ -1237,38 +1243,48 @@ class Honeypot(Cog):
         )
 
     async def _execute_joinwatch_action(
-        self, member: discord.Member, config: dict, reason: str
+        self,
+        guild: discord.Guild,
+        member: discord.Member | None,
+        member_id: int,
+        config: dict,
+        reason: str,
     ) -> tuple[str | None, str | None]:
         action = config.get("joinwatch_auto_role_action", "none")
+        if member is None and action == "kick":
+            action = "ban"
         if action not in ("kick", "ban"):
             return (_("No joinwatch punishment configured."), None)
         if config.get("dry_run"):
-            await self._increment_stat(member.guild, "dry_run_actions")
+            await self._increment_stat(guild, "dry_run_actions")
             return (self._dry_run_label(action), None)
-        missing_permission = self._missing_action_permission(member.guild, action)
+        missing_permission = self._missing_action_permission(guild, action)
         if missing_permission is not None:
-            await self._increment_stat(member.guild, "failed_actions")
+            await self._increment_stat(guild, "failed_actions")
             return (None, missing_permission)
         try:
             if action == "kick":
                 await member.kick(reason=reason)
             elif action == "ban":
-                await member.ban(
+                target = member if member is not None else await self._get_user_or_object(member_id)
+                await guild.ban(
+                    target,
                     reason=reason,
                     delete_message_days=config.get("ban_delete_message_days", 0),
                 )
-            await self._increment_stat(member.guild, "joinwatch_auto_role_punishments")
+            await self._increment_stat(guild, "joinwatch_auto_role_punishments")
         except discord.HTTPException as exc:
-            await self._increment_stat(member.guild, "failed_actions")
+            await self._increment_stat(guild, "failed_actions")
             return (None, _("**Action failed:**\n") + box(str(exc), lang="py"))
+        user = member if member is not None else await self._get_user_or_object(member_id)
         try:
             await modlog.create_case(
                 self.bot,
-                member.guild,
+                guild,
                 datetime.now(timezone.utc),
                 action_type=action,
-                user=member,
-                moderator=member.guild.me,
+                user=user,
+                moderator=guild.me,
                 reason=reason,
             )
         except Exception:
@@ -1304,7 +1320,51 @@ class Honeypot(Cog):
                         continue
                     member = await self._get_member_or_fetch(guild, member_id)
                     role = guild.get_role(role_id)
-                    if member is None or role is None:
+                    if member is None:
+                        action_label, failed = await self._execute_joinwatch_action(
+                            guild,
+                            None,
+                            member_id,
+                            config,
+                            reason="Suspicious Account",
+                        )
+                        if failed:
+                            async with self.config.guild(guild).joinwatch_pending_role_assignments() as stored_assignments:
+                                if member_id_str in stored_assignments:
+                                    stored_assignments[member_id_str]["apply_at"] = (
+                                        now + timedelta(minutes=5)
+                                    ).isoformat()
+                            continue
+                        if config.get("joinwatch_auto_role_action") in ("ban", "kick"):
+                            await self._edit_joinwatch_alert_auto_role(guild, data, _("Banned."))
+                        else:
+                            await self._edit_joinwatch_alert_auto_role(guild, data, _("Timer expired."))
+                        await self._delete_joinwatch_pending_assignment(guild, member_id)
+                        if logs_channel is not None:
+                            embed = discord.Embed(
+                                title=_("Joinwatch auto-role timer expired"),
+                                description=_("{mention} ({id}) left before the scheduled role could be applied.").format(
+                                    mention=f"<@{member_id}>",
+                                    id=member_id,
+                                ),
+                                color=discord.Color.dark_red() if failed else discord.Color.orange(),
+                                timestamp=now,
+                            )
+                            embed.add_field(
+                                name=_("Action:"),
+                                value=failed if failed else action_label,
+                                inline=False,
+                            )
+                            try:
+                                await logs_channel.send(embed=embed)
+                            except discord.HTTPException:
+                                log.debug(
+                                    "Failed to send joinwatch missing-member log for user %s in guild %s",
+                                    member_id,
+                                    guild.id,
+                                )
+                        continue
+                    if role is None:
                         await self._delete_joinwatch_pending_assignment(guild, member_id)
                         continue
                     if await self._is_protected_member(member):
@@ -1370,7 +1430,48 @@ class Honeypot(Cog):
                     member = await self._get_member_or_fetch(guild, member_id)
                     role = guild.get_role(role_id)
                     if member is None:
-                        await self._delete_joinwatch_pending_role(guild, member_id)
+                        action_label, failed = await self._execute_joinwatch_action(
+                            guild,
+                            None,
+                            member_id,
+                            config,
+                            reason="Suspicious Account",
+                        )
+                        if failed:
+                            async with self.config.guild(guild).joinwatch_pending_roles() as stored_pending_roles:
+                                if member_id_str in stored_pending_roles:
+                                    stored_pending_roles[member_id_str]["expires_at"] = (
+                                        now + timedelta(minutes=5)
+                                    ).isoformat()
+                        else:
+                            if config.get("joinwatch_auto_role_action") in ("ban", "kick"):
+                                await self._edit_joinwatch_alert_auto_role(guild, data, _("Banned."))
+                            else:
+                                await self._edit_joinwatch_alert_auto_role(guild, data, _("Timer expired."))
+                            await self._delete_joinwatch_pending_role(guild, member_id)
+                        if logs_channel is not None:
+                            embed = discord.Embed(
+                                title=_("Joinwatch auto-role timer expired"),
+                                description=_("{mention} ({id}) left before the timer expired.").format(
+                                    mention=f"<@{member_id}>",
+                                    id=member_id,
+                                ),
+                                color=discord.Color.dark_red() if failed else discord.Color.orange(),
+                                timestamp=now,
+                            )
+                            embed.add_field(
+                                name=_("Action:"),
+                                value=failed if failed else action_label,
+                                inline=False,
+                            )
+                            try:
+                                await logs_channel.send(embed=embed)
+                            except discord.HTTPException:
+                                log.debug(
+                                    "Failed to send joinwatch missing-member log for user %s in guild %s",
+                                    member_id,
+                                    guild.id,
+                                )
                         continue
                     if role is None:
                         await self._delete_joinwatch_pending_role(guild, member_id)
@@ -1388,7 +1489,9 @@ class Honeypot(Cog):
                         await self._delete_joinwatch_pending_role(guild, member_id)
                         continue
                     action_label, failed = await self._execute_joinwatch_action(
+                        guild,
                         member,
+                        member_id,
                         config,
                         reason="Suspicious Account",
                     )
