@@ -59,6 +59,7 @@ FALLBACK_ACTION_OPTIONS = ("review", "kick", "ban", "none")
 WHITELIST_MODE_OPTIONS = ("bypass", "review", "fallback", "none")
 JOINWATCH_AUTO_ROLE_ACTION_OPTIONS = ("none", "kick", "ban")
 BAIT_ACTION_OPTIONS = ("kick", "ban")
+BOOL_OPTIONS = ("false", "true")
 
 SCAM_KEYWORDS = [
     "free nitro", "giveaway", "steam gift", "free discord",
@@ -209,10 +210,10 @@ class ReviewView(discord.ui.View):
                     moderator=interaction.user,
                 )
                 return (failed, label)
-        if member is None and action != "ban":
+        if member is None and action not in ("ban", "ignore"):
             return (_("User is no longer in the server."), None)
         if action == "ignore":
-            if self.pending_mute_role_id is not None:
+            if member is not None and self.pending_mute_role_id is not None:
                 mute_role = guild.get_role(self.pending_mute_role_id)
                 if mute_role is not None and mute_role in member.roles:
                     removed = await self.cog._remove_review_mute_role(
@@ -2031,7 +2032,12 @@ class Honeypot(Cog):
         """Enable or disable the cog."""
         if value is None:
             v = await self.config.guild(ctx.guild).enabled()
-            await ctx.send(_("Enabled: {value}").format(value=v))
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
         else:
             await self.config.guild(ctx.guild).enabled.set(value)
             await ctx.send(_("✅ Enabled set to {value}").format(value=value))
@@ -2075,7 +2081,12 @@ class Honeypot(Cog):
         """Log actions without actually punishing users."""
         if value is None:
             v = await self.config.guild(ctx.guild).dry_run()
-            await ctx.send(_("Dry run: {value}").format(value=v))
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
         else:
             await self.config.guild(ctx.guild).dry_run.set(value)
             await ctx.send(_("✅ Dry run set to {value}").format(value=value))
@@ -2102,7 +2113,12 @@ class Honeypot(Cog):
         """Warn when the target has already left before the kick is applied."""
         if value is None:
             v = await self.config.guild(ctx.guild).automated_kick_fail_warning()
-            await ctx.send(_("Warn on automated kick fail: {value}").format(value=v))
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
         else:
             await self.config.guild(ctx.guild).automated_kick_fail_warning.set(value)
             await ctx.send(_("✅ Warn on automated kick fail set to {value}").format(value=value))
@@ -2223,7 +2239,12 @@ class Honeypot(Cog):
         """Delete recent messages from the user in the honeypot channel."""
         if value is None:
             v = await self.config.guild(ctx.guild).purge_enabled()
-            await ctx.send(_("Purge enabled: {value}").format(value=v))
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
         else:
             await self.config.guild(ctx.guild).purge_enabled.set(value)
             await ctx.send(_("✅ Purge enabled set to {value}").format(value=value))
@@ -2251,7 +2272,12 @@ class Honeypot(Cog):
         """Simulate activity in the honeypot channel to attract scammers."""
         if value is None:
             v = await self.config.guild(ctx.guild).fake_activity_enabled()
-            await ctx.send(_("Fake activity enabled: {value}").format(value=v))
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
         else:
             await self.config.guild(ctx.guild).fake_activity_enabled.set(value)
             await ctx.send(_("✅ Fake activity enabled set to {value}").format(value=value))
@@ -2313,7 +2339,12 @@ class Honeypot(Cog):
         """Send suspicious messages to moderator review instead of acting immediately."""
         if value is None:
             v = await self.config.guild(ctx.guild).review_enabled()
-            await ctx.send(_("Review enabled: {value}").format(value=v))
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
         else:
             await self.config.guild(ctx.guild).review_enabled.set(value)
             await ctx.send(_("✅ Review enabled set to {value}").format(value=value))
@@ -2496,7 +2527,12 @@ class Honeypot(Cog):
         """Enable or disable new account join alerts."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_enabled()
-            await ctx.send(_("Joinwatch enabled: {value}").format(value=self._format_bool_setting(v)))
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
         else:
             await self.config.guild(ctx.guild).joinwatch_enabled.set(value)
             await ctx.send(_("✅ Joinwatch enabled set to {value}").format(value=value))
@@ -2523,7 +2559,12 @@ class Honeypot(Cog):
         """Enable or disable joinwatch alert messages."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_alert_enabled()
-            await ctx.send(_("Joinwatch alerts: {value}").format(value=self._format_bool_setting(v)))
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
         else:
             await self.config.guild(ctx.guild).joinwatch_alert_enabled.set(value)
             await ctx.send(_("✅ Joinwatch alerts set to {value}").format(value=value))
@@ -2549,7 +2590,12 @@ class Honeypot(Cog):
         """Enable or disable joinwatch auto-role."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_enabled()
-            await ctx.send(_("Joinwatch auto-role: {value}").format(value=self._format_bool_setting(v)))
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
         else:
             await self.config.guild(ctx.guild).joinwatch_auto_role_enabled.set(value)
             await ctx.send(_("✅ Joinwatch auto-role set to {value}").format(value=value))
@@ -2689,7 +2735,12 @@ class Honeypot(Cog):
         """Enable or disable randomized delay before applying the auto-role."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_enabled()
-            await ctx.send(_("Joinwatch auto-role randomized delay: {value}").format(value=self._format_bool_setting(v)))
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
         else:
             await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_enabled.set(value)
             await ctx.send(_("✅ Joinwatch auto-role randomized delay set to {value}").format(value=value))
@@ -2754,7 +2805,12 @@ class Honeypot(Cog):
         """Enable or disable the bait role trap."""
         if value is None:
             v = await self.config.guild(ctx.guild).baitrole_enabled()
-            await ctx.send(_("Bait role trap: {value}").format(value=v))
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
         else:
             await self.config.guild(ctx.guild).baitrole_enabled.set(value)
             await ctx.send(_("✅ Bait role trap set to {value}").format(value=value))
