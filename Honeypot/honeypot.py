@@ -52,6 +52,8 @@ DEFAULT_STATS = {
 
 JOINWATCH_RETRY_DELAY_MINUTES = 5
 JOINWATCH_MAX_RETRIES = 5
+REVIEW_KICK_FAIL_WARNING_MODES = ("false", "true", "manual")
+KICK_FAIL_WARNING_REASON = "Suspicious kick avoidance - target left before the kick could be applied."
 
 SCAM_KEYWORDS = [
     "free nitro", "giveaway", "steam gift", "free discord",
@@ -108,7 +110,7 @@ class ReviewView(discord.ui.View):
     async def _create_modlog_case(
         self,
         guild: discord.Guild,
-        member: discord.Member,
+        user: discord.Member | discord.User | discord.Object,
         action: str,
         reason: str,
         moderator: typing.Any = None,
@@ -119,7 +121,7 @@ class ReviewView(discord.ui.View):
                 guild,
                 datetime.now(timezone.utc),
                 action_type=action,
-                user=member,
+                user=user,
                 moderator=moderator or guild.me,
                 reason=reason,
             )
@@ -164,6 +166,20 @@ class ReviewView(discord.ui.View):
             await self.cog._delete_pending_review(interaction.guild, self.active_key)
         self.stop()
 
+    async def _send_kick_fail_warning_prompt(self, interaction: discord.Interaction) -> None:
+        embed = discord.Embed(
+            title=_("Kick target left"),
+            description=_("The user is no longer in the server. Apply a warning instead?"),
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name=_("User ID:"), value=f"`{self.target_id}`", inline=False)
+        await interaction.followup.send(
+            embed=embed,
+            view=KickFailWarnView(self),
+            ephemeral=True,
+        )
+
     async def _action_perform(self, interaction: discord.Interaction, action: str) -> tuple[str | None, str | None]:
         """Returns (result_message, action_label) or (None, None) to abort."""
         if not self._check_perms(interaction):
@@ -171,8 +187,24 @@ class ReviewView(discord.ui.View):
         guild = self.cog.bot.get_guild(self.guild_id)
         if guild is None:
             return (_("Guild not found."), None)
+        config = await self.cog.config.guild(guild).all()
         member = guild.get_member(self.target_id)
-        if member is None:
+        if member is None and action == "kick":
+            if config.get("dry_run"):
+                await self.cog._increment_stat(guild, "dry_run_actions")
+                return (None, self.cog._dry_run_label(action))
+            warning_mode = self.cog._review_kick_fail_warning_mode(config)
+            if warning_mode == "manual":
+                await self._send_kick_fail_warning_prompt(interaction)
+                return (None, None)
+            if warning_mode == "true":
+                label, failed = await self.cog._create_kick_fail_warning(
+                    guild,
+                    self.target_id,
+                    moderator=interaction.user,
+                )
+                return (failed, label)
+        if member is None and action != "ban":
             return (_("User is no longer in the server."), None)
         if action == "ignore":
             if self.pending_mute_role_id is not None:
@@ -188,9 +220,8 @@ class ReviewView(discord.ui.View):
             await self.cog._increment_stat(guild, "ignored")
             return (None, _("Ignored (no action)"))
         reason = _("Honeypot review: {action}").format(action=action.title())
-        config = await self.cog.config.guild(guild).all()
         if config.get("dry_run"):
-            if self.pending_mute_role_id is not None:
+            if member is not None and self.pending_mute_role_id is not None:
                 mute_role = guild.get_role(self.pending_mute_role_id)
                 if mute_role is not None and mute_role in member.roles:
                     removed = await self.cog._remove_review_mute_role(
@@ -207,7 +238,7 @@ class ReviewView(discord.ui.View):
             await self.cog._increment_stat(guild, "failed_actions")
             return (missing_permission, None)
         try:
-            if self.pending_mute_role_id is not None:
+            if member is not None and self.pending_mute_role_id is not None:
                 mute_role = guild.get_role(self.pending_mute_role_id)
                 if mute_role is not None and mute_role in member.roles:
                     removed = await self.cog._remove_review_mute_role(
@@ -218,13 +249,16 @@ class ReviewView(discord.ui.View):
                     if not removed:
                         log.debug("Failed to remove pending mute role before %s for user %s", action, self.target_id)
             if action == "kick":
+                if member is None:
+                    return (_("User is no longer in the server."), None)
                 await member.kick(reason=reason)
                 await self._create_modlog_case(guild, member, action, reason, interaction.user)
                 await self.cog._increment_stat(guild, "kicked")
                 return (None, _("Kicked"))
             elif action == "ban":
-                await member.ban(reason=reason, delete_message_days=config.get("ban_delete_message_days", 0))
-                await self._create_modlog_case(guild, member, action, reason, interaction.user)
+                target = member if member is not None else await self.cog._get_user_or_object(self.target_id)
+                await guild.ban(target, reason=reason, delete_message_days=config.get("ban_delete_message_days", 0))
+                await self._create_modlog_case(guild, target, action, reason, interaction.user)
                 await self.cog._increment_stat(guild, "banned")
                 return (None, _("Banned"))
         except discord.HTTPException:
@@ -275,6 +309,52 @@ class ReviewView(discord.ui.View):
             await interaction.followup.send(msg, ephemeral=True)
 
 
+class KickFailWarnView(discord.ui.View):
+    def __init__(self, review_view: ReviewView) -> None:
+        super().__init__(timeout=300)
+        self.review_view = review_view
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.danger, custom_id="honeypot:kickfailwarn:yes")
+    async def warn_yes(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self.review_view._check_perms(interaction):
+            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
+            return
+        if not await self.review_view._claim_resolution():
+            await interaction.followup.send(_("This review is already being handled."), ephemeral=True)
+            return
+        guild = self.review_view.cog.bot.get_guild(self.review_view.guild_id)
+        if guild is None:
+            await self.review_view._release_resolution()
+            await interaction.followup.send(_("Guild not found."), ephemeral=True)
+            return
+        label, failed = await self.review_view.cog._create_kick_fail_warning(
+            guild,
+            self.review_view.target_id,
+            moderator=interaction.user,
+        )
+        if failed:
+            await self.review_view._release_resolution()
+            await interaction.followup.send(failed, ephemeral=True)
+            return
+        await self.review_view._update_done(interaction, label or _("Warning applied"))
+        await interaction.followup.send(_("Warning applied."), ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.secondary, custom_id="honeypot:kickfailwarn:no")
+    async def warn_no(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self.review_view._check_perms(interaction):
+            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
+            return
+        if not await self.review_view._claim_resolution():
+            await interaction.followup.send(_("This review is already being handled."), ephemeral=True)
+            return
+        await self.review_view._update_done(interaction, _("Kick skipped; target left the server."))
+        await interaction.followup.send(_("No warning applied."), ephemeral=True)
+        self.stop()
+
+
 @cog_i18n(_)
 class Honeypot(Cog):
     """Create a trap channel and handle users who post in it."""
@@ -306,6 +386,8 @@ class Honeypot(Cog):
             review_enabled=False,
             review_channel=None,
             review_timeout_minutes=1440,
+            review_kick_fail_warning="false",
+            automated_kick_fail_warning=False,
             whitelist_mode="bypass",
             stats=DEFAULT_STATS.copy(),
             pending_reviews={},
@@ -654,6 +736,41 @@ class Honeypot(Cog):
             return await self.bot.fetch_user(user_id)
         except (discord.HTTPException, discord.NotFound, discord.Forbidden):
             return discord.Object(id=user_id)
+
+    def _review_kick_fail_warning_mode(self, config: dict) -> str:
+        value = str(config.get("review_kick_fail_warning", "false")).lower()
+        return value if value in REVIEW_KICK_FAIL_WARNING_MODES else "false"
+
+    def _automated_kick_fail_warning_enabled(self, config: dict) -> bool:
+        return bool(config.get("automated_kick_fail_warning", False))
+
+    async def _create_kick_fail_warning(
+        self,
+        guild: discord.Guild,
+        user_id: int,
+        *,
+        moderator: typing.Any = None,
+    ) -> tuple[str | None, str | None]:
+        user = await self._get_user_or_object(user_id)
+        try:
+            await modlog.create_case(
+                self.bot,
+                guild,
+                datetime.now(timezone.utc),
+                action_type="warning",
+                user=user,
+                moderator=moderator or guild.me,
+                reason=KICK_FAIL_WARNING_REASON,
+            )
+        except Exception:
+            log.exception("Failed to create kick-fail warning case for user %s in guild %s", user_id, guild.id)
+            return (None, _("I couldn't create a warning case."))
+        return (_("Warning applied: suspicious kick avoidance."), None)
+
+    def _joinwatch_kick_status_value(self, action_label: str | None, default: str) -> str:
+        if action_label and action_label != _("The member has been kicked."):
+            return action_label
+        return default
 
     def _get_text_channel_or_thread(
         self, guild: discord.Guild, channel_id: int | None
@@ -1072,7 +1189,12 @@ class Honeypot(Cog):
             return (None, missing_permission)
         try:
             if action == "kick":
-                await message.author.kick(reason=reason)
+                try:
+                    await message.author.kick(reason=reason)
+                except discord.NotFound:
+                    if self._automated_kick_fail_warning_enabled(config):
+                        return await self._create_kick_fail_warning(message.guild, message.author.id)
+                    raise
                 await self._increment_stat(message.guild, "kicked")
             elif action == "ban":
                 await message.author.ban(
@@ -1404,8 +1526,15 @@ class Honeypot(Cog):
         try:
             if action == "kick":
                 if member is None:
+                    if self._automated_kick_fail_warning_enabled(config):
+                        return await self._create_kick_fail_warning(guild, member_id)
                     return (_("The member is no longer in the server."), None)
-                await member.kick(reason=reason)
+                try:
+                    await member.kick(reason=reason)
+                except discord.NotFound:
+                    if self._automated_kick_fail_warning_enabled(config):
+                        return await self._create_kick_fail_warning(guild, member_id)
+                    raise
             elif action == "ban":
                 target = member if member is not None else await self._get_user_or_object(member_id)
                 await guild.ban(
@@ -1481,7 +1610,11 @@ class Honeypot(Cog):
                         if config.get("joinwatch_auto_role_action") == "ban":
                             await self._edit_joinwatch_alert_auto_role(guild, data, _("Banned."))
                         elif config.get("joinwatch_auto_role_action") == "kick":
-                            await self._edit_joinwatch_alert_auto_role(guild, data, _("Left server."))
+                            await self._edit_joinwatch_alert_auto_role(
+                                guild,
+                                data,
+                                self._joinwatch_kick_status_value(action_label, _("Left server.")),
+                            )
                         else:
                             await self._edit_joinwatch_alert_auto_role(guild, data, _("Timer expired."))
                         await self._delete_joinwatch_pending_assignment(guild, member_id)
@@ -1598,7 +1731,11 @@ class Honeypot(Cog):
                             if config.get("joinwatch_auto_role_action") == "ban":
                                 await self._edit_joinwatch_alert_auto_role(guild, data, _("Banned."))
                             elif config.get("joinwatch_auto_role_action") == "kick":
-                                await self._edit_joinwatch_alert_auto_role(guild, data, _("Left server."))
+                                await self._edit_joinwatch_alert_auto_role(
+                                    guild,
+                                    data,
+                                    self._joinwatch_kick_status_value(action_label, _("Left server.")),
+                                )
                             else:
                                 await self._edit_joinwatch_alert_auto_role(guild, data, _("Timer expired."))
                             await self._delete_joinwatch_pending_role(guild, member_id)
@@ -1660,7 +1797,11 @@ class Honeypot(Cog):
                         if config.get("joinwatch_auto_role_action") == "ban":
                             await self._edit_joinwatch_alert_auto_role(guild, data, _("Banned."))
                         elif config.get("joinwatch_auto_role_action") == "kick":
-                            await self._edit_joinwatch_alert_auto_role(guild, data, _("Kicked."))
+                            await self._edit_joinwatch_alert_auto_role(
+                                guild,
+                                data,
+                                self._joinwatch_kick_status_value(action_label, _("Kicked.")),
+                            )
                         else:
                             await self._edit_joinwatch_alert_auto_role(guild, data, _("Timer expired."))
                         await self._delete_joinwatch_pending_role(guild, member_id)
@@ -1932,6 +2073,16 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).whitelist_mode.set(value)
             await ctx.send(_("✅ Whitelist mode set to {value}").format(value=value))
 
+    @core.command(name="automated_kick_fail_warn")
+    async def automated_kick_fail_warn(self, ctx: commands.Context, value: bool = None) -> None:
+        """Warn instead when an automated kick target has already left."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).automated_kick_fail_warning()
+            await ctx.send(_("Warn on automated kick fail: {value}").format(value=v))
+        else:
+            await self.config.guild(ctx.guild).automated_kick_fail_warning.set(value)
+            await ctx.send(_("✅ Warn on automated kick fail set to {value}").format(value=value))
+
     # ─── channel sub-group ────────────────────────────────────────────
 
     @honeypot.group(name="channel")
@@ -2167,6 +2318,20 @@ class Honeypot(Cog):
         else:
             await self.config.guild(ctx.guild).review_timeout_minutes.set(minutes)
             await ctx.send(_("✅ Review timeout set to {value} minutes").format(value=minutes))
+
+    @review.command(name="kick_fail_warn")
+    async def review_kick_fail_warn(self, ctx: commands.Context, value: str = None) -> None:
+        """Warn handling when review kick target has already left: false, true, or manual."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).review_kick_fail_warning()
+            await ctx.send(_("Review kick fail warning: {value}").format(value=v))
+            return
+        value = value.lower()
+        if value not in REVIEW_KICK_FAIL_WARNING_MODES:
+            await ctx.send(_("Must be `false`, `true`, or `manual`."))
+            return
+        await self.config.guild(ctx.guild).review_kick_fail_warning.set(value)
+        await ctx.send(_("✅ Review kick fail warning set to {value}").format(value=value))
 
     # ─── roles sub-group (was whitelistedroles) ───────────────────────
 
@@ -2602,6 +2767,7 @@ class Honeypot(Cog):
                 (_("Fallback action"), config.get("fallback_action")),
                 (_("Dry run"), self._format_bool_setting(config.get("dry_run", False))),
                 (_("Whitelist mode"), config.get("whitelist_mode")),
+                (_("Warn on automated kick fail"), self._format_bool_setting(config.get("automated_kick_fail_warning", False))),
             ],
         )
 
@@ -2671,6 +2837,7 @@ class Honeypot(Cog):
                 (_("Enabled"), self._format_bool_setting(config.get("review_enabled", False))),
                 (_("Channel"), self._format_channel_setting(ctx.guild, config.get("review_channel"))),
                 (_("Timeout"), _("{minutes} minutes").format(minutes=config.get("review_timeout_minutes"))),
+                (_("Kick fail warning"), config.get("review_kick_fail_warning", "false")),
                 (_("Pending reviews"), len(config.get("pending_reviews", {}))),
             ],
         )

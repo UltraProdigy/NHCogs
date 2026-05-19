@@ -36,6 +36,7 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot core fallback_action <review\|kick\|ban\|none>` | Action for non-suspicious posts |
 | `!honeypot core dry_run <bool>` | Log what would happen without punishing |
 | `!honeypot core whitelist_mode <bypass\|review\|fallback\|none>` | How whitelisted roles behave |
+| `!honeypot core automated_kick_fail_warn <bool>` | Warn instead when an automated kick target already left |
 
 ### channel
 
@@ -78,6 +79,7 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot review toggle <bool>` | Toggle moderator review |
 | `!honeypot review channel <channel>` | Channel for review requests |
 | `!honeypot review timeout <1-10080>` | Minutes before review expires |
+| `!honeypot review kick_fail_warn <false\|true\|manual>` | Warn handling when a review kick target already left |
 
 ### roles
 
