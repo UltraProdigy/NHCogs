@@ -22,7 +22,7 @@ log = logging.getLogger("red.Honeypot")
 DEFAULT_FAKE_MESSAGES = [
     "BAN CHANNEL - DO NOT WRITE HERE.",
     "Do not type in this channel.",
-    "Messages here are logged and reviewed by staff.",
+    "This channel is restricted.",
     "Wrong channel. Do not post here.",
     "Stop. This channel is monitored.",
 ]
@@ -53,7 +53,7 @@ DEFAULT_STATS = {
 JOINWATCH_RETRY_DELAY_MINUTES = 5
 JOINWATCH_MAX_RETRIES = 5
 REVIEW_KICK_FAIL_WARNING_MODES = ("false", "true", "manual")
-KICK_FAIL_WARNING_REASON = "Suspicious kick avoidance - target left before the kick could be applied."
+KICK_FAIL_WARNING_REASON = "Suspicious activity: target left before the kick could be applied."
 CORE_ACTION_OPTIONS = ("kick", "ban", "review", "none")
 FALLBACK_ACTION_OPTIONS = ("review", "kick", "ban", "none")
 WHITELIST_MODE_OPTIONS = ("bypass", "review", "fallback", "none")
@@ -162,7 +162,7 @@ class ReviewView(discord.ui.View):
         review_message = self.review_message or interaction.message
         if review_message is not None:
             try:
-                await review_message.edit(content=_("\u2705 **Review completed**"), embed=embed, view=self)
+                await review_message.edit(content=_("\u2705 **Review resolved**"), embed=embed, view=self)
             except discord.HTTPException:
                 log.debug("Failed to edit completed review message %s", getattr(review_message, "id", None))
         async with self.cog._views_lock:
@@ -173,8 +173,8 @@ class ReviewView(discord.ui.View):
 
     async def _send_kick_fail_warning_prompt(self, interaction: discord.Interaction) -> None:
         embed = discord.Embed(
-            title=_("Kick target left"),
-            description=_("The user is no longer in the server. Apply a warning instead?"),
+            title=_("Target left the server"),
+            description=_("The user left before the kick could be applied. Apply a warning instead?"),
             color=discord.Color.orange(),
             timestamp=datetime.now(timezone.utc),
         )
@@ -275,7 +275,7 @@ class ReviewView(discord.ui.View):
     async def ban_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         if not await self._claim_resolution():
-            await interaction.followup.send(_("This review is already being handled."), ephemeral=True)
+            await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
             return
         msg, label = await self._action_perform(interaction, "ban")
         if label:
@@ -289,7 +289,7 @@ class ReviewView(discord.ui.View):
     async def kick_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         if not await self._claim_resolution():
-            await interaction.followup.send(_("This review is already being handled."), ephemeral=True)
+            await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
             return
         msg, label = await self._action_perform(interaction, "kick")
         if label:
@@ -303,7 +303,7 @@ class ReviewView(discord.ui.View):
     async def ignore_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         if not await self._claim_resolution():
-            await interaction.followup.send(_("This review is already being handled."), ephemeral=True)
+            await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
             return
         msg, label = await self._action_perform(interaction, "ignore")
         if label:
@@ -326,7 +326,7 @@ class KickFailWarnView(discord.ui.View):
             await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
             return
         if not await self.review_view._claim_resolution():
-            await interaction.followup.send(_("This review is already being handled."), ephemeral=True)
+            await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
             return
         guild = self.review_view.cog.bot.get_guild(self.review_view.guild_id)
         if guild is None:
@@ -353,7 +353,7 @@ class KickFailWarnView(discord.ui.View):
             await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
             return
         if not await self.review_view._claim_resolution():
-            await interaction.followup.send(_("This review is already being handled."), ephemeral=True)
+            await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
             return
         await self.review_view._update_done(interaction, _("Kick skipped; target left the server."))
         await interaction.followup.send(_("No warning applied."), ephemeral=True)
@@ -568,10 +568,11 @@ class Honeypot(Cog):
         if not message.embeds:
             return
         embed = discord.Embed.from_dict(message.embeds[0].to_dict())
-        field_name = _("Auto role:")
+        field_name = _("Auto-role:")
+        legacy_field_name = _("Auto role:")
         for index, field in enumerate(embed.fields):
-            if field.name == field_name:
-                embed.set_field_at(index, name=field.name, value=value, inline=field.inline)
+            if field.name in (field_name, legacy_field_name):
+                embed.set_field_at(index, name=field_name, value=value, inline=field.inline)
                 break
         else:
             embed.add_field(name=field_name, value=value, inline=False)
@@ -804,7 +805,7 @@ class Honeypot(Cog):
     ) -> str | None:
         me = guild.me
         if me is None:
-            return _("I could not resolve my guild member.")
+            return _("I couldn't find my server member.")
         perms = channel.permissions_for(me)
         if not perms.view_channel:
             return _("I need `View Channel` in {channel}.").format(channel=channel.mention)
@@ -850,7 +851,7 @@ class Honeypot(Cog):
     def _missing_action_permission(self, guild: discord.Guild, action: str) -> str | None:
         me = guild.me
         if me is None:
-            return _("**Failed:** I could not resolve my guild member.")
+            return _("**Failed:** I couldn't find my server member.")
         permissions = me.guild_permissions
         if action == "kick" and not permissions.kick_members:
             return _("**Failed:** I do not have the `Kick Members` permission.")
@@ -861,11 +862,11 @@ class Honeypot(Cog):
     def _missing_role_assignment_permission(self, guild: discord.Guild, role: discord.Role) -> str | None:
         me = guild.me
         if me is None:
-            return _("I could not resolve my guild member.")
+            return _("I couldn't find my server member.")
         if not me.guild_permissions.manage_roles:
-            return _("I need `Manage Roles` permission to apply the joinwatch auto role.")
+            return _("I need `Manage Roles` permission to apply the joinwatch auto-role.")
         if me.top_role <= role:
-            return _("My top role must be above the joinwatch auto role.")
+            return _("My top role must be above the joinwatch auto-role.")
         return None
 
     async def _is_protected_member(self, member: discord.Member) -> bool:
@@ -920,14 +921,14 @@ class Honeypot(Cog):
         if len(message.attachments) > 10:
             snapshots.append(
                 {
-                    "filename": _("Additional attachments"),
+                    "filename": _("More attachments"),
                     "url": None,
                     "size": 0,
                     "content_type": None,
                     "description": None,
                     "spoiler": False,
                     "data": None,
-                    "error": _("{count} more attachment(s) not copied; Discord allows 10 files per message.").format(
+                    "error": _("{count} more attachments were not included; Discord only allows 10 files per message.").format(
                         count=len(message.attachments) - 10
                     ),
                 }
@@ -1122,7 +1123,7 @@ class Honeypot(Cog):
             )
         if view.review_message is not None:
             try:
-                await view.review_message.edit(content=_("✅ **Review completed**"), embed=embed, view=view)
+                await view.review_message.edit(content=_("✅ **Review expired**"), embed=embed, view=view)
             except discord.HTTPException:
                 log.debug("Failed to edit expired review message %s", view.active_key)
         await self._increment_stat(guild, "review_expired")
@@ -1143,14 +1144,14 @@ class Honeypot(Cog):
         scam_keywords = config.get("scam_keywords") or SCAM_KEYWORDS
         matched_keywords = [kw for kw in scam_keywords if kw.lower() in content]
         if matched_keywords:
-            reasons.append(_("Matched keyword: {keywords}").format(keywords=", ".join(matched_keywords[:5])))
+            reasons.append(_("Matched keywords: {keywords}").format(keywords=", ".join(matched_keywords[:5])))
         if message.attachments and message.author.created_at > datetime.now(timezone.utc) - timedelta(days=14):
             reasons.append(_("Attachment from an account under 14 days old"))
         attachment_patterns = config.get("attachment_patterns") or DEFAULT_ATTACHMENT_PATTERNS
         filenames = [attachment.filename.lower() for attachment in message.attachments]
         image_name_count = sum(1 for filename in filenames if filename.rsplit(".", 1)[0] == "image")
         if image_name_count >= 4:
-            reasons.append(_("Repeated attachment basename: image x{count}").format(count=image_name_count))
+            reasons.append(_("Repeated attachment names: image x{count}").format(count=image_name_count))
         filename_bases = [filename.rsplit(".", 1)[0] for filename in filenames]
         matched_patterns = []
         for pattern in attachment_patterns:
@@ -1161,7 +1162,7 @@ class Honeypot(Cog):
             if matches >= 4:
                 matched_patterns.append(pattern)
         if matched_patterns:
-            reasons.append(_("Matched attachment pattern: {patterns}").format(patterns=", ".join(matched_patterns[:3])))
+            reasons.append(_("Matched attachment rules: {patterns}").format(patterns=", ".join(matched_patterns[:3])))
         return reasons
 
     async def _purge_user_messages(
@@ -1257,7 +1258,7 @@ class Honeypot(Cog):
                     await self._increment_stat(message.guild, "pending_mutes")
                     embed.add_field(
                         name=_("Pending review mute:"),
-                        value=_("Temporary mute applied while staff reviews this."),
+                        value=_("Temporary mute applied while the review is pending."),
                         inline=False,
                     )
                 except discord.HTTPException:
@@ -1278,7 +1279,7 @@ class Honeypot(Cog):
             review_timeout_minutes=config.get("review_timeout_minutes", 1440),
         )
         embed.add_field(
-            name=_("Auto-ignore:"),
+            name=_("Review expires in:"),
             value=discord.utils.format_dt(view.expires_at, style="R"),
             inline=False,
         )
@@ -1302,7 +1303,7 @@ class Honeypot(Cog):
         await self._store_pending_review(message.guild, view, review_channel.id, sent.id)
         await self._increment_stat(message.guild, "reviewed")
         await logs_channel.send(
-            _("🟡 Review queued for {user} ({user_id}) in {channel}.").format(
+            _("Queued for review: {user} ({user_id}) in {channel}.").format(
                 user=message.author.mention,
                 user_id=message.author.id,
                 channel=review_channel.mention,
@@ -1427,7 +1428,7 @@ class Honeypot(Cog):
         if suspicion_reasons:
             await self._increment_stat(message.guild, "suspicious")
             embed.add_field(
-                name=_("Trigger reason(s):"),
+                name=_("Trigger reasons:"),
                 value="\n".join(f"- {reason}" for reason in suspicion_reasons),
                 inline=False,
             )
@@ -1469,7 +1470,7 @@ class Honeypot(Cog):
                 action_label, failed = await self._execute_action(
                     message,
                     config,
-                    reason="Suspicious post in the honeypot channel.",
+                    reason="Suspicious message in the honeypot channel.",
                 )
                 embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
                 if failed:
@@ -1491,7 +1492,7 @@ class Honeypot(Cog):
                 action_label, failed = await self._execute_action(
                     message,
                     config,
-                    reason="User posted in honeypot channel (no scam pattern detected).",
+                    reason="Message in the honeypot channel without a matching scam pattern.",
                     action=fallback_action,
                 )
                 embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
@@ -1624,7 +1625,7 @@ class Honeypot(Cog):
                                 self._joinwatch_kick_status_value(action_label, _("Left server.")),
                             )
                         else:
-                            await self._edit_joinwatch_alert_auto_role(guild, data, _("Timer expired."))
+                            await self._edit_joinwatch_alert_auto_role(guild, data, _("Auto-role timer expired."))
                         await self._delete_joinwatch_pending_assignment(guild, member_id)
                         if logs_channel is not None:
                             embed = discord.Embed(
@@ -1678,7 +1679,7 @@ class Honeypot(Cog):
                                 member_id_str,
                                 data,
                                 now,
-                                _("I couldn't apply the configured joinwatch auto role."),
+                                _("I couldn't apply the configured joinwatch auto-role."),
                             )
                             continue
                     expires_at = now + timedelta(
@@ -1745,12 +1746,12 @@ class Honeypot(Cog):
                                     self._joinwatch_kick_status_value(action_label, _("Left server.")),
                                 )
                             else:
-                                await self._edit_joinwatch_alert_auto_role(guild, data, _("Timer expired."))
+                                await self._edit_joinwatch_alert_auto_role(guild, data, _("Auto-role timer expired."))
                             await self._delete_joinwatch_pending_role(guild, member_id)
                         if logs_channel is not None:
                             embed = discord.Embed(
                                 title=_("Joinwatch auto-role timer expired"),
-                                description=_("{mention} ({id}) left before the timer expired.").format(
+                                description=_("{mention} ({id}) left before the auto-role timer expired.").format(
                                     mention=f"<@{member_id}>",
                                     id=member_id,
                                 ),
@@ -1811,15 +1812,15 @@ class Honeypot(Cog):
                                 self._joinwatch_kick_status_value(action_label, _("Kicked.")),
                             )
                         else:
-                            await self._edit_joinwatch_alert_auto_role(guild, data, _("Timer expired."))
+                            await self._edit_joinwatch_alert_auto_role(guild, data, _("Auto-role timer expired."))
                         await self._delete_joinwatch_pending_role(guild, member_id)
                     if logs_channel is not None:
                         embed = discord.Embed(
                             title=_("Joinwatch auto-role timer expired"),
-                            description=_("{mention} ({id}) still had {role} after the timer expired.").format(
+                            description=_("{mention} ({id}) still had {role} when the timer expired.").format(
                                 mention=member.mention,
                                 id=member.id,
-                                role=role.mention if role is not None else _("the auto role"),
+                                role=role.mention if role is not None else _("the auto-role"),
                             ),
                             color=discord.Color.dark_red() if failed else discord.Color.orange(),
                             timestamp=now,
@@ -1876,7 +1877,7 @@ class Honeypot(Cog):
                     if role_permission_error is not None:
                         await self._increment_stat(member.guild, "joinwatch_auto_role_failures")
                         embed.add_field(
-                            name=_("Auto role:"),
+                            name=_("Auto-role:"),
                             value=role_permission_error,
                             inline=False,
                         )
@@ -1892,7 +1893,7 @@ class Honeypot(Cog):
                             await self._store_joinwatch_pending_assignment(member, role.id, apply_at)
                             await self._increment_stat(member.guild, "joinwatch_auto_roles_scheduled")
                             embed.add_field(
-                                name=_("Auto role:"),
+                                name=_("Auto-role:"),
                                 value=_("{role} scheduled for {time}.").format(
                                     role=role.mention,
                                     time=discord.utils.format_dt(apply_at, style="R"),
@@ -1913,7 +1914,7 @@ class Honeypot(Cog):
                                     applied_at=now,
                                 )
                                 embed.add_field(
-                                    name=_("Auto role:"),
+                                    name=_("Auto-role:"),
                                     value=_("{role} applied until {time}.").format(
                                         role=role.mention,
                                         time=discord.utils.format_dt(expires_at, style="R"),
@@ -1923,8 +1924,8 @@ class Honeypot(Cog):
                             except discord.HTTPException:
                                 await self._increment_stat(member.guild, "joinwatch_auto_role_failures")
                                 embed.add_field(
-                                    name=_("Auto role:"),
-                                    value=_("I couldn't apply the configured joinwatch auto role."),
+                                    name=_("Auto-role:"),
+                                    value=_("I couldn't apply the configured joinwatch auto-role."),
                                     inline=False,
                                 )
             if config.get("joinwatch_alert_enabled", True) and channel is not None:
@@ -2027,7 +2028,7 @@ class Honeypot(Cog):
 
     @core.command(name="toggle")
     async def core_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Toggle the cog on/off."""
+        """Enable or disable the cog."""
         if value is None:
             v = await self.config.guild(ctx.guild).enabled()
             await ctx.send(_("Enabled: {value}").format(value=v))
@@ -2041,13 +2042,13 @@ class Honeypot(Cog):
         if value is None:
             v = await self.config.guild(ctx.guild).action()
             await ctx.send(
-                _("Action: {value}. Options: {options}").format(
+                _("Current: {value}. Choices: {options}").format(
                     value=v or _("not set"),
                     options=self._format_options(CORE_ACTION_OPTIONS),
                 )
             )
         elif value not in CORE_ACTION_OPTIONS:
-            await ctx.send(_("Action must be `kick`, `ban`, `review`, or `none`."))
+            await ctx.send(_("Choose one of: {options}").format(options=self._format_options(CORE_ACTION_OPTIONS)))
         else:
             await self.config.guild(ctx.guild).action.set(value)
             await ctx.send(_("✅ Action set to {value}").format(value=value))
@@ -2058,13 +2059,13 @@ class Honeypot(Cog):
         if value is None:
             v = await self.config.guild(ctx.guild).fallback_action()
             await ctx.send(
-                _("Fallback action: {value}. Options: {options}").format(
+                _("Current: {value}. Choices: {options}").format(
                     value=v,
                     options=self._format_options(FALLBACK_ACTION_OPTIONS),
                 )
             )
         elif value not in FALLBACK_ACTION_OPTIONS:
-            await ctx.send(_("Must be `review`, `kick`, `ban`, or `none`."))
+            await ctx.send(_("Choose one of: {options}").format(options=self._format_options(FALLBACK_ACTION_OPTIONS)))
         else:
             await self.config.guild(ctx.guild).fallback_action.set(value)
             await ctx.send(_("✅ Fallback action set to {value}").format(value=value))
@@ -2085,20 +2086,20 @@ class Honeypot(Cog):
         if value is None:
             v = await self.config.guild(ctx.guild).whitelist_mode()
             await ctx.send(
-                _("Whitelist mode: {value}. Options: {options}").format(
+                _("Current: {value}. Choices: {options}").format(
                     value=v,
                     options=self._format_options(WHITELIST_MODE_OPTIONS),
                 )
             )
         elif value not in WHITELIST_MODE_OPTIONS:
-            await ctx.send(_("Must be `bypass`, `review`, `fallback`, or `none`."))
+            await ctx.send(_("Choose one of: {options}").format(options=self._format_options(WHITELIST_MODE_OPTIONS)))
         else:
             await self.config.guild(ctx.guild).whitelist_mode.set(value)
             await ctx.send(_("✅ Whitelist mode set to {value}").format(value=value))
 
     @core.command(name="automated_kick_fail_warn")
     async def automated_kick_fail_warn(self, ctx: commands.Context, value: bool = None) -> None:
-        """Warn instead when an automated kick target has already left."""
+        """Warn when the target has already left before the kick is applied."""
         if value is None:
             v = await self.config.guild(ctx.guild).automated_kick_fail_warning()
             await ctx.send(_("Warn on automated kick fail: {value}").format(value=v))
@@ -2126,7 +2127,7 @@ class Honeypot(Cog):
             )
         me = ctx.guild.me
         if me is None:
-            raise commands.UserFeedbackCheckFailure(_("I could not resolve my guild member."))
+            raise commands.UserFeedbackCheckFailure(_("I couldn't find my server member."))
         honeypot_channel = await ctx.guild.create_text_channel(
             name="honeypot",
             position=0,
@@ -2219,7 +2220,7 @@ class Honeypot(Cog):
 
     @purge.command(name="toggle")
     async def purge_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Toggle purging on detection."""
+        """Delete recent messages from the user in the honeypot channel."""
         if value is None:
             v = await self.config.guild(ctx.guild).purge_enabled()
             await ctx.send(_("Purge enabled: {value}").format(value=v))
@@ -2247,7 +2248,7 @@ class Honeypot(Cog):
 
     @fakeactivity.command(name="toggle")
     async def fakeactivity_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Toggle fake activity messages."""
+        """Simulate activity in the honeypot channel to attract scammers."""
         if value is None:
             v = await self.config.guild(ctx.guild).fake_activity_enabled()
             await ctx.send(_("Fake activity enabled: {value}").format(value=v))
@@ -2309,7 +2310,7 @@ class Honeypot(Cog):
 
     @review.command(name="toggle")
     async def review_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Toggle moderator review."""
+        """Send suspicious messages to moderator review instead of acting immediately."""
         if value is None:
             v = await self.config.guild(ctx.guild).review_enabled()
             await ctx.send(_("Review enabled: {value}").format(value=v))
@@ -2344,11 +2345,11 @@ class Honeypot(Cog):
 
     @review.command(name="kick_fail_warn")
     async def review_kick_fail_warn(self, ctx: commands.Context, value: str = None) -> None:
-        """Warn handling when review kick target has already left: false, true, or manual."""
+        """How to handle a review kick when the target has already left: false, true, or manual."""
         if value is None:
             v = await self.config.guild(ctx.guild).review_kick_fail_warning()
             await ctx.send(
-                _("Review kick fail warning: {value}. Options: {options}").format(
+                _("Current: {value}. Choices: {options}").format(
                     value=v,
                     options=self._format_options(REVIEW_KICK_FAIL_WARNING_MODES),
                 )
@@ -2356,10 +2357,10 @@ class Honeypot(Cog):
             return
         value = value.lower()
         if value not in REVIEW_KICK_FAIL_WARNING_MODES:
-            await ctx.send(_("Must be `false`, `true`, or `manual`."))
+            await ctx.send(_("Choose one of: {options}").format(options=self._format_options(REVIEW_KICK_FAIL_WARNING_MODES)))
             return
         await self.config.guild(ctx.guild).review_kick_fail_warning.set(value)
-        await ctx.send(_("✅ Review kick fail warning set to {value}").format(value=value))
+        await ctx.send(_("✅ Kick-fail warning set to {value}").format(value=value))
 
     # ─── roles sub-group (was whitelistedroles) ───────────────────────
 
@@ -2492,10 +2493,10 @@ class Honeypot(Cog):
 
     @joinwatch.command(name="toggle")
     async def joinwatch_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Toggle new account join alerts."""
+        """Enable or disable new account join alerts."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_enabled()
-            await ctx.send(_("Joinwatch enabled: {value}").format(value=v))
+            await ctx.send(_("Joinwatch enabled: {value}").format(value=self._format_bool_setting(v)))
         else:
             await self.config.guild(ctx.guild).joinwatch_enabled.set(value)
             await ctx.send(_("✅ Joinwatch enabled set to {value}").format(value=value))
@@ -2519,10 +2520,10 @@ class Honeypot(Cog):
 
     @joinwatch_alert.command(name="toggle")
     async def joinwatch_alert_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Toggle joinwatch alert messages."""
+        """Enable or disable joinwatch alert messages."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_alert_enabled()
-            await ctx.send(_("Joinwatch alerts: {value}").format(value=v))
+            await ctx.send(_("Joinwatch alerts: {value}").format(value=self._format_bool_setting(v)))
         else:
             await self.config.guild(ctx.guild).joinwatch_alert_enabled.set(value)
             await ctx.send(_("✅ Joinwatch alerts set to {value}").format(value=value))
@@ -2545,13 +2546,13 @@ class Honeypot(Cog):
 
     @joinwatch_autorole.command(name="toggle")
     async def joinwatch_autorole_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Toggle joinwatch auto role."""
+        """Enable or disable joinwatch auto-role."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_enabled()
-            await ctx.send(_("Joinwatch auto role: {value}").format(value=v))
+            await ctx.send(_("Joinwatch auto-role: {value}").format(value=self._format_bool_setting(v)))
         else:
             await self.config.guild(ctx.guild).joinwatch_auto_role_enabled.set(value)
-            await ctx.send(_("✅ Joinwatch auto role set to {value}").format(value=value))
+            await ctx.send(_("✅ Joinwatch auto-role set to {value}").format(value=value))
 
     @joinwatch_autorole.command(name="role")
     async def joinwatch_autorole_role(self, ctx: commands.Context, role: discord.Role = None) -> None:
@@ -2560,7 +2561,7 @@ class Honeypot(Cog):
             role_id = await self.config.guild(ctx.guild).joinwatch_auto_role_id()
             configured_role = ctx.guild.get_role(role_id) if role_id else None
             await ctx.send(
-                _("Joinwatch auto role: {role}").format(
+                _("Joinwatch auto-role: {role}").format(
                     role=configured_role.mention if configured_role else _("not set"),
                 )
             )
@@ -2569,14 +2570,14 @@ class Honeypot(Cog):
             if role_permission_error is not None:
                 raise commands.UserFeedbackCheckFailure(role_permission_error)
             await self.config.guild(ctx.guild).joinwatch_auto_role_id.set(role.id)
-            await ctx.send(_("✅ Joinwatch auto role set to {role.mention}").format(role=role))
+            await ctx.send(_("✅ Joinwatch auto-role set to {role.mention}").format(role=role))
 
     @joinwatch_autorole.command(name="timer")
     async def joinwatch_autorole_timer(self, ctx: commands.Context, minutes: int = None) -> None:
-        """Minutes before punishment if the auto role is still present."""
+        """Minutes before punishment if the auto-role is still present."""
         if minutes is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_timer_minutes()
-            await ctx.send(_("Joinwatch auto role timer: {value} minutes").format(value=v))
+            await ctx.send(_("Joinwatch auto-role timer: {value} minutes").format(value=v))
         elif minutes < 1 or minutes > 10080:
             await ctx.send(_("Timer must be between 1 and 10080 minutes."))
         else:
@@ -2584,7 +2585,7 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).joinwatch_auto_role_timer_minutes.set(minutes)
             updated = await self._reschedule_joinwatch_pending_roles(ctx.guild, old_minutes, minutes)
             await ctx.send(
-                _("✅ Joinwatch auto role timer set to {value} minutes. Updated {count} active timer(s).").format(
+                _("✅ Joinwatch auto-role timer set to {value} minutes. Updated {count} active timer(s).").format(
                     value=minutes,
                     count=updated,
                 )
@@ -2592,20 +2593,20 @@ class Honeypot(Cog):
 
     @joinwatch_autorole.command(name="action")
     async def joinwatch_autorole_action(self, ctx: commands.Context, value: str = None) -> None:
-        """Action when the auto role is not removed before the timer: none, kick, or ban."""
+        """Action when the auto-role is not removed before the timer: none, kick, or ban."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_action()
             await ctx.send(
-                _("Joinwatch auto role action: {value}. Options: {options}").format(
+                _("Current: {value}. Choices: {options}").format(
                     value=v,
                     options=self._format_options(JOINWATCH_AUTO_ROLE_ACTION_OPTIONS),
                 )
             )
         elif value not in JOINWATCH_AUTO_ROLE_ACTION_OPTIONS:
-            await ctx.send(_("Action must be `none`, `kick`, or `ban`."))
+            await ctx.send(_("Choose one of: {options}").format(options=self._format_options(JOINWATCH_AUTO_ROLE_ACTION_OPTIONS)))
         else:
             await self.config.guild(ctx.guild).joinwatch_auto_role_action.set(value)
-            await ctx.send(_("✅ Joinwatch auto role action set to {value}").format(value=value))
+            await ctx.send(_("✅ Joinwatch auto-role action set to {value}").format(value=value))
 
     @joinwatch_autorole.command(name="bantimers")
     async def joinwatch_autorole_bantimers(self, ctx: commands.Context) -> None:
@@ -2613,7 +2614,7 @@ class Honeypot(Cog):
         config = await self.config.guild(ctx.guild).all()
         pending_roles = config.get("joinwatch_pending_roles", {})
         if not pending_roles:
-            await ctx.send(_("No active joinwatch auto-role timers."))
+            await ctx.send(_("No active joinwatch punishment timers."))
             return
 
         now = datetime.now(timezone.utc)
@@ -2663,7 +2664,7 @@ class Honeypot(Cog):
             )
 
         if not entries:
-            await ctx.send(_("No readable joinwatch auto-role timers."))
+            await ctx.send(_("No readable joinwatch punishment timers."))
             return
 
         entries.sort(key=lambda item: item[0])
@@ -2671,7 +2672,7 @@ class Honeypot(Cog):
             count=len(entries),
         )
         if invalid:
-            header += _("\nSkipped invalid timer entries: {count}").format(count=invalid)
+            header += _("\nSkipped invalid entries: {count}").format(count=invalid)
         lines = [header, ""]
         lines.extend(f"{index}. {entry}" for index, (_, entry) in enumerate(entries, 1))
         for page in pagify("\n".join(lines), page_length=1900):
@@ -2679,28 +2680,28 @@ class Honeypot(Cog):
 
     @joinwatch_autorole.group(name="randomize")
     async def joinwatch_autorole_randomize(self, ctx: commands.Context) -> None:
-        """Randomize when the joinwatch auto role is applied."""
+        """Randomize when the joinwatch auto-role is applied."""
 
     @joinwatch_autorole_randomize.command(name="toggle")
     async def joinwatch_autorole_randomize_toggle(
         self, ctx: commands.Context, value: bool = None
     ) -> None:
-        """Toggle randomized delay before applying the auto role."""
+        """Enable or disable randomized delay before applying the auto-role."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_enabled()
-            await ctx.send(_("Joinwatch auto role randomized delay: {value}").format(value=v))
+            await ctx.send(_("Joinwatch auto-role randomized delay: {value}").format(value=self._format_bool_setting(v)))
         else:
             await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_enabled.set(value)
-            await ctx.send(_("✅ Joinwatch auto role randomized delay set to {value}").format(value=value))
+            await ctx.send(_("✅ Joinwatch auto-role randomized delay set to {value}").format(value=value))
 
     @joinwatch_autorole_randomize.command(name="min_time")
     async def joinwatch_autorole_randomize_min_time(
         self, ctx: commands.Context, minutes: int = None
     ) -> None:
-        """Minimum minutes before applying the auto role."""
+        """Minimum minutes before applying the auto-role."""
         if minutes is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_min_minutes()
-            await ctx.send(_("Joinwatch auto role randomized minimum: {value} minutes").format(value=v))
+            await ctx.send(_("Joinwatch auto-role randomized minimum: {value} minutes").format(value=v))
         elif minutes < 1 or minutes > 10080:
             await ctx.send(_("Minimum delay must be between 1 and 10080 minutes."))
         else:
@@ -2724,10 +2725,10 @@ class Honeypot(Cog):
     async def joinwatch_autorole_randomize_max_time(
         self, ctx: commands.Context, minutes: int = None
     ) -> None:
-        """Maximum minutes before applying the auto role."""
+        """Maximum minutes before applying the auto-role."""
         if minutes is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_max_minutes()
-            await ctx.send(_("Joinwatch auto role randomized maximum: {value} minutes").format(value=v))
+            await ctx.send(_("Joinwatch auto-role randomized maximum: {value} minutes").format(value=v))
         elif minutes < 1 or minutes > 10080:
             await ctx.send(_("Maximum delay must be between 1 and 10080 minutes."))
         else:
@@ -2750,7 +2751,7 @@ class Honeypot(Cog):
 
     @bait.command(name="toggle")
     async def bait_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Toggle the bait role trap."""
+        """Enable or disable the bait role trap."""
         if value is None:
             v = await self.config.guild(ctx.guild).baitrole_enabled()
             await ctx.send(_("Bait role trap: {value}").format(value=v))
@@ -2775,13 +2776,13 @@ class Honeypot(Cog):
         if value is None:
             v = await self.config.guild(ctx.guild).baitrole_action()
             await ctx.send(
-                _("Bait action: {value}. Options: {options}").format(
+                _("Current: {value}. Choices: {options}").format(
                     value=v,
                     options=self._format_options(BAIT_ACTION_OPTIONS),
                 )
             )
         elif value not in BAIT_ACTION_OPTIONS:
-            await ctx.send(_("Must be `kick` or `ban`."))
+            await ctx.send(_("Choose one of: {options}").format(options=self._format_options(BAIT_ACTION_OPTIONS)))
         else:
             await self.config.guild(ctx.guild).baitrole_action.set(value)
             await ctx.send(_("✅ Bait action set to {value}").format(value=value))
@@ -2921,15 +2922,15 @@ class Honeypot(Cog):
             f"  {_('Channel')}: {self._format_channel_setting(ctx.guild, config.get('joinwatch_channel'))}",
             f"  {_('Maximum account age')}: {_('{hours} hours').format(hours=config.get('joinwatch_min_age_hours'))}",
             "",
-            _("Auto role:"),
+            _("Auto-role:"),
             f"  {_('Enabled')}: {self._format_bool_setting(config.get('joinwatch_auto_role_enabled', False))}",
             f"  {_('Role')}: {self._format_role_setting(ctx.guild, config.get('joinwatch_auto_role_id'))}",
             f"  {_('Timer')}: {_('{minutes} minutes').format(minutes=config.get('joinwatch_auto_role_timer_minutes'))}",
             f"  {_('Action')}: {config.get('joinwatch_auto_role_action')}",
             f"  {_('Randomized delay')}: {self._format_bool_setting(config.get('joinwatch_auto_role_random_delay_enabled', False))}",
             f"  {_('Delay range')}: {_('{min} to {max} minutes').format(min=config.get('joinwatch_auto_role_random_delay_min_minutes', 1), max=config.get('joinwatch_auto_role_random_delay_max_minutes', 10))}",
-            f"  {_('Scheduled applications')}: {len(config.get('joinwatch_pending_role_assignments', {}))}",
-            f"  {_('Active timers')}: {len(config.get('joinwatch_pending_roles', {}))}",
+            f"  {_('Pending role applications')}: {len(config.get('joinwatch_pending_role_assignments', {}))}",
+            f"  {_('Active joinwatch timers')}: {len(config.get('joinwatch_pending_roles', {}))}",
         ]
         await ctx.send(_("Joinwatch config:\n") + box("\n".join(lines)))
 
@@ -2949,7 +2950,7 @@ class Honeypot(Cog):
 
     @config_dump.command(name="stats")
     async def config_stats(self, ctx: commands.Context) -> None:
-        """Show stored stats and pending object counts."""
+        """Show stored stats and pending review/timer counts."""
         config = await self.config.guild(ctx.guild).all()
         stats = DEFAULT_STATS.copy()
         stats.update(config.get("stats", {}))
@@ -2957,10 +2958,10 @@ class Honeypot(Cog):
             ctx,
             _("Stats config"),
             [
-                (_("Stored stat keys"), len(stats)),
+                (_("Stored stats"), len(stats)),
                 (_("Pending reviews"), len(config.get("pending_reviews", {}))),
-                (_("Scheduled joinwatch auto roles"), len(config.get("joinwatch_pending_role_assignments", {}))),
-                (_("Pending joinwatch auto roles"), len(config.get("joinwatch_pending_roles", {}))),
+                (_("Pending joinwatch role applications"), len(config.get("joinwatch_pending_role_assignments", {}))),
+                (_("Active joinwatch auto-role timers"), len(config.get("joinwatch_pending_roles", {}))),
             ],
         )
 
@@ -2977,11 +2978,11 @@ class Honeypot(Cog):
                 (_("Logs channel"), self._format_channel_setting(ctx.guild, config.get("logs_channel"))),
                 (_("Review"), self._format_bool_setting(config.get("review_enabled", False))),
                 (_("Joinwatch"), self._format_bool_setting(config.get("joinwatch_enabled", False))),
-                (_("Joinwatch auto role"), self._format_bool_setting(config.get("joinwatch_auto_role_enabled", False))),
+                (_("Joinwatch auto-role"), self._format_bool_setting(config.get("joinwatch_auto_role_enabled", False))),
                 (_("Bait role"), self._format_bool_setting(config.get("baitrole_enabled", False))),
                 (_("Pending reviews"), len(config.get("pending_reviews", {}))),
-                (_("Scheduled joinwatch auto roles"), len(config.get("joinwatch_pending_role_assignments", {}))),
-                (_("Pending joinwatch auto roles"), len(config.get("joinwatch_pending_roles", {}))),
+                (_("Pending joinwatch role applications"), len(config.get("joinwatch_pending_role_assignments", {}))),
+                (_("Active joinwatch auto-role timers"), len(config.get("joinwatch_pending_roles", {}))),
             ],
         )
 
@@ -3017,13 +3018,13 @@ class Honeypot(Cog):
                 "Total joins": total_joins,
                 "Young joins": young_joins,
                 "Young join rate": f"{young_join_rate:.1f}%",
-                "Auto roles scheduled": stats["joinwatch_auto_roles_scheduled"],
-                "Scheduled auto roles": len(pending_joinwatch_assignments),
-                "Auto roles applied": stats["joinwatch_auto_roles"],
-                "Auto role failures": stats["joinwatch_auto_role_failures"],
-                "Auto roles cleared": stats["joinwatch_auto_roles_cleared"],
-                "Active auto role timers": len(pending_joinwatch_roles),
-                "Auto role punishments": stats["joinwatch_auto_role_punishments"],
+                "Auto-role applications scheduled": stats["joinwatch_auto_roles_scheduled"],
+                "Pending role applications": len(pending_joinwatch_assignments),
+                "Auto-roles applied": stats["joinwatch_auto_roles"],
+                "Auto-role failures": stats["joinwatch_auto_role_failures"],
+                "Auto-roles cleared": stats["joinwatch_auto_roles_cleared"],
+                "Active auto-role timers": len(pending_joinwatch_roles),
+                "Auto-role punishments": stats["joinwatch_auto_role_punishments"],
             },
             "Actions": {
                 "Kicked users": stats["kicked"],
@@ -3042,15 +3043,15 @@ class Honeypot(Cog):
 
     @honeypot.command(name="stats")
     async def honeypot_stats(self, ctx: commands.Context) -> None:
-        """Show public-safe honeypot statistics."""
+        """Show public-facing honeypot statistics."""
         stats = DEFAULT_STATS.copy()
         stats.update(await self.config.guild(ctx.guild).stats())
         lines = [
             f"  {_('Messages')}: {stats['detections']}",
             f"  {_('Bans')}: {stats['banned']}",
             f"  {_('Sent for Review')}: {stats['reviewed']}",
-            f"  {_('Shadowbans')}: {stats['joinwatch_auto_roles']}",
-            f"  {_('Automated Shadowban Actions')}: {stats['joinwatch_auto_role_punishments']}",
+            f"  {_('Auto roles applied')}: {stats['joinwatch_auto_roles']}",
+            f"  {_('Joinwatch auto-role punishments')}: {stats['joinwatch_auto_role_punishments']}",
         ]
         await ctx.send(_("**Server safety stats:**\n") + box("\n".join(lines)))
 
@@ -3067,13 +3068,13 @@ class Honeypot(Cog):
         checks: list[tuple[str, bool, str]] = []
         me = ctx.guild.me
         if me is None:
-            await ctx.send(_("**Honeypot doctor:**\n❌ Could not resolve my guild member."))
+            await ctx.send(_("**Honeypot doctor:**\n❌ I couldn't find my server member."))
             return
         honeypot_channel = self._get_text_channel_or_thread(ctx.guild, config.get("honeypot_channel"))
         logs_channel = self._get_text_channel_or_thread(ctx.guild, config.get("logs_channel"))
         review_channel = self._get_text_channel_or_thread(ctx.guild, config.get("review_channel"))
-        checks.append(("Cog enabled", bool(config.get("enabled")), "Run `honeypot core toggle true`."))
-        checks.append(("Suspicious action set", config.get("action") in ("kick", "ban", "review", "none"), "Run `honeypot core action`."))
+        checks.append(("Honeypot enabled", bool(config.get("enabled")), "Run `honeypot core toggle true`."))
+        checks.append(("Action configured", config.get("action") in ("kick", "ban", "review", "none"), "Run `honeypot core action`."))
         checks.append(("Honeypot channel exists", honeypot_channel is not None, "Run `honeypot channel set`."))
         checks.append(("Logs channel exists", logs_channel is not None, "Run `honeypot channel logs`."))
         if config.get("fallback_action") == "review" or config.get("review_enabled") or config.get("whitelist_mode") == "review":
@@ -3086,9 +3087,9 @@ class Honeypot(Cog):
         if config.get("joinwatch_auto_role_enabled"):
             auto_role_id = config.get("joinwatch_auto_role_id")
             auto_role = ctx.guild.get_role(auto_role_id) if auto_role_id else None
-            checks.append(("Joinwatch auto role exists", auto_role is not None, "Run `honeypot joinwatch autorole role`."))
+            checks.append(("Joinwatch auto-role exists", auto_role is not None, "Run `honeypot joinwatch autorole role`."))
             if auto_role is not None:
-                checks.append(("Bot above joinwatch auto role", me.top_role > auto_role, "Move bot role above the joinwatch auto role."))
+                checks.append(("Bot above joinwatch auto-role", me.top_role > auto_role, "Move bot role above the joinwatch auto-role."))
         if config.get("joinwatch_enabled") and config.get("joinwatch_alert_enabled", True):
             joinwatch_channel = self._get_text_channel_or_thread(ctx.guild, config.get("joinwatch_channel"))
             checks.append(("Joinwatch alert channel exists", joinwatch_channel is not None, "Run `honeypot joinwatch channel`."))
@@ -3105,7 +3106,7 @@ class Honeypot(Cog):
             checks.append(("Can send logs", perms.send_messages, "Grant Send Messages."))
         if review_channel is not None:
             perms = review_channel.permissions_for(me)
-            checks.append(("Can send review", perms.send_messages, "Grant Send Messages."))
+            checks.append(("Can send review messages", perms.send_messages, "Grant Send Messages."))
         guild_perms = me.guild_permissions
         checks.append(("Can kick members", guild_perms.kick_members, "Grant Kick Members."))
         checks.append(("Can ban members", guild_perms.ban_members, "Grant Ban Members."))

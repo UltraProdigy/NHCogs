@@ -2,7 +2,7 @@
 
 Honeypot is a Red-DiscordBot cog that protects your server by creating a trap channel for self-bots, scammers,
 spam accounts, and suspicious users. Messages posted in the honeypot channel are deleted, logged, optionally purged,
-and either punished automatically or sent to moderators for review. Also alerts on new accounts joining the server.
+and either punished automatically or sent to moderators for review. It also alerts moderators when new accounts join the server.
 
 ## Installation
 
@@ -31,12 +31,12 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 
 | Command | Description |
 |---------|-------------|
-| `!honeypot core toggle <bool>` | Toggle the cog on/off |
+| `!honeypot core toggle <bool>` | Enable or disable the cog |
 | `!honeypot core action <kick\|ban\|review\|none>` | Main action for suspicious posts |
 | `!honeypot core fallback_action <review\|kick\|ban\|none>` | Action for non-suspicious posts |
 | `!honeypot core dry_run <bool>` | Log what would happen without punishing |
 | `!honeypot core whitelist_mode <bypass\|review\|fallback\|none>` | How whitelisted roles behave |
-| `!honeypot core automated_kick_fail_warn <bool>` | Warn instead when an automated kick target already left |
+| `!honeypot core automated_kick_fail_warn <bool>` | Warn when the target has already left before the kick is applied |
 
 ### channel
 
@@ -58,14 +58,14 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 
 | Command | Description |
 |---------|-------------|
-| `!honeypot purge toggle <bool>` | Toggle auto-purge of recent messages |
+| `!honeypot purge toggle <bool>` | Delete recent messages from the user in the honeypot channel |
 | `!honeypot purge minutes <1-60>` | Minutes of history to purge |
 
 ### fakeactivity
 
 | Command | Description |
 |---------|-------------|
-| `!honeypot fakeactivity toggle <bool>` | Toggle fake activity messages |
+| `!honeypot fakeactivity toggle <bool>` | Simulate activity in the honeypot channel to attract scammers |
 | `!honeypot fakeactivity interval <1-120>` | Minutes between fake messages |
 | `!honeypot fakeactivity add <message>` | Add a custom message |
 | `!honeypot fakeactivity remove <index>` | Remove a message by index |
@@ -76,10 +76,10 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 
 | Command | Description |
 |---------|-------------|
-| `!honeypot review toggle <bool>` | Toggle moderator review |
+| `!honeypot review toggle <bool>` | Send suspicious messages to moderator review instead of acting immediately |
 | `!honeypot review channel <channel>` | Channel for review requests |
 | `!honeypot review timeout <1-10080>` | Minutes before review expires |
-| `!honeypot review kick_fail_warn <false\|true\|manual>` | Warn handling when a review kick target already left |
+| `!honeypot review kick_fail_warn <false\|true\|manual>` | How to handle a review kick when the target has already left |
 
 ### roles
 
@@ -106,24 +106,24 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 
 | Command | Description |
 |---------|-------------|
-| `!honeypot joinwatch toggle <bool>` | Toggle the joinwatch module |
-| `!honeypot joinwatch alert toggle <bool>` | Toggle joinwatch alert messages |
+| `!honeypot joinwatch toggle <bool>` | Enable or disable the joinwatch module |
+| `!honeypot joinwatch alert toggle <bool>` | Enable or disable joinwatch alert messages |
 | `!honeypot joinwatch channel <channel>` | Channel for join alerts |
 | `!honeypot joinwatch max_age <1-168>` | Max account age in hours to trigger alert |
-| `!honeypot joinwatch autorole toggle <bool>` | Toggle automatic role assignment for young accounts |
+| `!honeypot joinwatch autorole toggle <bool>` | Enable or disable automatic role assignment for young accounts |
 | `!honeypot joinwatch autorole role <role>` | Role to apply to young accounts |
 | `!honeypot joinwatch autorole timer <1-10080>` | Minutes before punishment if the role remains |
-| `!honeypot joinwatch autorole action <none\|kick\|ban>` | Action when the auto role is not removed in time |
+| `!honeypot joinwatch autorole action <none\|kick\|ban>` | Action when the auto-role is not removed in time |
 | `!honeypot joinwatch autorole bantimers` | List active auto-role punishment timers |
-| `!honeypot joinwatch autorole randomize toggle <bool>` | Toggle randomized delay before the auto role is applied |
-| `!honeypot joinwatch autorole randomize min_time <1-10080>` | Minimum minutes before applying the auto role |
-| `!honeypot joinwatch autorole randomize max_time <1-10080>` | Maximum minutes before applying the auto role |
+| `!honeypot joinwatch autorole randomize toggle <bool>` | Enable or disable randomized delay before the auto-role is applied |
+| `!honeypot joinwatch autorole randomize min_time <1-10080>` | Minimum minutes before applying the auto-role |
+| `!honeypot joinwatch autorole randomize max_time <1-10080>` | Maximum minutes before applying the auto-role |
 
 ### bait
 
 | Command | Description |
 |---------|-------------|
-| `!honeypot bait toggle <bool>` | Toggle the bait role trap |
+| `!honeypot bait toggle <bool>` | Enable or disable the bait role trap |
 | `!honeypot bait role <role>` | Set the bait role |
 | `!honeypot bait action <kick\|ban>` | Action to take when users take the bait role |
 
@@ -142,8 +142,8 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot config keywords` | Show keyword and attachment-pattern counts |
 | `!honeypot config joinwatch` | Show joinwatch and joinwatch auto-role settings |
 | `!honeypot config bait` | Show bait role settings |
-| `!honeypot config stats` | Show stored stat and pending object counts |
-| `!honeypot stats` | Show public-safe safety statistics |
+| `!honeypot config stats` | Show stored stats and pending review/timer counts |
+| `!honeypot stats` | Show public-facing stats |
 | `!honeypot modstats` | Show detailed moderator statistics |
 | `!honeypot resetstats` | Reset statistics |
 | `!honeypot doctor` | Check config, channels, and permissions |
@@ -192,18 +192,17 @@ Default attachment patterns: `^image ?\(\d+\)$` (matches `image(1)`, `image (2)`
 1. Message deleted from honeypot channel
 2. Recent messages from that user purged (if enabled)
 3. Mute role applied while review is pending (if configured)
-4. Embed sent to review channel with Kick / Ban / Ignore buttons
+4. Embed sent to review channel with Ban / Kick / Ignore buttons
 5. Attachments copied into the review message
 6. Moderators with `Moderate Members` permission can click buttons
 7. If review expires, mute role is removed and review marked as timed out
 8. Pending reviews survive bot restarts
-9. If kicked/banned, mute role is removed first (prevents role persistence bots from saving it)
+9. If kicked or banned, the mute role is removed first so it does not linger
 
 ## Stats
 
-`stats` is intended to be safe for broader visibility. It shows only a compact
-summary: messages, bans, sent-for-review cases, shadowbans, and automated
-shadowban actions.
+`stats` shows a compact public-facing summary: messages, bans,
+sent-for-review cases, auto-roles applied, and joinwatch auto-role punishments.
 
 `modstats` is the detailed moderator view. `Total detections` counts every
 non-exempt message caught in the honeypot channel. `Suspicious detections`
@@ -212,10 +211,10 @@ rules. `Reviews sent` counts cases sent to moderator review, while `Active
 pending reviews` is the current number of unresolved review messages.
 
 `Applied temporary mutes` and `Failed temporary mutes` are historical counters
-for review containment mutes. They do not mean those users are still muted.
+for temporary review mutes. They do not mean those users are still muted.
 The review mute role may be the same role as joinwatch auto-role. If that user
 has an active joinwatch auto-role timer, review cleanup leaves the role in place
-so it does not accidentally clear the joinwatch hold.
+so it does not clear the joinwatch timer.
 
 `Purged messages` counts extra recent messages removed by the purge step. It
 does not include the original honeypot message, which is deleted separately as
@@ -224,15 +223,15 @@ part of every detection.
 The `Joinwatch` stats section tracks non-bot joins while joinwatch is enabled.
 `Young joins` counts accounts below the configured `joinwatch max_age`
 threshold, and `Young join rate` is `Young joins / Total joins`. Auto-role
-scheduled, clear, and punishment counters are historical. `Scheduled auto roles`
+scheduled, clear, and punishment counters are historical. `Pending role applications`
 is the current number of delayed role applications waiting to run, and
-`Active auto role timers` is the current number of users still waiting for staff
+`Active auto-role timers` is the current number of users still waiting for staff
 action or timeout after the role was applied.
 
 ## Config Dumps
 
-Use `!honeypot config <section>` to inspect current settings without dumping raw
-internal data. Config dumps resolve channels and roles when possible, show
+Use `!honeypot config <section>` to inspect current settings without exposing raw
+IDs or message contents. Config dumps resolve channels and roles when possible, show
 missing IDs when objects were deleted, and summarize pending reviews or
 joinwatch timers by count instead of exposing message contents.
 
@@ -243,8 +242,8 @@ is sent to the joinwatch channel when alerts are enabled. If joinwatch auto-role
 is enabled, the cog also applies the configured role and starts a timer. Auto-role
 can run even when alert messages are disabled.
 
-Randomized auto-role delay can be enabled to avoid applying the shadowban role at
-the exact join moment. When enabled, the cog schedules the role for a random time
+Enable randomized auto-role delay to avoid applying the configured role immediately
+when the user joins. When enabled, the cog schedules the role for a random time
 between `min_time` and `max_time`. The punishment timer starts only after the role
 is actually applied, not when the account joins.
 
@@ -262,7 +261,7 @@ Setup:
 [p]honeypot joinwatch autorole toggle true
 ```
 
-If staff removes the auto role before the timer expires, the timer is cleared and
+If staff removes the auto-role before the timer expires, the timer is cleared and
 no punishment is taken. If the timer expires and the user still has the role, the
 cog applies the configured joinwatch action: `none`, `kick`, or `ban`.
 Changing `joinwatch autorole timer` recalculates active timers immediately. If

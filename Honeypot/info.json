@@ -2,8 +2,8 @@
     "author": ["AAA3A", "opencode-contributor"],
     "name": "Honeypot",
     "install_msg": "Thank you for installing this cog!\nDo `[p]help Honeypot` to get the list of commands and their description.",
-    "short": "Create a honeypot channel to catch self bots/scammers with purge, whitelist roles, fake activity, and mod review.",
-    "description": "Create a honeypot channel at the top of the server to attract self bots/scammers. Features include: configurable punishment (mute/kick/ban), automatic message purge for the last N minutes, whitelisted role exceptions, fake activity simulation to lure scammers, and optional moderator review queue with interactive buttons for manual judgment.",
+    "short": "Create a honeypot channel to catch self-bots and scammers with purge, whitelist roles, fake activity, and mod review.",
+    "description": "Create a honeypot channel at the top of the server to attract self-bots and scammers. Features include: configurable punishment (mute/kick/ban), automatic message purge for the last N minutes, whitelisted role exceptions, fake activity simulation to lure scammers, and optional moderator review queue with interactive buttons for manual judgment.",
     "tags": [
         "channel",
         "bots",

@@ -14,18 +14,18 @@ msgstr ""
 #: honeypot\honeypot.py:151
 #, docstring
 msgid ""
-"Create a channel at the top of the server to attract self bots/scammers and "
+"Create a channel at the top of the server to attract self-bots and scammers and "
 "automatically handle them."
 msgstr ""
 
 # ─── Settings descriptions ────────────────────────────────────────────
 
 #: honeypot\honeypot.py:183
-msgid "Toggle the cog."
+msgid "Enable or disable the cog."
 msgstr ""
 
 #: honeypot\honeypot.py:187
-msgid "The action to take when a self bot/scammer is detected."
+msgid "The action to take when a self-bot or scammer is detected."
 msgstr ""
 
 #: honeypot\honeypot.py:190
@@ -33,11 +33,11 @@ msgid "The channel to send the logs to."
 msgstr ""
 
 #: honeypot\honeypot.py:196
-msgid "The role to ping when a self bot/scammer is detected."
+msgid "The role to ping when a self-bot or scammer is detected."
 msgstr ""
 
 #: honeypot\honeypot.py:200
-msgid "The mute role to assign, if the action is `mute`."
+msgid "The temporary mute role to assign for review containment."
 msgstr ""
 
 #: honeypot\honeypot.py:203
@@ -45,7 +45,7 @@ msgid "Number of days of messages to delete when banning."
 msgstr ""
 
 #: honeypot\honeypot.py:207
-msgid "Toggle purging recent messages from the user in the honeypot channel."
+msgid "Delete recent messages from the user in the honeypot channel."
 msgstr ""
 
 #: honeypot\honeypot.py:210
@@ -53,7 +53,7 @@ msgid "Minutes of message history to purge from the user."
 msgstr ""
 
 #: honeypot\honeypot.py:214
-msgid "Toggle fake activity in the honeypot channel to attract scammers."
+msgid "Simulate activity in the honeypot channel to attract scammers."
 msgstr ""
 
 #: honeypot\honeypot.py:217
@@ -61,7 +61,7 @@ msgid "Minutes between fake activity messages."
 msgstr ""
 
 #: honeypot\honeypot.py:221
-msgid "Toggle moderator review instead of instant action for suspicious messages."
+msgid "Send suspicious messages to moderator review instead of acting immediately."
 msgstr ""
 
 #: honeypot\honeypot.py:224
@@ -79,7 +79,7 @@ msgid "Action taken:"
 msgstr ""
 
 #: honeypot\honeypot.py:78
-msgid "✅ **Review completed**"
+msgid "✅ **Review resolved**"
 msgstr ""
 
 #: honeypot\honeypot.py:84
@@ -125,7 +125,7 @@ msgstr ""
 # ─── on_message listener ──────────────────────────────────────────────
 
 #: honeypot\honeypot.py:360
-msgid "Honeypot — Self Bot/Scammer Detected!"
+msgid "Honeypot — Self-bot/Scammer Detected!"
 msgstr ""
 
 #: honeypot\honeypot.py:361
@@ -208,11 +208,11 @@ msgid "⚠️ DO NOT POST HERE! ⚠️"
 msgstr ""
 
 #: honeypot\honeypot.py:538
-msgid "An action will be immediately taken against you if you send a message in this channel."
+msgid "Sending a message here will trigger the configured action immediately."
 msgstr ""
 
 #: honeypot\honeypot.py:542
-msgid "What not to do?"
+msgid "Do not send messages here."
 msgstr ""
 
 #: honeypot\honeypot.py:543
@@ -220,7 +220,7 @@ msgid "Do not send any messages in this channel."
 msgstr ""
 
 #: honeypot\honeypot.py:547
-msgid "What WILL happen?"
+msgid "What happens if you post here?"
 msgstr ""
 
 #: honeypot\honeypot.py:548
