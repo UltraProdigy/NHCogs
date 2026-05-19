@@ -3046,7 +3046,6 @@ class Honeypot(Cog):
         stats = DEFAULT_STATS.copy()
         stats.update(await self.config.guild(ctx.guild).stats())
         lines = [
-            _("Community safety:"),
             f"  {_('Messages')}: {stats['detections']}",
             f"  {_('Bans')}: {stats['banned']}",
             f"  {_('Sent for Review')}: {stats['reviewed']}",
