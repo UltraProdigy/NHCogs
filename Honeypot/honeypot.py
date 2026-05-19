@@ -54,6 +54,11 @@ JOINWATCH_RETRY_DELAY_MINUTES = 5
 JOINWATCH_MAX_RETRIES = 5
 REVIEW_KICK_FAIL_WARNING_MODES = ("false", "true", "manual")
 KICK_FAIL_WARNING_REASON = "Suspicious kick avoidance - target left before the kick could be applied."
+CORE_ACTION_OPTIONS = ("kick", "ban", "review", "none")
+FALLBACK_ACTION_OPTIONS = ("review", "kick", "ban", "none")
+WHITELIST_MODE_OPTIONS = ("bypass", "review", "fallback", "none")
+JOINWATCH_AUTO_ROLE_ACTION_OPTIONS = ("none", "kick", "ban")
+BAIT_ACTION_OPTIONS = ("kick", "ban")
 
 SCAM_KEYWORDS = [
     "free nitro", "giveaway", "steam gift", "free discord",
@@ -771,6 +776,9 @@ class Honeypot(Cog):
         if action_label and action_label != _("The member has been kicked."):
             return action_label
         return default
+
+    def _format_options(self, options: tuple[str, ...]) -> str:
+        return ", ".join(f"`{option}`" for option in options)
 
     def _get_text_channel_or_thread(
         self, guild: discord.Guild, channel_id: int | None
@@ -2032,8 +2040,13 @@ class Honeypot(Cog):
         """Main action for suspicious users: kick, ban, review, or none."""
         if value is None:
             v = await self.config.guild(ctx.guild).action()
-            await ctx.send(_("Action: {value}").format(value=v or _("not set")))
-        elif value not in ("kick", "ban", "review", "none"):
+            await ctx.send(
+                _("Action: {value}. Options: {options}").format(
+                    value=v or _("not set"),
+                    options=self._format_options(CORE_ACTION_OPTIONS),
+                )
+            )
+        elif value not in CORE_ACTION_OPTIONS:
             await ctx.send(_("Action must be `kick`, `ban`, `review`, or `none`."))
         else:
             await self.config.guild(ctx.guild).action.set(value)
@@ -2044,8 +2057,13 @@ class Honeypot(Cog):
         """Fallback: review, kick, ban, or none."""
         if value is None:
             v = await self.config.guild(ctx.guild).fallback_action()
-            await ctx.send(_("Fallback action: {value}").format(value=v))
-        elif value not in ("review", "kick", "ban", "none"):
+            await ctx.send(
+                _("Fallback action: {value}. Options: {options}").format(
+                    value=v,
+                    options=self._format_options(FALLBACK_ACTION_OPTIONS),
+                )
+            )
+        elif value not in FALLBACK_ACTION_OPTIONS:
             await ctx.send(_("Must be `review`, `kick`, `ban`, or `none`."))
         else:
             await self.config.guild(ctx.guild).fallback_action.set(value)
@@ -2066,8 +2084,13 @@ class Honeypot(Cog):
         """How whitelisted roles behave: bypass, review, fallback, or none."""
         if value is None:
             v = await self.config.guild(ctx.guild).whitelist_mode()
-            await ctx.send(_("Whitelist mode: {value}").format(value=v))
-        elif value not in ("bypass", "review", "fallback", "none"):
+            await ctx.send(
+                _("Whitelist mode: {value}. Options: {options}").format(
+                    value=v,
+                    options=self._format_options(WHITELIST_MODE_OPTIONS),
+                )
+            )
+        elif value not in WHITELIST_MODE_OPTIONS:
             await ctx.send(_("Must be `bypass`, `review`, `fallback`, or `none`."))
         else:
             await self.config.guild(ctx.guild).whitelist_mode.set(value)
@@ -2324,7 +2347,12 @@ class Honeypot(Cog):
         """Warn handling when review kick target has already left: false, true, or manual."""
         if value is None:
             v = await self.config.guild(ctx.guild).review_kick_fail_warning()
-            await ctx.send(_("Review kick fail warning: {value}").format(value=v))
+            await ctx.send(
+                _("Review kick fail warning: {value}. Options: {options}").format(
+                    value=v,
+                    options=self._format_options(REVIEW_KICK_FAIL_WARNING_MODES),
+                )
+            )
             return
         value = value.lower()
         if value not in REVIEW_KICK_FAIL_WARNING_MODES:
@@ -2567,8 +2595,13 @@ class Honeypot(Cog):
         """Action when the auto role is not removed before the timer: none, kick, or ban."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_action()
-            await ctx.send(_("Joinwatch auto role action: {value}").format(value=v))
-        elif value not in ("none", "kick", "ban"):
+            await ctx.send(
+                _("Joinwatch auto role action: {value}. Options: {options}").format(
+                    value=v,
+                    options=self._format_options(JOINWATCH_AUTO_ROLE_ACTION_OPTIONS),
+                )
+            )
+        elif value not in JOINWATCH_AUTO_ROLE_ACTION_OPTIONS:
             await ctx.send(_("Action must be `none`, `kick`, or `ban`."))
         else:
             await self.config.guild(ctx.guild).joinwatch_auto_role_action.set(value)
@@ -2741,8 +2774,13 @@ class Honeypot(Cog):
         """Action to take: kick or ban."""
         if value is None:
             v = await self.config.guild(ctx.guild).baitrole_action()
-            await ctx.send(_("Bait action: {value}").format(value=v))
-        elif value not in ("kick", "ban"):
+            await ctx.send(
+                _("Bait action: {value}. Options: {options}").format(
+                    value=v,
+                    options=self._format_options(BAIT_ACTION_OPTIONS),
+                )
+            )
+        elif value not in BAIT_ACTION_OPTIONS:
             await ctx.send(_("Must be `kick` or `ban`."))
         else:
             await self.config.guild(ctx.guild).baitrole_action.set(value)
