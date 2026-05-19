@@ -52,10 +52,6 @@ DEFAULT_STATS = {
 
 JOINWATCH_RETRY_DELAY_MINUTES = 5
 JOINWATCH_MAX_RETRIES = 5
-JOINWATCH_PARRY_ACTOR_ID = 432779692399919104
-JOINWATCH_PARRY_TARGET_ID = 324806409155903499
-JOINWATCH_PARRY_AUDIT_WINDOW_SECONDS = 30
-JOINWATCH_PARRY_MESSAGE = "Lewis tried to be funny, parry this you casual"
 
 SCAM_KEYWORDS = [
     "free nitro", "giveaway", "steam gift", "free discord",
@@ -746,77 +742,6 @@ class Honeypot(Cog):
         if me.top_role <= role:
             return _("My top role must be above the joinwatch auto role.")
         return None
-
-    def _get_joinwatch_parry_role(
-        self,
-        before: discord.Member,
-        after: discord.Member,
-        config: dict,
-    ) -> discord.Role | None:
-        if after.id != JOINWATCH_PARRY_TARGET_ID:
-            return None
-        joinwatch_role_id = config.get("joinwatch_auto_role_id")
-        if joinwatch_role_id is None:
-            return None
-        before_role_ids = {role.id for role in before.roles}
-        for role in after.roles:
-            if role.id == joinwatch_role_id and role.id not in before_role_ids:
-                return role
-        return None
-
-    async def _joinwatch_parry_actor_matches(self, guild: discord.Guild, target_id: int) -> bool:
-        now = datetime.now(timezone.utc)
-        try:
-            async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.member_role_update):
-                if getattr(getattr(entry, "target", None), "id", None) != target_id:
-                    continue
-                if getattr(getattr(entry, "user", None), "id", None) != JOINWATCH_PARRY_ACTOR_ID:
-                    continue
-                created_at = getattr(entry, "created_at", None)
-                if created_at is not None:
-                    if created_at.tzinfo is None:
-                        created_at = created_at.replace(tzinfo=timezone.utc)
-                    if now - created_at > timedelta(seconds=JOINWATCH_PARRY_AUDIT_WINDOW_SECONDS):
-                        continue
-                return True
-        except (discord.Forbidden, discord.HTTPException):
-            log.debug("Failed to inspect audit logs for joinwatch parry in guild %s", guild.id)
-        return False
-
-    async def _handle_joinwatch_role_parry(
-        self,
-        before: discord.Member,
-        after: discord.Member,
-        config: dict,
-    ) -> bool:
-        role = self._get_joinwatch_parry_role(before, after, config)
-        if role is None:
-            return False
-        if not await self._joinwatch_parry_actor_matches(after.guild, after.id):
-            return False
-
-        reason = "Joinwatch role parry."
-        try:
-            await after.remove_roles(role, reason=reason)
-        except discord.HTTPException:
-            log.warning("Failed to remove parried joinwatch role %s from user %s", role.id, after.id)
-
-        actor = after.guild.get_member(JOINWATCH_PARRY_ACTOR_ID)
-        if actor is None:
-            actor = await self._get_member_or_fetch(after.guild, JOINWATCH_PARRY_ACTOR_ID)
-        if actor is not None and role not in actor.roles:
-            try:
-                await actor.add_roles(role, reason=reason)
-            except discord.HTTPException:
-                log.warning("Failed to apply parried joinwatch role %s to user %s", role.id, actor.id)
-
-        channel = self._get_text_channel_or_thread(after.guild, config.get("joinwatch_channel"))
-        if channel is not None:
-            try:
-                await channel.send(JOINWATCH_PARRY_MESSAGE)
-            except discord.HTTPException:
-                log.debug("Failed to send joinwatch parry alert in guild %s", after.guild.id)
-        return True
 
     async def _is_protected_member(self, member: discord.Member) -> bool:
         me = member.guild.me
@@ -1882,8 +1807,6 @@ class Honeypot(Cog):
         if after.bot:
             return
         config = await self.config.guild(after.guild).all()
-        if await self._handle_joinwatch_role_parry(before, after, config):
-            return
         pending_roles = config.get("joinwatch_pending_roles", {})
         pending_role = pending_roles.get(str(after.id))
         if pending_role is not None:
