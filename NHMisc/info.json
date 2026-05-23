@@ -1,0 +1,23 @@
+{
+  "author": [
+    "Pxx500"
+  ],
+  "name": "NHMisc",
+  "install_msg": "Thank you for installing this cog.\nDo `[p]help NHMisc` to get the list of commands and their description.",
+  "short": "Miscellaneous small utilities for Red-DiscordBot.",
+  "description": "A placeholder cog intended for miscellaneous small bot functionality.",
+  "tags": [
+    "misc",
+    "utility",
+    "redbot"
+  ],
+  "requirements": [],
+  "min_bot_version": "3.5.0",
+  "min_python_version": [
+    3,
+    10,
+    0
+  ],
+  "end_user_data_statement": "This cog does not persistently store data or metadata about users."
+}
+
