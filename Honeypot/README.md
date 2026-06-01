@@ -202,7 +202,7 @@ Default attachment patterns: `^image ?\(\d+\)$` (matches `image(1)`, `image (2)`
 ## Stats
 
 `stats` shows a compact public-facing summary: messages, bans,
-sent-for-review cases, auto-roles applied, and joinwatch auto-role punishments.
+sent-for-review cases, auto-roles applied, and auto role punishments.
 
 `modstats` is the detailed moderator view. `Total detections` counts every
 non-exempt message caught in the honeypot channel. `Suspicious detections`

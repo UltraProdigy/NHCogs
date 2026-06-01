@@ -3107,7 +3107,7 @@ class Honeypot(Cog):
             f"  {_('Bans')}: {stats['banned']}",
             f"  {_('Sent for Review')}: {stats['reviewed']}",
             f"  {_('Auto roles applied')}: {stats['joinwatch_auto_roles']}",
-            f"  {_('Joinwatch auto-role punishments')}: {stats['joinwatch_auto_role_punishments']}",
+            f"  {_('Auto role punishments')}: {stats['joinwatch_auto_role_punishments']}",
         ]
         await ctx.send(_("**Server safety stats:**\n") + box("\n".join(lines)))
 
