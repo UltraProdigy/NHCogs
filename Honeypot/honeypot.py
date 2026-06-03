@@ -52,6 +52,11 @@ DEFAULT_STATS = {
 
 JOINWATCH_RETRY_DELAY_MINUTES = 5
 JOINWATCH_MAX_RETRIES = 5
+POST_BAN_SWEEP_DELAY_SECONDS = 5
+POST_BAN_SWEEP_LOOKBACK_MINUTES = 15
+POST_BAN_SWEEP_PER_CHANNEL_LIMIT = 10
+# Guild-wide bulk delete is ~1 request/s; pause after a channel actually deletes messages.
+POST_BAN_SWEEP_CHANNEL_COOLDOWN_SECONDS = 1.0
 REVIEW_KICK_FAIL_WARNING_MODES = ("false", "true", "manual")
 KICK_FAIL_WARNING_REASON = "Suspicious activity: target left before the kick could be applied."
 CORE_ACTION_OPTIONS = ("kick", "ban", "review", "none")
@@ -263,7 +268,12 @@ class ReviewView(discord.ui.View):
                 return (None, _("Kicked"))
             elif action == "ban":
                 target = member if member is not None else await self.cog._get_user_or_object(self.target_id)
-                await guild.ban(target, reason=reason, delete_message_days=config.get("ban_delete_message_days", 0))
+                await guild.ban(
+                    target,
+                    reason=reason,
+                    delete_message_seconds=self.cog._ban_delete_message_seconds(config),
+                )
+                self.cog._schedule_post_ban_sweep_if_enabled(guild, target.id, config)
                 await self._create_modlog_case(guild, target, action, reason, interaction.user)
                 await self.cog._increment_stat(guild, "banned")
                 return (None, _("Banned"))
@@ -849,6 +859,13 @@ class Honeypot(Cog):
             return _("Dry run: I would kick this member.")
         return _("Dry run: I would not take action.")
 
+    @staticmethod
+    def _ban_delete_message_seconds(config: dict) -> int:
+        days = int(config.get("ban_delete_message_days", 0) or 0)
+        if days <= 0:
+            return 0
+        return min(days, 7) * 86400
+
     def _missing_action_permission(self, guild: discord.Guild, action: str) -> str | None:
         me = guild.me
         if me is None:
@@ -1166,13 +1183,35 @@ class Honeypot(Cog):
             reasons.append(_("Matched attachment rules: {patterns}").format(patterns=", ".join(matched_patterns[:3])))
         return reasons
 
+    def _iter_message_channels(
+        self, guild: discord.Guild
+    ) -> typing.Iterator[discord.TextChannel | discord.Thread]:
+        me = guild.me
+        if me is None:
+            return
+        for channel in guild.channels:
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            perms = channel.permissions_for(me)
+            if perms.read_message_history and perms.manage_messages:
+                yield channel
+        for thread in guild.threads:
+            perms = thread.permissions_for(me)
+            if perms.read_message_history and perms.manage_messages:
+                yield thread
+
     async def _purge_user_messages(
-        self, channel: discord.TextChannel | discord.Thread, author_id: int, minutes: int
+        self,
+        channel: discord.TextChannel | discord.Thread,
+        author_id: int,
+        minutes: int,
+        *,
+        limit: int = 200,
     ) -> int:
         after = datetime.now(timezone.utc) - timedelta(minutes=minutes)
         try:
             deleted = await channel.purge(
-                limit=200,
+                limit=limit,
                 after=after,
                 check=lambda m: m.author.id == author_id,
                 bulk=True,
@@ -1180,6 +1219,51 @@ class Honeypot(Cog):
             return len(deleted)
         except (discord.HTTPException, discord.Forbidden):
             return 0
+
+    async def _sweep_user_messages_guild(
+        self, guild: discord.Guild, user_id: int, minutes: int
+    ) -> int:
+        total = 0
+        for channel in self._iter_message_channels(guild):
+            deleted = await self._purge_user_messages(
+                channel,
+                user_id,
+                minutes,
+                limit=POST_BAN_SWEEP_PER_CHANNEL_LIMIT,
+            )
+            total += deleted
+            if deleted > 0:
+                await asyncio.sleep(POST_BAN_SWEEP_CHANNEL_COOLDOWN_SECONDS)
+        return total
+
+    def _schedule_post_ban_sweep_if_enabled(
+        self, guild: discord.Guild, user_id: int, config: dict
+    ) -> None:
+        """After ban: wait, then purge this user's recent messages on accessible channels."""
+        if config.get("ban_delete_message_days", 0) <= 0:
+            return
+        self.bot.loop.create_task(
+            self._post_ban_message_sweep(guild.id, user_id),
+            name=f"honeypot-post-ban-sweep-{guild.id}-{user_id}",
+        )
+
+    async def _post_ban_message_sweep(self, guild_id: int, user_id: int) -> None:
+        try:
+            await asyncio.sleep(POST_BAN_SWEEP_DELAY_SECONDS)
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                return
+            deleted = await self._sweep_user_messages_guild(
+                guild, user_id, POST_BAN_SWEEP_LOOKBACK_MINUTES
+            )
+            if deleted:
+                await self._increment_stat(guild, "purged_messages", deleted)
+        except Exception:
+            log.exception(
+                "Post-ban message sweep failed for user %s in guild %s",
+                user_id,
+                guild_id,
+            )
 
     async def _execute_action(
         self, message: discord.Message, config: dict, reason: str, action: str | None = None
@@ -1209,7 +1293,10 @@ class Honeypot(Cog):
             elif action == "ban":
                 await message.author.ban(
                     reason=reason,
-                    delete_message_days=config["ban_delete_message_days"],
+                    delete_message_seconds=self._ban_delete_message_seconds(config),
+                )
+                self._schedule_post_ban_sweep_if_enabled(
+                    message.guild, message.author.id, config
                 )
                 await self._increment_stat(message.guild, "banned")
         except discord.HTTPException as e:
@@ -1550,8 +1637,9 @@ class Honeypot(Cog):
                 await guild.ban(
                     target,
                     reason=reason,
-                    delete_message_days=config.get("ban_delete_message_days", 0),
+                    delete_message_seconds=self._ban_delete_message_seconds(config),
                 )
+                self._schedule_post_ban_sweep_if_enabled(guild, target.id, config)
             await self._increment_stat(guild, "joinwatch_auto_role_punishments")
         except discord.HTTPException as exc:
             await self._increment_stat(guild, "failed_actions")
@@ -1989,7 +2077,13 @@ class Honeypot(Cog):
             reason = "Took the bait role - potential DM bot/scammer."
             try:
                 if action == "ban":
-                    await after.ban(reason=reason)
+                    await after.ban(
+                        reason=reason,
+                        delete_message_seconds=self._ban_delete_message_seconds(config),
+                    )
+                    self._schedule_post_ban_sweep_if_enabled(
+                        after.guild, after.id, config
+                    )
                     await self._increment_stat(after.guild, "banned")
                 elif action == "kick":
                     await after.kick(reason=reason)
