@@ -28,6 +28,7 @@ class NHMisc(commands.Cog):
         )
         self.config.register_guild(
             voice_log_channel=None,
+            alert_channel=None,
             rapid_channel_count=DEFAULT_RAPID_CHANNEL_COUNT,
             rapid_window_seconds=DEFAULT_RAPID_WINDOW_SECONDS,
         )
@@ -49,6 +50,23 @@ class NHMisc(commands.Cog):
 
         await self.config.guild(ctx.guild).voice_log_channel.set(channel.id)
         await ctx.send(f"Voice log channel set to {channel.mention}.")
+
+    @voicelog.group(name="alert", invoke_without_command=True)
+    async def voicelog_alert(self, ctx: commands.Context) -> None:
+        """Configure alert logging."""
+        await ctx.send_help()
+
+    @voicelog_alert.command(name="channel")
+    async def voicelog_alert_channel(
+        self, ctx: commands.Context, channel: discord.TextChannel
+    ) -> None:
+        """Set the text channel used for alert logs."""
+        missing_permissions = self._missing_log_permissions(ctx.guild, channel)
+        if missing_permissions is not None:
+            raise commands.UserFeedbackCheckFailure(missing_permissions)
+
+        await self.config.guild(ctx.guild).alert_channel.set(channel.id)
+        await ctx.send(f"Alert channel set to {channel.mention}.")
 
     @voicelog.group(name="rapid", invoke_without_command=True)
     async def voicelog_rapid(self, ctx: commands.Context) -> None:
@@ -78,11 +96,15 @@ class NHMisc(commands.Cog):
         """Show the current voice log configuration."""
         config = await self.config.guild(ctx.guild).all()
         channel = self._get_log_channel(ctx.guild, config["voice_log_channel"])
+        alert_channel = self._get_log_channel(ctx.guild, config["alert_channel"])
         channel_label = channel.mention if channel is not None else "not set"
+        alert_channel_label = alert_channel.mention if alert_channel is not None else "not set"
         await ctx.send(
             "Voice log channel: {channel}\n"
+            "Alert channel: {alert_channel}\n"
             "Rapid switching: {count} different channels in {seconds} seconds.".format(
                 channel=channel_label,
+                alert_channel=alert_channel_label,
                 count=config["rapid_channel_count"],
                 seconds=config["rapid_window_seconds"],
             )
@@ -102,27 +124,26 @@ class NHMisc(commands.Cog):
         guild = member.guild
         config = await self.config.guild(guild).all()
         log_channel = self._get_log_channel(guild, config["voice_log_channel"])
-        if log_channel is None:
-            return
 
-        if before.channel is None and after.channel is not None:
-            await self._send_voice_log(
-                log_channel,
-                f"{member.mention} has joined a channel {after.channel.mention}",
-            )
-        elif before.channel is not None and after.channel is None:
-            await self._send_voice_log(
-                log_channel,
-                f"{member.mention} has left a channel {before.channel.mention}",
-            )
-        elif before.channel is not None and after.channel is not None:
-            await self._send_voice_log(
-                log_channel,
-                (
-                    f"{member.mention} has moved from {before.channel.mention} "
-                    f"to {after.channel.mention}"
-                ),
-            )
+        if log_channel is not None:
+            if before.channel is None and after.channel is not None:
+                await self._send_voice_log(
+                    log_channel,
+                    f"{member.mention} has joined a channel {after.channel.mention}",
+                )
+            elif before.channel is not None and after.channel is None:
+                await self._send_voice_log(
+                    log_channel,
+                    f"{member.mention} has left a channel {before.channel.mention}",
+                )
+            elif before.channel is not None and after.channel is not None:
+                await self._send_voice_log(
+                    log_channel,
+                    (
+                        f"{member.mention} has moved from {before.channel.mention} "
+                        f"to {after.channel.mention}"
+                    ),
+                )
 
         if after.channel is None:
             return
@@ -135,8 +156,12 @@ class NHMisc(commands.Cog):
             window_seconds=config["rapid_window_seconds"],
         )
         if is_rapid_switching:
+            alert_channel = self._get_log_channel(guild, config["alert_channel"])
+            if alert_channel is None:
+                return
+
             await self._send_voice_log(
-                log_channel,
+                alert_channel,
                 (
                     f"{member.mention} is rapidly changing channels "
                     f"({config['rapid_channel_count']} different channels in "

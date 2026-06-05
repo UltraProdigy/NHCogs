@@ -16,14 +16,16 @@ NHMisc is a Red-DiscordBot cog reserved for miscellaneous small bot functionalit
 
 ```ini
 [p]voicelog channel #logs
+[p]voicelog alert channel #alerts
 [p]voicelog rapid channels 3
 [p]voicelog rapid seconds 30
 [p]voicelog status
 ```
 
 Voice logs send a message to the configured log channel whenever a user joins, leaves, or
-moves between voice channels. Rapid switching is logged when a user visits the configured
-number of different voice channels within the configured time window.
+moves between voice channels. Alerts use the configured alert channel. Rapid switching
+alerts trigger when a user visits the configured number of different voice channels within
+the configured time window.
 
 Defaults:
 
