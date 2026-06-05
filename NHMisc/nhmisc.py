@@ -11,8 +11,8 @@ from .voice_activity import VoiceChannelVisitTracker
 
 log = logging.getLogger("red.NHMisc")
 
-DEFAULT_RAPID_CHANNEL_COUNT = 3
-DEFAULT_RAPID_WINDOW_SECONDS = 30
+DEFAULT_VCJUMPING_VISIT_COUNT = 3
+DEFAULT_VCJUMPING_WINDOW_SECONDS = 30
 
 
 class NHMisc(commands.Cog):
@@ -29,20 +29,20 @@ class NHMisc(commands.Cog):
         self.config.register_guild(
             voice_log_channel=None,
             alert_channel=None,
-            rapid_channel_count=DEFAULT_RAPID_CHANNEL_COUNT,
-            rapid_window_seconds=DEFAULT_RAPID_WINDOW_SECONDS,
+            vcjumping_visit_count=DEFAULT_VCJUMPING_VISIT_COUNT,
+            vcjumping_window_seconds=DEFAULT_VCJUMPING_WINDOW_SECONDS,
         )
         self._voice_visits = VoiceChannelVisitTracker()
 
-    @commands.group(name="voicelog", invoke_without_command=True)
+    @commands.group(name="nhmisc", invoke_without_command=True)
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
-    async def voicelog(self, ctx: commands.Context) -> None:
-        """Configure voice channel event logging."""
+    async def nhmisc(self, ctx: commands.Context) -> None:
+        """Configure NHMisc."""
         await ctx.send_help()
 
-    @voicelog.command(name="channel")
-    async def voicelog_channel(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
+    @nhmisc.command(name="channel")
+    async def nhmisc_channel(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
         """Set the text channel used for voice event logs."""
         missing_permissions = self._missing_log_permissions(ctx.guild, channel)
         if missing_permissions is not None:
@@ -51,13 +51,13 @@ class NHMisc(commands.Cog):
         await self.config.guild(ctx.guild).voice_log_channel.set(channel.id)
         await ctx.send(f"Voice log channel set to {channel.mention}.")
 
-    @voicelog.group(name="alert", invoke_without_command=True)
-    async def voicelog_alert(self, ctx: commands.Context) -> None:
+    @nhmisc.group(name="alert", invoke_without_command=True)
+    async def nhmisc_alert(self, ctx: commands.Context) -> None:
         """Configure alert logging."""
         await ctx.send_help()
 
-    @voicelog_alert.command(name="channel")
-    async def voicelog_alert_channel(
+    @nhmisc_alert.command(name="channel")
+    async def nhmisc_alert_channel(
         self, ctx: commands.Context, channel: discord.TextChannel
     ) -> None:
         """Set the text channel used for alert logs."""
@@ -68,31 +68,31 @@ class NHMisc(commands.Cog):
         await self.config.guild(ctx.guild).alert_channel.set(channel.id)
         await ctx.send(f"Alert channel set to {channel.mention}.")
 
-    @voicelog.group(name="rapid", invoke_without_command=True)
-    async def voicelog_rapid(self, ctx: commands.Context) -> None:
-        """Configure rapid voice channel switching detection."""
+    @nhmisc.group(name="vcjumping", invoke_without_command=True)
+    async def nhmisc_vcjumping(self, ctx: commands.Context) -> None:
+        """Configure voice channel jumping detection."""
         await ctx.send_help()
 
-    @voicelog_rapid.command(name="channels")
-    async def voicelog_rapid_channels(self, ctx: commands.Context, count: int) -> None:
-        """Set how many distinct voice channels trigger rapid-switch logging."""
+    @nhmisc_vcjumping.command(name="visits", aliases=["channels"])
+    async def nhmisc_vcjumping_visits(self, ctx: commands.Context, count: int) -> None:
+        """Set how many voice channel entries trigger VC jumping alerts."""
         if count < 2:
-            raise commands.UserFeedbackCheckFailure("Rapid channel count must be at least 2.")
+            raise commands.UserFeedbackCheckFailure("VC jumping visit count must be at least 2.")
 
-        await self.config.guild(ctx.guild).rapid_channel_count.set(count)
-        await ctx.send(f"Rapid voice switching will trigger after {count} different channels.")
+        await self.config.guild(ctx.guild).vcjumping_visit_count.set(count)
+        await ctx.send(f"VC jumping alerts will trigger after {count} channel entries.")
 
-    @voicelog_rapid.command(name="seconds")
-    async def voicelog_rapid_seconds(self, ctx: commands.Context, seconds: int) -> None:
-        """Set the rapid-switch detection time window in seconds."""
+    @nhmisc_vcjumping.command(name="seconds")
+    async def nhmisc_vcjumping_seconds(self, ctx: commands.Context, seconds: int) -> None:
+        """Set the VC jumping detection time window in seconds."""
         if seconds < 1:
-            raise commands.UserFeedbackCheckFailure("Rapid switching window must be at least 1 second.")
+            raise commands.UserFeedbackCheckFailure("VC jumping window must be at least 1 second.")
 
-        await self.config.guild(ctx.guild).rapid_window_seconds.set(seconds)
-        await ctx.send(f"Rapid voice switching window set to {seconds} seconds.")
+        await self.config.guild(ctx.guild).vcjumping_window_seconds.set(seconds)
+        await ctx.send(f"VC jumping window set to {seconds} seconds.")
 
-    @voicelog.command(name="status")
-    async def voicelog_status(self, ctx: commands.Context) -> None:
+    @nhmisc.command(name="status")
+    async def nhmisc_status(self, ctx: commands.Context) -> None:
         """Show the current voice log configuration."""
         config = await self.config.guild(ctx.guild).all()
         channel = self._get_log_channel(ctx.guild, config["voice_log_channel"])
@@ -102,11 +102,11 @@ class NHMisc(commands.Cog):
         await ctx.send(
             "Voice log channel: {channel}\n"
             "Alert channel: {alert_channel}\n"
-            "Rapid switching: {count} different channels in {seconds} seconds.".format(
+            "VC jumping: {count} channel entries in {seconds} seconds.".format(
                 channel=channel_label,
                 alert_channel=alert_channel_label,
-                count=config["rapid_channel_count"],
-                seconds=config["rapid_window_seconds"],
+                count=config["vcjumping_visit_count"],
+                seconds=config["vcjumping_window_seconds"],
             )
         )
 
@@ -117,7 +117,7 @@ class NHMisc(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        """Log voice channel joins, leaves, moves, and rapid channel switching."""
+        """Log voice channel joins, leaves, moves, and VC jumping."""
         if before.channel == after.channel:
             return
 
@@ -129,7 +129,10 @@ class NHMisc(commands.Cog):
             if before.channel is None and after.channel is not None:
                 await self._send_voice_log(
                     log_channel,
-                    f"{member.mention} has joined a channel {after.channel.mention}",
+                    (
+                        f"{member.mention} ({member.id}) has joined a channel "
+                        f"{after.channel.mention} at <t:{int(time.time())}:F>"
+                    ),
                 )
             elif before.channel is not None and after.channel is None:
                 await self._send_voice_log(
@@ -148,14 +151,14 @@ class NHMisc(commands.Cog):
         if after.channel is None:
             return
 
-        is_rapid_switching = self._voice_visits.record_visit(
+        is_vcjumping = self._voice_visits.record_visit(
             (guild.id, member.id),
             after.channel.id,
             timestamp=time.monotonic(),
-            channel_count=config["rapid_channel_count"],
-            window_seconds=config["rapid_window_seconds"],
+            visit_count=config["vcjumping_visit_count"],
+            window_seconds=config["vcjumping_window_seconds"],
         )
-        if is_rapid_switching:
+        if is_vcjumping:
             alert_channel = self._get_log_channel(guild, config["alert_channel"])
             if alert_channel is None:
                 return
@@ -163,9 +166,9 @@ class NHMisc(commands.Cog):
             await self._send_voice_log(
                 alert_channel,
                 (
-                    f"{member.mention} is rapidly changing channels "
-                    f"({config['rapid_channel_count']} different channels in "
-                    f"{config['rapid_window_seconds']} seconds)."
+                    f"{member.mention} is VC jumping "
+                    f"({config['vcjumping_visit_count']} channel entries in "
+                    f"{config['vcjumping_window_seconds']} seconds)."
                 ),
             )
 
