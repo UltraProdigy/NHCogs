@@ -432,7 +432,6 @@ class Honeypot(Cog):
         )
 
         self._last_fake_message: dict[int, datetime] = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
-        self._fake_config_cache: dict[int, tuple[datetime, dict]] = {}
         self._active_views: dict[int, ReviewView] = {}
         self._views_lock: asyncio.Lock = asyncio.Lock()
         self._restore_task: asyncio.Task | None = None
@@ -1033,12 +1032,7 @@ class Honeypot(Cog):
         now = datetime.now(timezone.utc)
         for guild in self.bot.guilds:
             try:
-                cached = self._fake_config_cache.get(guild.id)
-                if cached and (now - cached[0]).total_seconds() < 120:
-                    config = cached[1]
-                else:
-                    config = await self.config.guild(guild).all()
-                    self._fake_config_cache[guild.id] = (now, config)
+                config = await self.config.guild(guild).all()
                 if not config["enabled"] or not config["fake_activity_enabled"]:
                     continue
                 honeypot_channels = [
@@ -1352,7 +1346,7 @@ class Honeypot(Cog):
         config: dict,
         embed: discord.Embed,
         review_channel: discord.TextChannel | discord.Thread,
-        logs_channel: discord.TextChannel | discord.Thread,
+        logs_channel: discord.TextChannel | discord.Thread | None,
         attachment_snapshots: list[dict[str, typing.Any]],
     ) -> None:
         embed.color = discord.Color.gold()
@@ -1419,30 +1413,40 @@ class Honeypot(Cog):
             self._active_views[sent.id] = view
         await self._store_pending_review(message.guild, view, review_channel.id, sent.id)
         await self._increment_stat(message.guild, "reviewed")
-        await logs_channel.send(
-            _("Queued for review: {user} ({user_id}) in {channel}.").format(
-                user=message.author.mention,
-                user_id=message.author.id,
-                channel=review_channel.mention,
-            ),
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        if logs_channel is not None:
+            try:
+                await logs_channel.send(
+                    _("Queued for review: {user} ({user_id}) in {channel}.").format(
+                        user=message.author.mention,
+                        user_id=message.author.id,
+                        channel=review_channel.mention,
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                log.debug("Failed to send queued review log in guild %s", message.guild.id)
 
     async def _send_log(
         self,
-        channel: discord.TextChannel | discord.Thread,
+        channel: discord.TextChannel | discord.Thread | None,
         embed: discord.Embed,
         attachment_snapshots: list[dict[str, typing.Any]],
         content: str | None = None,
         allowed_mentions: discord.AllowedMentions | None = None,
     ) -> None:
+        if channel is None:
+            return
         send_kwargs: dict[str, typing.Any] = {"content": content, "embed": embed}
         if allowed_mentions is not None:
             send_kwargs["allowed_mentions"] = allowed_mentions
         files = self._attachment_files(attachment_snapshots)
         if files:
             send_kwargs["files"] = files
-        await channel.send(**send_kwargs)
+        try:
+            await channel.send(**send_kwargs)
+        except discord.HTTPException:
+            guild_id = channel.guild.id if isinstance(channel, discord.TextChannel) else channel.guild.id
+            log.debug("Failed to send honeypot log in guild %s", guild_id)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -1452,19 +1456,13 @@ class Honeypot(Cog):
             return
         if message.author.bot:
             return
-        honeypot_channel_ids = await self.config.guild(message.guild).honeypot_channels()
-        legacy_honeypot_channel_id = await self.config.guild(message.guild).honeypot_channel()
-        configured_honeypot_channel_ids = self._honeypot_channel_ids_from_config(
-            {
-                "honeypot_channels": honeypot_channel_ids,
-                "honeypot_channel": legacy_honeypot_channel_id,
-            }
-        )
+        config = await self.config.guild(message.guild).all()
+        configured_honeypot_channel_ids = self._honeypot_channel_ids_from_config(config)
         if message.channel.id not in configured_honeypot_channel_ids:
             return
-        config = await self.config.guild(message.guild).all()
-        if not config["enabled"] or (logs_channel_id := config["logs_channel"]) is None or (logs_channel := self._get_text_channel_or_thread(message.guild, logs_channel_id)) is None:
+        if not config["enabled"]:
             return
+        logs_channel = self._get_text_channel_or_thread(message.guild, config.get("logs_channel"))
         if await self._is_protected_member(message.author):
             return
 
@@ -2489,6 +2487,11 @@ class Honeypot(Cog):
     @fakeactivity.command(name="add")
     async def fakeactivity_add(self, ctx: commands.Context, *, message: str) -> None:
         """Add a custom fake activity message."""
+        message = message.strip()
+        if not message:
+            raise commands.UserFeedbackCheckFailure(_("Fake activity message cannot be empty."))
+        if len(message) > 2000:
+            raise commands.UserFeedbackCheckFailure(_("Fake activity message must be 2000 characters or fewer."))
         async with self.config.guild(ctx.guild).fake_activity_messages() as msgs:
             msgs.append(message)
         await ctx.send(_("✅ Message added. ({num} total)").format(num=len(msgs)))
@@ -3222,7 +3225,7 @@ class Honeypot(Cog):
             _("Honeypot config summary"),
             [
                 (_("Core"), self._format_bool_setting(config.get("enabled", False))),
-                (_("Honeypot channel"), self._format_channel_setting(ctx.guild, config.get("honeypot_channel"))),
+                (_("Honeypot channels"), self._format_honeypot_channel_list(ctx.guild, self._honeypot_channel_ids_from_config(config))),
                 (_("Logs channel"), self._format_channel_setting(ctx.guild, config.get("logs_channel"))),
                 (_("Review"), self._format_bool_setting(config.get("review_enabled", False))),
                 (_("Joinwatch"), self._format_bool_setting(config.get("joinwatch_enabled", False))),
