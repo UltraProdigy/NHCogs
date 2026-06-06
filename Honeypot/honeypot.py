@@ -75,9 +75,12 @@ SCAM_KEYWORDS = [
 ]
 
 DEFAULT_ATTACHMENT_PATTERNS = [
+    r"^image$",
     r"^image ?\(\d+\)$",
-    r"^[1-4]$",
+    r"^\d+$",
 ]
+
+GENERIC_ATTACHMENT_NAME_RE = re.compile(r"^(?:image(?: ?\(\d+\))?|\d+)$", re.IGNORECASE)
 
 
 class ReviewView(discord.ui.View):
@@ -1166,20 +1169,25 @@ class Honeypot(Cog):
         if message.attachments and message.author.created_at > datetime.now(timezone.utc) - timedelta(days=14):
             reasons.append(_("Attachment from an account under 14 days old"))
         attachment_patterns = config.get("attachment_patterns") or DEFAULT_ATTACHMENT_PATTERNS
-        filenames = [attachment.filename.lower() for attachment in message.attachments]
-        image_name_count = sum(1 for filename in filenames if filename.rsplit(".", 1)[0] == "image")
-        if image_name_count >= 4:
-            reasons.append(_("Repeated attachment names: image x{count}").format(count=image_name_count))
-        filename_bases = [filename.rsplit(".", 1)[0] for filename in filenames]
-        matched_patterns = []
+        filename_bases = [attachment.filename.rsplit(".", 1)[0].lower() for attachment in message.attachments]
+        generic_attachment_count = sum(1 for filename_base in filename_bases if GENERIC_ATTACHMENT_NAME_RE.fullmatch(filename_base))
+        if generic_attachment_count >= 2:
+            reasons.append(_("Multiple generic attachment names: {count}").format(count=generic_attachment_count))
+        matched_patterns: list[str] = []
+        matched_attachment_indexes: set[int] = set()
         for pattern in attachment_patterns:
             try:
-                matches = sum(1 for filename_base in filename_bases if re.fullmatch(pattern, filename_base, flags=re.IGNORECASE))
+                matches = [
+                    index
+                    for index, filename_base in enumerate(filename_bases)
+                    if re.fullmatch(pattern, filename_base, flags=re.IGNORECASE)
+                ]
             except re.error:
                 continue
-            if matches >= 4:
+            if matches:
+                matched_attachment_indexes.update(matches)
                 matched_patterns.append(pattern)
-        if matched_patterns:
+        if len(matched_attachment_indexes) >= 2 and matched_patterns:
             reasons.append(_("Matched attachment rules: {patterns}").format(patterns=", ".join(matched_patterns[:3])))
         return reasons
 
@@ -2575,7 +2583,7 @@ class Honeypot(Cog):
 
     @keyword_attachments.command(name="add")
     async def keyword_attachments_add(self, ctx: commands.Context, *, pattern: str) -> None:
-        """Add an attachment filename-base regex. It triggers when 4+ files match."""
+        """Add an attachment filename-base regex. It triggers when 2+ files match."""
         try:
             re.compile(pattern)
         except re.error as exc:

@@ -97,7 +97,7 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot keywords remove <keyword>` | Remove a scam keyword |
 | `!honeypot keywords list` | List scam keywords |
 | `!honeypot keywords reset` | Reset to defaults |
-| `!honeypot keywords attachments add <regex>` | Add filename-base regex (triggers at 4+ matches) |
+| `!honeypot keywords attachments add <regex>` | Add filename-base regex (triggers at 2+ matches) |
 | `!honeypot keywords attachments remove <regex>` | Remove a filename regex |
 | `!honeypot keywords attachments list` | List filename regexes |
 | `!honeypot keywords attachments reset` | Reset to default patterns |
@@ -177,15 +177,15 @@ A message is considered suspicious if:
 - Account is under 7 days old
 - Content contains scam keywords (customizable, see `!honeypot keywords`)
 - Has attachments and account is under 14 days old
-- Has 4+ attachments with the same filename base (e.g. "image.png", "image.jpg")
-- Has 4+ attachments matching configured filename-base regexes
+- Has 2+ generic attachment names (e.g. `image.jpeg`, `image(1).jpeg`, `1.jpeg`)
+- Has 2+ attachments matching configured filename-base regexes
 
 Default scam keywords: `free nitro`, `giveaway`, `steam gift`, `free discord`, `discord.gift`,
 `claim your`, `you won`, `free vbucks`, `free robux`, `free coins`, `boost your server`,
 `limited time`, `exclusive offer`, `free membership`, `hack`, `crack`, `generator`.
 
-Default attachment patterns: `^image ?\(\d+\)$` (matches `image(1)`, `image (2)`) and
-`^[1-4]$` (matches `1.png`, `2.png`).
+Default attachment patterns: `^image$` (matches `image.jpeg`), `^image ?\(\d+\)$`
+(matches `image(1)`, `image (2)`) and `^\d+$` (matches `1.png`, `42.jpeg`).
 
 ## Review Flow
 
