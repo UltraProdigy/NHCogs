@@ -394,6 +394,7 @@ class Honeypot(Cog):
             logs_channel=None,
             ping_role=None,
             honeypot_channel=None,
+            honeypot_channels=[],
             mute_role=None,
             ban_delete_message_days=3,
             whitelisted_roles=[],
@@ -837,6 +838,24 @@ class Honeypot(Cog):
             return f"{channel.mention} ({channel.id})"
         return _("not set") if channel_id is None else _("missing ({id})").format(id=channel_id)
 
+    def _honeypot_channel_ids_from_config(self, config: dict) -> list[int]:
+        channel_ids: list[int] = []
+        for channel_id in config.get("honeypot_channels") or []:
+            if isinstance(channel_id, int) and channel_id not in channel_ids:
+                channel_ids.append(channel_id)
+        legacy_channel_id = config.get("honeypot_channel")
+        if isinstance(legacy_channel_id, int) and legacy_channel_id not in channel_ids:
+            channel_ids.append(legacy_channel_id)
+        return channel_ids
+
+    def _format_honeypot_channel_list(self, guild: discord.Guild, channel_ids: list[int]) -> str:
+        if not channel_ids:
+            return _("not set")
+        return "\n".join(
+            f"{index}. {self._format_channel_setting(guild, channel_id)}"
+            for index, channel_id in enumerate(channel_ids, 1)
+        )
+
     def _format_role_setting(self, guild: discord.Guild, role_id: int | None) -> str:
         role = guild.get_role(role_id) if role_id else None
         if role is not None:
@@ -1022,11 +1041,12 @@ class Honeypot(Cog):
                     self._fake_config_cache[guild.id] = (now, config)
                 if not config["enabled"] or not config["fake_activity_enabled"]:
                     continue
-                honeypot_channel_id = config["honeypot_channel"]
-                if honeypot_channel_id is None:
-                    continue
-                honeypot_channel = self._get_text_channel_or_thread(guild, honeypot_channel_id)
-                if honeypot_channel is None:
+                honeypot_channels = [
+                    channel
+                    for channel_id in self._honeypot_channel_ids_from_config(config)
+                    if (channel := self._get_text_channel_or_thread(guild, channel_id)) is not None
+                ]
+                if not honeypot_channels:
                     continue
                 interval = config["fake_activity_interval"]
                 last = self._last_fake_message[guild.id]
@@ -1035,6 +1055,7 @@ class Honeypot(Cog):
                 custom_msgs: list[str] = config.get("fake_activity_messages", [])
                 pool = custom_msgs if custom_msgs else DEFAULT_FAKE_MESSAGES
                 msg = random.choice(pool)
+                honeypot_channel = random.choice(honeypot_channels)
                 await honeypot_channel.send(msg)
                 self._last_fake_message[guild.id] = now
             except asyncio.CancelledError:
@@ -1431,8 +1452,15 @@ class Honeypot(Cog):
             return
         if message.author.bot:
             return
-        honeypot_channel_id = await self.config.guild(message.guild).honeypot_channel()
-        if honeypot_channel_id is None or message.channel.id != honeypot_channel_id:
+        honeypot_channel_ids = await self.config.guild(message.guild).honeypot_channels()
+        legacy_honeypot_channel_id = await self.config.guild(message.guild).honeypot_channel()
+        configured_honeypot_channel_ids = self._honeypot_channel_ids_from_config(
+            {
+                "honeypot_channels": honeypot_channel_ids,
+                "honeypot_channel": legacy_honeypot_channel_id,
+            }
+        )
+        if message.channel.id not in configured_honeypot_channel_ids:
             return
         config = await self.config.guild(message.guild).all()
         if not config["enabled"] or (logs_channel_id := config["logs_channel"]) is None or (logs_channel := self._get_text_channel_or_thread(message.guild, logs_channel_id)) is None:
@@ -1520,6 +1548,19 @@ class Honeypot(Cog):
                 force_fallback = True
 
         suspicion_reasons = await self._suspicion_reasons(message, config)
+        second_strike_role_ids = {
+            role_id
+            for role_id in (
+                config.get("mute_role"),
+                config.get("joinwatch_auto_role_id"),
+            )
+            if role_id
+        }
+        second_strike = bool(second_strike_role_ids) and any(
+            role.id in second_strike_role_ids for role in message.author.roles
+        )
+        if second_strike:
+            suspicion_reasons.append(_("Repeat honeypot activity"))
         suspicious = bool(suspicion_reasons)
         if suspicion_reasons:
             await self._increment_stat(message.guild, "suspicious")
@@ -1534,6 +1575,31 @@ class Honeypot(Cog):
             review_channel = self._get_text_channel_or_thread(message.guild, config["review_channel"])
         action = config.get("action")
         fallback_action = config.get("fallback_action", "review")
+        if second_strike and not force_review and not force_fallback:
+            action_label, failed = await self._execute_action(
+                message,
+                config,
+                reason="Suspicious Activity",
+                action="ban",
+            )
+            embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
+            if failed:
+                embed.color = discord.Color.dark_red()
+                embed.add_field(name=_("Staff check needed:"), value=_("Second strike action failed."), inline=False)
+            embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
+            await self._send_log(
+                logs_channel,
+                embed,
+                attachment_snapshots,
+                content=(
+                    ping_role.mention
+                    if (ping_role_id := config["ping_role"]) is not None
+                    and (ping_role := message.guild.get_role(ping_role_id)) is not None
+                    else None
+                ),
+                allowed_mentions=discord.AllowedMentions(roles=True),
+            )
+            return
         should_review = force_review or (
             action == "review"
             and config["review_enabled"]
@@ -2235,14 +2301,6 @@ class Honeypot(Cog):
     @channels.command()
     async def create(self, ctx: commands.Context) -> None:
         """Create the honeypot channel."""
-        if (
-            honeypot_channel_id := await self.config.guild(ctx.guild).honeypot_channel()
-        ) is not None and (
-            honeypot_channel := ctx.guild.get_channel(honeypot_channel_id)
-        ) is not None:
-            raise commands.UserFeedbackCheckFailure(
-                _("Already exists: {channel.mention} ({channel.id}).").format(channel=honeypot_channel),
-            )
         me = ctx.guild.me
         if me is None:
             raise commands.UserFeedbackCheckFailure(_("I couldn't find my server member."))
@@ -2260,12 +2318,14 @@ class Honeypot(Cog):
             },
             reason=_("Honeypot channel requested by {author}.").format(author=ctx.author),
         )
-        await self.config.guild(ctx.guild).honeypot_channel.set(honeypot_channel.id)
-        await ctx.send(_("✅ Honeypot channel: {channel.mention}").format(channel=honeypot_channel))
+        async with self.config.guild(ctx.guild).honeypot_channels() as channel_ids:
+            if honeypot_channel.id not in channel_ids:
+                channel_ids.append(honeypot_channel.id)
+        await ctx.send(_("✅ Honeypot channel added: {channel.mention}").format(channel=honeypot_channel))
 
-    @channels.command(name="set")
-    async def channel_set(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread) -> None:
-        """Set an existing channel as the honeypot."""
+    @channels.command(name="add")
+    async def channel_add(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread) -> None:
+        """Add an existing honeypot channel."""
         missing = self._missing_channel_permissions(
             ctx.guild,
             target,
@@ -2274,8 +2334,38 @@ class Honeypot(Cog):
         )
         if missing is not None:
             raise commands.UserFeedbackCheckFailure(missing)
-        await self.config.guild(ctx.guild).honeypot_channel.set(target.id)
-        await ctx.send(_("✅ Honeypot channel set to {channel.mention}").format(channel=target))
+        config = await self.config.guild(ctx.guild).all()
+        if target.id in self._honeypot_channel_ids_from_config(config):
+            raise commands.UserFeedbackCheckFailure(_("That channel is already a honeypot channel."))
+        async with self.config.guild(ctx.guild).honeypot_channels() as channel_ids:
+            channel_ids.append(target.id)
+        await ctx.send(_("✅ Honeypot channel added: {channel.mention}").format(channel=target))
+
+    @channels.command(name="remove")
+    async def channel_remove(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread) -> None:
+        """Remove a honeypot channel."""
+        removed = False
+        async with self.config.guild(ctx.guild).honeypot_channels() as channel_ids:
+            while target.id in channel_ids:
+                channel_ids.remove(target.id)
+                removed = True
+        if await self.config.guild(ctx.guild).honeypot_channel() == target.id:
+            await self.config.guild(ctx.guild).honeypot_channel.set(None)
+            removed = True
+        if not removed:
+            raise commands.UserFeedbackCheckFailure(_("That channel is not a honeypot channel."))
+        await ctx.send(_("✅ Honeypot channel removed: {channel.mention}").format(channel=target))
+
+    @channels.command(name="list")
+    async def channel_list(self, ctx: commands.Context) -> None:
+        """List honeypot channels."""
+        config = await self.config.guild(ctx.guild).all()
+        channel_ids = self._honeypot_channel_ids_from_config(config)
+        await ctx.send(
+            _("Honeypot channels:\n{channels}").format(
+                channels=self._format_honeypot_channel_list(ctx.guild, channel_ids),
+            )
+        )
 
     @channels.command()
     async def logs(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread = None) -> None:
@@ -2976,7 +3066,7 @@ class Honeypot(Cog):
             ctx,
             _("Channel config"),
             [
-                (_("Honeypot channel"), self._format_channel_setting(ctx.guild, config.get("honeypot_channel"))),
+                (_("Honeypot channels"), self._format_honeypot_channel_list(ctx.guild, self._honeypot_channel_ids_from_config(config))),
                 (_("Logs channel"), self._format_channel_setting(ctx.guild, config.get("logs_channel"))),
                 (_("Ping role"), self._format_role_setting(ctx.guild, config.get("ping_role"))),
             ],
@@ -3228,12 +3318,16 @@ class Honeypot(Cog):
         if me is None:
             await ctx.send(_("**Honeypot doctor:**\n❌ I couldn't find my server member."))
             return
-        honeypot_channel = self._get_text_channel_or_thread(ctx.guild, config.get("honeypot_channel"))
+        honeypot_channels = [
+            channel
+            for channel_id in self._honeypot_channel_ids_from_config(config)
+            if (channel := self._get_text_channel_or_thread(ctx.guild, channel_id)) is not None
+        ]
         logs_channel = self._get_text_channel_or_thread(ctx.guild, config.get("logs_channel"))
         review_channel = self._get_text_channel_or_thread(ctx.guild, config.get("review_channel"))
         checks.append(("Honeypot enabled", bool(config.get("enabled")), "Run `honeypot core toggle true`."))
         checks.append(("Action configured", config.get("action") in ("kick", "ban", "review", "none"), "Run `honeypot core action`."))
-        checks.append(("Honeypot channel exists", honeypot_channel is not None, "Run `honeypot channel set`."))
+        checks.append(("Honeypot channel exists", bool(honeypot_channels), "Run `honeypot channel add`."))
         checks.append(("Logs channel exists", logs_channel is not None, "Run `honeypot channel logs`."))
         if config.get("fallback_action") == "review" or config.get("review_enabled") or config.get("whitelist_mode") == "review":
             checks.append(("Review channel exists", review_channel is not None, "Run `honeypot review channel`."))
@@ -3254,11 +3348,25 @@ class Honeypot(Cog):
             if joinwatch_channel is not None:
                 perms = joinwatch_channel.permissions_for(me)
                 checks.append(("Can send joinwatch alerts", perms.send_messages, "Grant Send Messages."))
-        if honeypot_channel is not None:
+        for honeypot_channel in honeypot_channels:
             perms = honeypot_channel.permissions_for(me)
-            checks.append(("Can view", perms.view_channel, "Grant View Channel."))
-            checks.append(("Can read history", perms.read_message_history, "Grant Read Message History."))
-            checks.append(("Can manage messages", perms.manage_messages, "Grant Manage Messages."))
+            required_permissions = [
+                ("View Channel", perms.view_channel),
+                ("Read Message History", perms.read_message_history),
+                ("Manage Messages", perms.manage_messages),
+            ]
+            missing_permissions = [
+                name for name, has_permission in required_permissions if not has_permission
+            ]
+            checks.append(
+                (
+                    f"Honeypot permissions in {honeypot_channel}",
+                    not missing_permissions,
+                    "Missing: {permissions}".format(
+                        permissions=", ".join(missing_permissions) if missing_permissions else "None",
+                    ),
+                )
+            )
         if logs_channel is not None:
             perms = logs_channel.permissions_for(me)
             checks.append(("Can send logs", perms.send_messages, "Grant Send Messages."))

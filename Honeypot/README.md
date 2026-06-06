@@ -1,7 +1,7 @@
 # Honeypot
 
-Honeypot is a Red-DiscordBot cog that protects your server by creating a trap channel for self-bots, scammers,
-spam accounts, and suspicious users. Messages posted in the honeypot channel are deleted, logged, optionally purged,
+Honeypot is a Red-DiscordBot cog that protects your server by creating trap channels for self-bots, scammers,
+spam accounts, and suspicious users. Messages posted in honeypot channels are deleted, logged, optionally purged,
 and either punished automatically or sent to moderators for review. It also alerts moderators when new accounts join the server.
 
 ## Installation
@@ -42,8 +42,10 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 
 | Command | Description |
 |---------|-------------|
-| `!honeypot channel create` | Create a new `#honeypot` channel at position 0 |
-| `!honeypot channel set <channel>` | Use an existing channel as the honeypot |
+| `!honeypot channel create` | Create and add a new `#honeypot` channel at position 0 |
+| `!honeypot channel add <channel>` | Add an existing honeypot channel |
+| `!honeypot channel remove <channel>` | Remove a honeypot channel |
+| `!honeypot channel list` | List honeypot channels |
 | `!honeypot channel logs <channel>` | Set the logs channel |
 | `!honeypot channel ping_role <role>` | Role to ping on detection |
 
@@ -152,7 +154,7 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 
 ```
 suspicious + action = kick/ban  → instant punishment
-suspicious + action = review    → review (if channel set), otherwise fallback
+suspicious + action = review    → review (if review channel is set), otherwise fallback
 suspicious + action = none      → skip to fallback
 non-suspicious                  → fallback_action decides
 
@@ -198,6 +200,10 @@ Default attachment patterns: `^image$` (matches `image.jpeg`), `^image ?\(\d+\)$
 7. If review expires, mute role is removed and review marked as timed out
 8. Pending reviews survive bot restarts
 9. If kicked or banned, the mute role is removed first so it does not linger
+
+Any configured honeypot channel uses the same flow. If a user with the review
+mute role or joinwatch auto-role posts in any honeypot channel, the bot treats it
+as repeat honeypot activity and forces a ban with the reason `Suspicious Activity`.
 
 ## Stats
 
