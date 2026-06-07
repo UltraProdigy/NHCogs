@@ -302,6 +302,7 @@ the bait role is deleted or no bait role is configured, the trap does nothing.
 ## Permissions
 
 - View Channel, Send Messages, Read Message History, Manage Messages (in honeypot channel)
+- View Channel, Read Message History, Manage Messages (in every text, voice-chat, or thread channel where post-ban sweep should remove recent scammer messages; voice/stage channels also require Connect)
 - Send Messages (in logs, review, and joinwatch channels)
 - Kick Members (if using kick)
 - Ban Members (if using ban)
