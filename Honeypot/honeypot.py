@@ -26,6 +26,12 @@ PURGE_PERMISSION_REQUIREMENTS = (
     ("Read Message History", "read_message_history"),
     ("Manage Messages", "manage_messages"),
 )
+SHORT_PERMISSION_NAMES = {
+    "View Channel": "View",
+    "Read Message History": "Read",
+    "Manage Messages": "Manage",
+    "Connect": "Connect",
+}
 
 DEFAULT_FAKE_MESSAGES = [
     "BAN CHANNEL - DO NOT WRITE HERE.",
@@ -111,6 +117,12 @@ def missing_channel_purge_permissions(channel: object, permissions: object) -> l
     ):
         missing.append("Connect")
     return missing
+
+
+def short_permission_summary(permissions: tuple[str, ...]) -> str:
+    return "/".join(
+        SHORT_PERMISSION_NAMES.get(permission, permission) for permission in permissions
+    )
 
 
 SCAM_KEYWORDS = [
@@ -3428,7 +3440,7 @@ class Honeypot(Cog):
                 )
             )
         if ban_delete_message_days(config) > 0:
-            skipped_channels = []
+            skipped_channels_by_reason = {}
             purgeable_channels = [
                 channel
                 for channel in list(ctx.guild.channels) + list(ctx.guild.threads)
@@ -3438,26 +3450,32 @@ class Honeypot(Cog):
                 perms = channel.permissions_for(me)
                 missing_permissions = missing_channel_purge_permissions(channel, perms)
                 if missing_permissions:
-                    skipped_channels.append(
-                        "{channel} ({permissions})".format(
-                            channel=channel.mention,
-                            permissions=", ".join(missing_permissions),
+                    reason = tuple(missing_permissions)
+                    skipped_channels_by_reason.setdefault(reason, []).append(channel.mention)
+            if skipped_channels_by_reason:
+                missing_permission_lines = []
+                for missing_permissions, channels in skipped_channels_by_reason.items():
+                    shown_channels = ", ".join(channels[:8])
+                    if len(channels) > 8:
+                        shown_channels += " ..."
+                    missing_permission_lines.append(
+                        "{permissions} - {channels}".format(
+                            permissions=short_permission_summary(missing_permissions),
+                            channels=shown_channels,
                         )
                     )
-            if skipped_channels:
                 checks.append(
                     (
-                        "Post-ban sweep can purge all visible message channels",
+                        "Post-ban sweep can purge all known message channels",
                         False,
-                        "Missing purge permissions: "
-                        + ", ".join(skipped_channels[:5])
-                        + (" ..." if len(skipped_channels) > 5 else ""),
+                        "\n" + "\n".join(missing_permission_lines[:5])
+                        + ("\n..." if len(missing_permission_lines) > 5 else ""),
                     )
                 )
             else:
                 checks.append(
                     (
-                        "Post-ban sweep can purge all visible message channels",
+                        "Post-ban sweep can purge all known message channels",
                         True,
                         "Grant View Channel, Read Message History, Manage Messages, and Connect for voice/stage channels.",
                     )
@@ -3472,6 +3490,10 @@ class Honeypot(Cog):
         checks.append(("Can kick members", guild_perms.kick_members, "Grant Kick Members."))
         checks.append(("Can ban members", guild_perms.ban_members, "Grant Ban Members."))
         checks.append(("Can manage roles", guild_perms.manage_roles, "Grant Manage Roles for mute or joinwatch auto-role."))
-        failed = [f"❌ {name} - {hint}" for name, ok, hint in checks if not ok]
+        failed = [
+            f"❌ {name}{hint}" if hint.startswith("\n") else f"❌ {name} - {hint}"
+            for name, ok, hint in checks
+            if not ok
+        ]
         passed = [f"✅ {name}" for name, ok, _hint in checks if ok]
         await ctx.send(_("**Honeypot doctor:**\n{body}").format(body="\n".join(passed + failed)))
