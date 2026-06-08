@@ -95,6 +95,8 @@ def ban_delete_message_seconds(config: dict) -> int:
 
 
 def missing_purge_permissions(permissions: object) -> list[str]:
+    if not bool(getattr(permissions, "view_channel", False)):
+        return ["View Channel"]
     return [
         name
         for name, attribute in PURGE_PERMISSION_REQUIREMENTS
@@ -3448,6 +3450,8 @@ class Honeypot(Cog):
             ]
             for channel in purgeable_channels:
                 perms = channel.permissions_for(me)
+                if not perms.view_channel:
+                    continue
                 missing_permissions = missing_channel_purge_permissions(channel, perms)
                 if missing_permissions:
                     reason = tuple(missing_permissions)
@@ -3466,7 +3470,7 @@ class Honeypot(Cog):
                     )
                 checks.append(
                     (
-                        "Post-ban sweep can purge all known message channels",
+                        "Post-ban sweep can purge all visible message channels",
                         False,
                         "\n" + "\n".join(missing_permission_lines[:5])
                         + ("\n..." if len(missing_permission_lines) > 5 else ""),
@@ -3475,9 +3479,9 @@ class Honeypot(Cog):
             else:
                 checks.append(
                     (
-                        "Post-ban sweep can purge all known message channels",
+                        "Post-ban sweep can purge all visible message channels",
                         True,
-                        "Grant View Channel, Read Message History, Manage Messages, and Connect for voice/stage channels.",
+                        "Grant Read Message History, Manage Messages, and Connect for visible voice/stage channels.",
                     )
                 )
         if logs_channel is not None:
