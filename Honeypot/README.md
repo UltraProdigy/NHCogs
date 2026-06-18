@@ -179,6 +179,7 @@ A message is considered suspicious if:
 - Account is under 7 days old
 - Content contains scam keywords (customizable, see `!honeypot keywords`)
 - Has attachments and account is under 14 days old
+- Has 4+ image attachments, regardless of filename
 - Has 2+ generic attachment names (e.g. `image.jpeg`, `image(1).jpeg`, `1.jpeg`)
 - Has 2+ attachments matching configured filename-base regexes
 

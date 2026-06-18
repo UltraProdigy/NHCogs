@@ -127,6 +127,14 @@ def short_permission_summary(permissions: tuple[str, ...]) -> str:
     )
 
 
+def is_image_attachment(attachment: discord.Attachment) -> bool:
+    content_type = (attachment.content_type or "").lower()
+    if content_type.startswith("image/"):
+        return True
+    filename = attachment.filename.lower()
+    return any(filename.endswith(extension) for extension in IMAGE_ATTACHMENT_EXTENSIONS)
+
+
 SCAM_KEYWORDS = [
     "free nitro", "giveaway", "steam gift", "free discord",
     "discord.gift", "claim your", "you won", "free vbucks",
@@ -142,6 +150,17 @@ DEFAULT_ATTACHMENT_PATTERNS = [
 ]
 
 GENERIC_ATTACHMENT_NAME_RE = re.compile(r"^(?:image(?: ?\(\d+\))?|\d+)$", re.IGNORECASE)
+IMAGE_ATTACHMENT_EXTENSIONS = {
+    ".avif",
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
 
 
 class ReviewView(discord.ui.View):
@@ -1248,6 +1267,9 @@ class Honeypot(Cog):
             reasons.append(_("Matched keywords: {keywords}").format(keywords=", ".join(matched_keywords[:5])))
         if message.attachments and message.author.created_at > datetime.now(timezone.utc) - timedelta(days=14):
             reasons.append(_("Attachment from an account under 14 days old"))
+        image_attachment_count = sum(1 for attachment in message.attachments if is_image_attachment(attachment))
+        if image_attachment_count >= 4:
+            reasons.append(_("Multiple image attachments: {count}").format(count=image_attachment_count))
         attachment_patterns = config.get("attachment_patterns") or DEFAULT_ATTACHMENT_PATTERNS
         filename_bases = [attachment.filename.rsplit(".", 1)[0].lower() for attachment in message.attachments]
         generic_attachment_count = sum(1 for filename_base in filename_bases if GENERIC_ATTACHMENT_NAME_RE.fullmatch(filename_base))
