@@ -469,7 +469,6 @@ class Honeypot(Cog):
             purge_minutes=5,
             firstpost_enabled=False,
             firstpost_action="review",
-            firstpost_bait_texts=["bro"],
             fake_activity_enabled=False,
             fake_activity_interval=10,
             fake_activity_messages=[],
@@ -1535,15 +1534,8 @@ class Honeypot(Cog):
             reasons.append(_("Matched keywords: {keywords}").format(keywords=", ".join(matched_keywords[:5])))
         if attachment_count <= 0:
             return reasons
-        bait_texts = {
-            str(text).strip().lower()
-            for text in config.get("firstpost_bait_texts", [])
-            if str(text).strip()
-        }
         if not content:
             reasons.append(_("First post with empty attachment message"))
-        if content and content in bait_texts:
-            reasons.append(_("First post with bait attachment message"))
         if attachment_count >= 2:
             reasons.append(_("First post with multiple attachments"))
         return reasons
@@ -2918,7 +2910,6 @@ class Honeypot(Cog):
         lines = [
             f"Enabled: {self._format_bool_setting(config.get('firstpost_enabled', False))}",
             f"Action: {config.get('firstpost_action', 'review')}",
-            f"Bait texts: {', '.join(config.get('firstpost_bait_texts') or [])}",
             f"Seen authors: {seen_count}",
         ]
         await ctx.send(_("**Firstpost status:**\n") + box("\n".join(lines)))
@@ -3583,7 +3574,6 @@ class Honeypot(Cog):
             [
                 (_("Enabled"), self._format_bool_setting(config.get("firstpost_enabled", False))),
                 (_("Action"), config.get("firstpost_action", "review")),
-                (_("Bait texts"), ", ".join(config.get("firstpost_bait_texts") or [])),
             ],
         )
 

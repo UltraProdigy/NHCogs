@@ -194,7 +194,7 @@ A message is considered suspicious if:
 
 If firstpost is enabled, a user's first observed message is also considered
 suspicious when it contains scam keywords, has empty content with attachments,
-bait text such as `bro` with attachments, or 2+ attachments.
+or has 2+ attachments.
 
 Default scam keywords: `free nitro`, `giveaway`, `steam gift`, `free discord`, `discord.gift`,
 `claim your`, `you won`, `free vbucks`, `free robux`, `free coins`, `boost your server`,
