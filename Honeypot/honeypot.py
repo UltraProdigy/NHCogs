@@ -1527,10 +1527,14 @@ class Honeypot(Cog):
         self, message: discord.Message, config: dict
     ) -> list[str]:
         attachment_count = len(message.attachments)
-        if attachment_count <= 0:
-            return []
         reasons: list[str] = []
         content = message.content.strip().lower()
+        scam_keywords = config.get("scam_keywords") or SCAM_KEYWORDS
+        matched_keywords = [kw for kw in scam_keywords if kw.lower() in content]
+        if matched_keywords:
+            reasons.append(_("Matched keywords: {keywords}").format(keywords=", ".join(matched_keywords[:5])))
+        if attachment_count <= 0:
+            return reasons
         bait_texts = {
             str(text).strip().lower()
             for text in config.get("firstpost_bait_texts", [])
