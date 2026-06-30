@@ -4,7 +4,7 @@ import logging
 import random
 import re
 import typing
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -26,13 +26,6 @@ PURGE_PERMISSION_REQUIREMENTS = (
     ("Read Message History", "read_message_history"),
     ("Manage Messages", "manage_messages"),
 )
-SHORT_PERMISSION_NAMES = {
-    "View Channel": "View",
-    "Read Message History": "Read",
-    "Manage Messages": "Manage",
-    "Connect": "Connect",
-}
-
 DEFAULT_FAKE_MESSAGES = [
     "BAN CHANNEL - DO NOT WRITE HERE.",
     "Do not type in this channel.",
@@ -55,6 +48,8 @@ DEFAULT_STATS = {
     "pending_mutes": 0,
     "pending_mute_failures": 0,
     "purged_messages": 0,
+    "cached_purge_deletes": 0,
+    "forward_purge_deletes": 0,
     "joinwatch_total_joins": 0,
     "joinwatch_young_joins": 0,
     "joinwatch_auto_roles_scheduled": 0,
@@ -67,12 +62,9 @@ DEFAULT_STATS = {
 JOINWATCH_RETRY_DELAY_MINUTES = 5
 JOINWATCH_MAX_RETRIES = 5
 POST_BAN_SWEEP_DELAY_SECONDS = 5
-POST_BAN_SWEEP_LOOKBACK_MINUTES = 5
-POST_BAN_SWEEP_PER_CHANNEL_LIMIT = 10
-# This flat sweep does not replace ban delete-message-days; it only catches
-# messages that race Discord's on-ban deletion path.
-# Guild-wide bulk delete is ~1 request/s; pause after a channel actually deletes messages.
-POST_BAN_SWEEP_CHANNEL_COOLDOWN_SECONDS = 1.0
+MESSAGE_CACHE_RETENTION_SECONDS = 120
+FORWARD_PURGE_SECONDS = 60
+RECENT_USER_MESSAGES_PER_USER_LIMIT = 25
 REVIEW_KICK_FAIL_WARNING_MODES = ("false", "true", "manual")
 KICK_FAIL_WARNING_REASON = "Suspicious activity: target left before the kick could be applied."
 CORE_ACTION_OPTIONS = ("kick", "ban", "review", "none")
@@ -108,31 +100,18 @@ def is_purgeable_message_channel(channel: object) -> bool:
     return callable(getattr(channel, "purge", None))
 
 
-def requires_connect_for_message_history(channel: object) -> bool:
-    return callable(getattr(channel, "connect", None))
-
-
-def missing_channel_purge_permissions(channel: object, permissions: object) -> list[str]:
-    missing = missing_purge_permissions(permissions)
-    if requires_connect_for_message_history(channel) and not bool(
-        getattr(permissions, "connect", False)
-    ):
-        missing.append("Connect")
-    return missing
-
-
-def short_permission_summary(permissions: tuple[str, ...]) -> str:
-    return "/".join(
-        SHORT_PERMISSION_NAMES.get(permission, permission) for permission in permissions
-    )
-
-
 def is_image_attachment(attachment: discord.Attachment) -> bool:
     content_type = (attachment.content_type or "").lower()
     if content_type.startswith("image/"):
         return True
     filename = attachment.filename.lower()
     return any(filename.endswith(extension) for extension in IMAGE_ATTACHMENT_EXTENSIONS)
+
+
+class MessageRef(typing.NamedTuple):
+    channel_id: int
+    message_id: int
+    created_at: datetime
 
 
 SCAM_KEYWORDS = [
@@ -516,6 +495,10 @@ class Honeypot(Cog):
         self._views_lock: asyncio.Lock = asyncio.Lock()
         self._restore_task: asyncio.Task | None = None
         self._post_ban_sweep_tasks: set[asyncio.Task] = set()
+        self._recent_user_messages: dict[int, dict[int, deque[MessageRef]]] = defaultdict(
+            lambda: defaultdict(deque)
+        )
+        self._hot_purge_users: dict[int, dict[int, datetime]] = defaultdict(dict)
 
     async def _increment_stat(self, guild: discord.Guild, key: str, amount: int = 1) -> None:
         async with self.config.guild(guild).stats() as stats:
@@ -1093,12 +1076,14 @@ class Honeypot(Cog):
         self.fake_activity_loop.start()
         self.review_timeout_loop.start()
         self.joinwatch_auto_role_loop.start()
+        self.purge_cache_cleanup_loop.start()
         self._restore_task = asyncio.create_task(self._restore_pending_reviews())
 
     async def cog_unload(self) -> None:
         self.fake_activity_loop.cancel()
         self.review_timeout_loop.cancel()
         self.joinwatch_auto_role_loop.cancel()
+        self.purge_cache_cleanup_loop.cancel()
         if self._restore_task is not None:
             self._restore_task.cancel()
         pending_sweeps = tuple(self._post_ban_sweep_tasks)
@@ -1108,6 +1093,10 @@ class Honeypot(Cog):
             await asyncio.gather(*pending_sweeps, return_exceptions=True)
         self._post_ban_sweep_tasks.clear()
         await super().cog_unload()
+
+    @tasks.loop(minutes=1)
+    async def purge_cache_cleanup_loop(self) -> None:
+        self._prune_purge_cache()
 
     # ─── Fake Activity Loop ───────────────────────────────────────────────
 
@@ -1293,97 +1282,152 @@ class Honeypot(Cog):
             reasons.append(_("Matched attachment rules: {patterns}").format(patterns=", ".join(matched_patterns[:3])))
         return reasons
 
-    def _iter_message_channels(
-        self, guild: discord.Guild
-    ) -> typing.Iterator[typing.Any]:
-        me = guild.me
-        if me is None:
+    def _record_recent_user_message(self, message: discord.Message) -> None:
+        if message.guild is None:
             return
-        for channel in guild.channels:
-            if not is_purgeable_message_channel(channel):
-                continue
-            perms = channel.permissions_for(me)
-            if not missing_channel_purge_permissions(channel, perms):
-                yield channel
-        for thread in guild.threads:
-            perms = thread.permissions_for(me)
-            if not missing_channel_purge_permissions(thread, perms):
-                yield thread
+        refs = self._recent_user_messages[message.guild.id][message.author.id]
+        refs.append(MessageRef(message.channel.id, message.id, message.created_at))
+        self._prune_recent_user_messages(message.guild.id, message.author.id)
 
-    async def _purge_user_messages(
-        self,
-        channel: typing.Any,
-        author_id: int,
-        minutes: int,
-        *,
-        limit: int = 200,
-    ) -> int:
-        after = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    def _prune_recent_user_messages(self, guild_id: int, user_id: int) -> None:
+        refs = self._recent_user_messages.get(guild_id, {}).get(user_id)
+        if not refs:
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=MESSAGE_CACHE_RETENTION_SECONDS)
+        while refs and refs[0].created_at < cutoff:
+            refs.popleft()
+        while len(refs) > RECENT_USER_MESSAGES_PER_USER_LIMIT:
+            refs.popleft()
+        if not refs:
+            self._recent_user_messages[guild_id].pop(user_id, None)
+
+    def _prune_purge_cache(self) -> None:
+        now = datetime.now(timezone.utc)
+        for guild_id, users in list(self._recent_user_messages.items()):
+            for user_id in list(users):
+                self._prune_recent_user_messages(guild_id, user_id)
+            if not users:
+                self._recent_user_messages.pop(guild_id, None)
+        for guild_id, users in list(self._hot_purge_users.items()):
+            for user_id, expires_at in list(users.items()):
+                if expires_at <= now:
+                    users.pop(user_id, None)
+            if not users:
+                self._hot_purge_users.pop(guild_id, None)
+
+    def _activate_forward_purge(self, guild_id: int, user_id: int) -> None:
+        self._hot_purge_users[guild_id][user_id] = datetime.now(timezone.utc) + timedelta(
+            seconds=FORWARD_PURGE_SECONDS
+        )
+
+    def _is_forward_purge_active(self, guild_id: int, user_id: int) -> bool:
+        expires_at = self._hot_purge_users.get(guild_id, {}).get(user_id)
+        if expires_at is None:
+            return False
+        if expires_at <= datetime.now(timezone.utc):
+            self._hot_purge_users[guild_id].pop(user_id, None)
+            return False
+        return True
+
+    def _get_cached_message_channel(
+        self, guild: discord.Guild, channel_id: int
+    ) -> typing.Any | None:
+        return guild.get_channel(channel_id) or guild.get_thread(channel_id)
+
+    async def _delete_cached_message_ref(
+        self, guild: discord.Guild, user_id: int, ref: MessageRef
+    ) -> bool:
+        channel = self._get_cached_message_channel(guild, ref.channel_id)
+        if channel is None:
+            return False
+        get_partial_message = getattr(channel, "get_partial_message", None)
+        if not callable(get_partial_message):
+            return False
         try:
-            deleted = await channel.purge(
-                limit=limit,
-                after=after,
-                check=lambda m: m.author.id == author_id,
-                bulk=True,
-            )
-            return len(deleted)
-        except (discord.HTTPException, discord.Forbidden) as exc:
+            await get_partial_message(ref.message_id).delete()
+            return True
+        except discord.NotFound:
+            return False
+        except (discord.Forbidden, discord.HTTPException) as exc:
             log.debug(
-                "Failed to purge messages for user %s in channel %s (%s): %r",
-                author_id,
-                getattr(channel, "id", "unknown"),
-                getattr(channel, "name", "unknown"),
+                "Failed to delete cached message %s for user %s in channel %s: %r",
+                ref.message_id,
+                user_id,
+                ref.channel_id,
                 exc,
             )
-            return 0
+            return False
 
-    async def _sweep_user_messages_guild(
-        self, guild: discord.Guild, user_id: int, minutes: int
+    async def _delete_recent_cached_user_messages(
+        self,
+        guild: discord.Guild,
+        user_id: int,
+        *,
+        exclude_message_id: int | None = None,
     ) -> int:
+        self._prune_recent_user_messages(guild.id, user_id)
+        refs = list(self._recent_user_messages.get(guild.id, {}).get(user_id, ()))
         total = 0
-        for channel in self._iter_message_channels(guild):
-            deleted = await self._purge_user_messages(
-                channel,
-                user_id,
-                minutes,
-                limit=POST_BAN_SWEEP_PER_CHANNEL_LIMIT,
-            )
-            total += deleted
-            if deleted > 0:
-                await asyncio.sleep(POST_BAN_SWEEP_CHANNEL_COOLDOWN_SECONDS)
+        for ref in refs:
+            if exclude_message_id is not None and ref.message_id == exclude_message_id:
+                continue
+            if await self._delete_cached_message_ref(guild, user_id, ref):
+                total += 1
         return total
+
+    async def _cached_purge_user_messages(
+        self, guild: discord.Guild, user_id: int, *, exclude_message_id: int | None = None
+    ) -> int:
+        deleted = await self._delete_recent_cached_user_messages(
+            guild, user_id, exclude_message_id=exclude_message_id
+        )
+        self._activate_forward_purge(guild.id, user_id)
+        return deleted
+
+    async def _delete_forward_purge_message(self, message: discord.Message) -> bool:
+        try:
+            await message.delete()
+            return True
+        except discord.NotFound:
+            return False
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.debug(
+                "Failed to forward-purge message %s from user %s in guild %s: %r",
+                message.id,
+                message.author.id,
+                message.guild.id if message.guild else "unknown",
+                exc,
+            )
+            return False
 
     def _schedule_post_ban_sweep_if_enabled(
         self, guild: discord.Guild, user_id: int, config: dict
     ) -> None:
-        """After ban: wait, then purge this user's recent messages on accessible channels."""
+        """After ban: wait, then delete this user's recent cached messages."""
         if ban_delete_message_days(config) <= 0:
             return
         task = self.bot.loop.create_task(
             self._post_ban_message_sweep(
-                guild.id, user_id, POST_BAN_SWEEP_LOOKBACK_MINUTES
+                guild.id, user_id
             ),
             name=f"honeypot-post-ban-sweep-{guild.id}-{user_id}",
         )
         self._post_ban_sweep_tasks.add(task)
         task.add_done_callback(self._post_ban_sweep_tasks.discard)
 
-    async def _post_ban_message_sweep(
-        self, guild_id: int, user_id: int, lookback_minutes: int
-    ) -> None:
+    async def _post_ban_message_sweep(self, guild_id: int, user_id: int) -> None:
         try:
             await asyncio.sleep(POST_BAN_SWEEP_DELAY_SECONDS)
             guild = self.bot.get_guild(guild_id)
             if guild is None:
                 return
-            deleted = await self._sweep_user_messages_guild(
-                guild, user_id, lookback_minutes
-            )
+            deleted = await self._cached_purge_user_messages(guild, user_id)
             if deleted:
                 await self._increment_stat(guild, "purged_messages", deleted)
+                await self._increment_stat(guild, "cached_purge_deletes", deleted)
         except Exception:
             log.exception(
-                "Post-ban message sweep failed for user %s in guild %s",
+                "Post-ban cached message purge failed for user %s in guild %s",
                 user_id,
                 guild_id,
             )
@@ -1556,6 +1600,14 @@ class Honeypot(Cog):
             return
         if message.author.bot:
             return
+        if message.webhook_id is not None:
+            return
+        self._record_recent_user_message(message)
+        if self._is_forward_purge_active(message.guild.id, message.author.id):
+            if await self._delete_forward_purge_message(message):
+                await self._increment_stat(message.guild, "purged_messages")
+                await self._increment_stat(message.guild, "forward_purge_deletes")
+            return
         config = await self.config.guild(message.guild).all()
         configured_honeypot_channel_ids = self._honeypot_channel_ids_from_config(config)
         if message.channel.id not in configured_honeypot_channel_ids:
@@ -1570,7 +1622,9 @@ class Honeypot(Cog):
 
         try:
             await message.delete()
+            message_deleted = True
         except discord.HTTPException:
+            message_deleted = False
             log.debug("Failed to delete honeypot message from user %s", message.author.id)
         await self._increment_stat(message.guild, "detections")
 
@@ -1614,11 +1668,14 @@ class Honeypot(Cog):
         # Purge - always runs before any action/review
         purged = 0
         if config["purge_enabled"]:
-            purged = await self._purge_user_messages(
-                message.channel, message.author.id, config["purge_minutes"]
+            purged = await self._cached_purge_user_messages(
+                message.guild,
+                message.author.id,
+                exclude_message_id=message.id if message_deleted else None,
             )
         if purged:
             await self._increment_stat(message.guild, "purged_messages", purged)
+            await self._increment_stat(message.guild, "cached_purge_deletes", purged)
             embed.add_field(
                 name=_("Purged messages:"),
                 value=str(purged),
@@ -2526,7 +2583,7 @@ class Honeypot(Cog):
 
     @purge.command(name="toggle")
     async def purge_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Delete recent messages from the user in the honeypot channel."""
+        """Delete recent cached messages from caught users."""
         if value is None:
             v = await self.config.guild(ctx.guild).purge_enabled()
             await ctx.send(
@@ -2541,15 +2598,11 @@ class Honeypot(Cog):
 
     @purge.command()
     async def minutes(self, ctx: commands.Context, value: int = None) -> None:
-        """Minutes of history to purge (1-60)."""
+        """Show fixed cached purge retention."""
         if value is None:
-            v = await self.config.guild(ctx.guild).purge_minutes()
-            await ctx.send(_("Purge minutes: {value}").format(value=v))
-        elif value < 1 or value > 60:
-            await ctx.send(_("Minutes must be between 1 and 60."))
+            await ctx.send(_("Cached purge retention: 2 minutes (fixed)."))
         else:
-            await self.config.guild(ctx.guild).purge_minutes.set(value)
-            await ctx.send(_("✅ Purge minutes set to {value}").format(value=value))
+            await ctx.send(_("Cached purge retention is fixed at 2 minutes."))
 
     # ─── fakeactivity sub-group ───────────────────────────────────────
 
@@ -3197,7 +3250,7 @@ class Honeypot(Cog):
             _("Purge config"),
             [
                 (_("Enabled"), self._format_bool_setting(config.get("purge_enabled", False))),
-                (_("Minutes"), config.get("purge_minutes")),
+                (_("Retention"), _("2 minutes (fixed)")),
             ],
         )
 
@@ -3356,6 +3409,8 @@ class Honeypot(Cog):
                 "Suspicious detections": stats["suspicious"],
                 "Whitelisted users": stats["whitelisted"],
                 "Purged messages": stats["purged_messages"],
+                "Cached purge deletes": stats["cached_purge_deletes"],
+                "Forward purge deletes": stats["forward_purge_deletes"],
             },
             "Review": {
                 "Reviews sent": stats["reviewed"],
@@ -3463,8 +3518,8 @@ class Honeypot(Cog):
                     ),
                 )
             )
-        if ban_delete_message_days(config) > 0:
-            skipped_channels_by_reason = {}
+        if config.get("purge_enabled") or ban_delete_message_days(config) > 0:
+            skipped_channels = []
             purgeable_channels = [
                 channel
                 for channel in list(ctx.guild.channels) + list(ctx.guild.threads)
@@ -3474,36 +3529,25 @@ class Honeypot(Cog):
                 perms = channel.permissions_for(me)
                 if not perms.view_channel:
                     continue
-                missing_permissions = missing_channel_purge_permissions(channel, perms)
-                if missing_permissions:
-                    reason = tuple(missing_permissions)
-                    skipped_channels_by_reason.setdefault(reason, []).append(channel.mention)
-            if skipped_channels_by_reason:
-                missing_permission_lines = []
-                for missing_permissions, channels in skipped_channels_by_reason.items():
-                    shown_channels = ", ".join(channels[:8])
-                    if len(channels) > 8:
-                        shown_channels += " ..."
-                    missing_permission_lines.append(
-                        "{permissions} - {channels}".format(
-                            permissions=short_permission_summary(missing_permissions),
-                            channels=shown_channels,
-                        )
-                    )
+                if not perms.manage_messages:
+                    skipped_channels.append(channel.mention)
+            if skipped_channels:
+                shown_channels = ", ".join(skipped_channels[:8])
+                if len(skipped_channels) > 8:
+                    shown_channels += " ..."
                 checks.append(
                     (
-                        "Post-ban sweep can purge all visible message channels",
+                        "Cached purge can delete visible message channels",
                         False,
-                        "\n" + "\n".join(missing_permission_lines[:5])
-                        + ("\n..." if len(missing_permission_lines) > 5 else ""),
+                        "\nManage - " + shown_channels,
                     )
                 )
             else:
                 checks.append(
                     (
-                        "Post-ban sweep can purge all visible message channels",
+                        "Cached purge can delete visible message channels",
                         True,
-                        "Grant Read Message History, Manage Messages, and Connect for visible voice/stage channels.",
+                        "Grant Manage Messages in visible channels where cached purge should delete messages.",
                     )
                 )
         if logs_channel is not None:

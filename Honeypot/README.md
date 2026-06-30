@@ -60,8 +60,8 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 
 | Command | Description |
 |---------|-------------|
-| `!honeypot purge toggle <bool>` | Delete recent messages from the user in the honeypot channel |
-| `!honeypot purge minutes <1-60>` | Minutes of history to purge |
+| `!honeypot purge toggle <bool>` | Delete recent cached messages from caught users |
+| `!honeypot purge minutes` | Show fixed cache retention |
 
 ### fakeactivity
 
@@ -193,7 +193,7 @@ Default attachment patterns: `^image$` (matches `image.jpeg`), `^image ?\(\d+\)$
 ## Review Flow
 
 1. Message deleted from honeypot channel
-2. Recent messages from that user purged (if enabled)
+2. Recent cached messages from that user purged (if enabled)
 3. Mute role applied while review is pending (if configured)
 4. Embed sent to review channel with Ban / Kick / Ignore buttons
 5. Attachments copied into the review message
@@ -226,6 +226,10 @@ so it does not clear the joinwatch timer.
 `Purged messages` counts extra recent messages removed by the purge step. It
 does not include the original honeypot message, which is deleted separately as
 part of every detection.
+
+Cached purge stores recent message IDs observed through Discord Gateway events
+for 2 minutes, then deletes those known messages directly. After a purge trigger,
+the bot also forward-purges new messages from that user for 1 minute.
 
 The `Joinwatch` stats section tracks non-bot joins while joinwatch is enabled.
 `Young joins` counts accounts below the configured `joinwatch max_age`
@@ -303,7 +307,7 @@ the bait role is deleted or no bait role is configured, the trap does nothing.
 ## Permissions
 
 - View Channel, Send Messages, Read Message History, Manage Messages (in honeypot channel)
-- View Channel, Read Message History, Manage Messages (in every text, voice-chat, or thread channel where post-ban sweep should remove recent scammer messages; voice/stage channels also require Connect)
+- Manage Messages (in every visible channel where cached purge should remove recent scammer messages)
 - Send Messages (in logs, review, and joinwatch channels)
 - Kick Members (if using kick)
 - Ban Members (if using ban)
@@ -326,7 +330,7 @@ pending review metadata. No persistent user data.
 ## Operational Notes
 
 - Bot owners, mods, admins, users with `Manage Server`, and users at or above the bot's top role are ignored
-- The purge only scans the honeypot channel, not the entire server
+- Purge uses a 2-minute Gateway message cache; it does not scan channel history
 - Fake activity runs once per minute, only posts when the configured interval has elapsed
 - When using review mode, a mute role is used as temporary containment until moderators decide
 - `!honeypot doctor` checks all permissions and configuration at once
