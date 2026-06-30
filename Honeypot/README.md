@@ -72,6 +72,16 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot firstpost action <review\|kick\|ban\|none>` | Action for suspicious first observed messages |
 | `!honeypot firstpost status` | Show firstpost status and seen-author count |
 
+### spam
+
+| Command | Description |
+|---------|-------------|
+| `!honeypot spam toggle <bool>` | Enable or disable repeated message detection |
+| `!honeypot spam action <review\|kick\|ban\|none>` | Action for repeated messages across channels |
+| `!honeypot spam window <3-60>` | Seconds in the repeated message window |
+| `!honeypot spam channels <2-10>` | Different channels required to trigger |
+| `!honeypot spam status` | Show spam detection status |
+
 ### fakeactivity
 
 | Command | Description |
@@ -148,6 +158,7 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot config punishment` | Show punishment settings |
 | `!honeypot config purge` | Show purge settings |
 | `!honeypot config firstpost` | Show firstpost settings |
+| `!honeypot config spam` | Show spam detection settings |
 | `!honeypot config fakeactivity` | Show fake activity settings |
 | `!honeypot config review` | Show review settings and pending review count |
 | `!honeypot config roles` | Show whitelist role settings |
@@ -201,6 +212,10 @@ but can satisfy the 2-attachment firstpost rule.
 `firstpost collect` and active firstpost detection are mutually exclusive:
 enabling one disables the other.
 
+If spam detection is enabled, a user's matching message fingerprint in multiple
+different channels within the configured window is considered suspicious when
+the message has attachments or configured scam keywords.
+
 Default scam keywords: `free nitro`, `giveaway`, `steam gift`, `free discord`, `discord.gift`,
 `claim your`, `you won`, `free vbucks`, `free robux`, `free coins`, `boost your server`,
 `limited time`, `exclusive offer`, `free membership`, `hack`, `crack`, `generator`.
@@ -251,6 +266,7 @@ for 2 minutes, then deletes those known messages directly. After a purge trigger
 the bot also forward-purges new messages from that user for 1 minute.
 
 `Early catches` counts suspicious first observed messages handled by firstpost.
+`Spam catches` counts repeated messages across channels handled by spam detection.
 
 The `Joinwatch` stats section tracks non-bot joins while joinwatch is enabled.
 `Young joins` counts accounts below the configured `joinwatch max_age`

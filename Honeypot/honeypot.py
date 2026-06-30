@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import logging
 import random
@@ -58,6 +59,11 @@ DEFAULT_STATS = {
     "firstpost_kicks": 0,
     "firstpost_bans": 0,
     "early_catches": 0,
+    "spam_hits": 0,
+    "spam_reviews": 0,
+    "spam_kicks": 0,
+    "spam_bans": 0,
+    "spam_catches": 0,
     "joinwatch_total_joins": 0,
     "joinwatch_young_joins": 0,
     "joinwatch_auto_roles_scheduled": 0,
@@ -73,6 +79,10 @@ POST_BAN_SWEEP_DELAY_SECONDS = 5
 MESSAGE_CACHE_RETENTION_SECONDS = 120
 FORWARD_PURGE_SECONDS = 60
 RECENT_USER_MESSAGES_PER_USER_LIMIT = 25
+SPAM_WINDOW_MIN_SECONDS = 3
+SPAM_WINDOW_MAX_SECONDS = 60
+SPAM_CHANNEL_MIN = 2
+SPAM_CHANNEL_MAX = 10
 REVIEW_KICK_FAIL_WARNING_MODES = ("false", "true", "manual")
 KICK_FAIL_WARNING_REASON = "Suspicious activity: target left before the kick could be applied."
 CORE_ACTION_OPTIONS = ("kick", "ban", "review", "none")
@@ -120,6 +130,7 @@ class MessageRef(typing.NamedTuple):
     channel_id: int
     message_id: int
     created_at: datetime
+    fingerprint: str
 
 
 SCAM_KEYWORDS = [
@@ -176,6 +187,20 @@ def matched_scam_keywords(
         )
         and keyword_matches_content(keyword, content)
     ]
+
+
+def message_spam_fingerprint(message: discord.Message) -> str:
+    content = re.sub(r"\s+", " ", message.content.strip().lower())
+    attachments = tuple(
+        (
+            attachment.filename.lower(),
+            attachment.size,
+            (attachment.content_type or "").lower(),
+        )
+        for attachment in message.attachments
+    )
+    raw = repr((content, attachments))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 class ReviewView(discord.ui.View):
@@ -501,6 +526,10 @@ class Honeypot(Cog):
             firstpost_collect_enabled=False,
             firstpost_enabled=False,
             firstpost_action="review",
+            spam_enabled=False,
+            spam_action="review",
+            spam_window_seconds=10,
+            spam_min_channels=2,
             fake_activity_enabled=False,
             fake_activity_interval=10,
             fake_activity_messages=[],
@@ -1440,7 +1469,14 @@ class Honeypot(Cog):
         if message.guild is None:
             return
         refs = self._recent_user_messages[message.guild.id][message.author.id]
-        refs.append(MessageRef(message.channel.id, message.id, message.created_at))
+        refs.append(
+            MessageRef(
+                message.channel.id,
+                message.id,
+                message.created_at,
+                message_spam_fingerprint(message),
+            )
+        )
         self._prune_recent_user_messages(message.guild.id, message.author.id)
 
     def _prune_recent_user_messages(self, guild_id: int, user_id: int) -> None:
@@ -1609,6 +1645,148 @@ class Honeypot(Cog):
         if purged:
             await self._increment_stat(message.guild, "purged_messages", purged)
             await self._increment_stat(message.guild, "cached_purge_deletes", purged)
+
+    def _spam_suspicion_reasons(self, message: discord.Message, config: dict) -> list[str]:
+        window_seconds = int(config.get("spam_window_seconds", 10) or 10)
+        window_seconds = max(SPAM_WINDOW_MIN_SECONDS, min(window_seconds, SPAM_WINDOW_MAX_SECONDS))
+        min_channels = int(config.get("spam_min_channels", 2) or 2)
+        min_channels = max(SPAM_CHANNEL_MIN, min(min_channels, SPAM_CHANNEL_MAX))
+        content = message.content.strip().lower()
+        scam_keywords = config.get("scam_keywords") or SCAM_KEYWORDS
+        has_signal = bool(message.attachments) or bool(matched_scam_keywords(scam_keywords, content))
+        if not has_signal:
+            return []
+        current_fingerprint = message_spam_fingerprint(message)
+        cutoff = message.created_at - timedelta(seconds=window_seconds)
+        channel_ids = {
+            ref.channel_id
+            for ref in self._recent_user_messages.get(message.guild.id, {}).get(message.author.id, ())
+            if ref.fingerprint == current_fingerprint and ref.created_at >= cutoff
+        }
+        if len(channel_ids) < min_channels:
+            return []
+        return [
+            _("Same message in {count} channels within {seconds}s").format(
+                count=len(channel_ids),
+                seconds=window_seconds,
+            )
+        ]
+
+    async def _delete_spam_current_message(self, message: discord.Message) -> bool:
+        try:
+            await message.delete()
+            return True
+        except discord.NotFound:
+            return True
+        except discord.HTTPException:
+            log.debug("Failed to delete spam message from user %s", message.author.id)
+            return False
+
+    async def _finish_spam_response(
+        self, message: discord.Message, *, message_deleted: bool
+    ) -> None:
+        purged = await self._cached_purge_user_messages(
+            message.guild,
+            message.author.id,
+            exclude_message_id=message.id if message_deleted else None,
+        )
+        if purged:
+            await self._increment_stat(message.guild, "purged_messages", purged)
+            await self._increment_stat(message.guild, "cached_purge_deletes", purged)
+
+    async def _handle_spam_message(
+        self,
+        message: discord.Message,
+        config: dict,
+        logs_channel: discord.TextChannel | discord.Thread | None,
+    ) -> bool:
+        if not config.get("spam_enabled", False):
+            return False
+        suspicion_reasons = self._spam_suspicion_reasons(message, config)
+        if not suspicion_reasons:
+            return False
+        await self._increment_stat(message.guild, "spam_hits")
+        action = config.get("spam_action", "review")
+        if action not in CORE_ACTION_OPTIONS:
+            action = "review"
+        if action == "none":
+            return False
+
+        attachment_snapshots = await self._snapshot_attachments(message)
+        embed: discord.Embed = discord.Embed(
+            title=_("Spam hit"),
+            description=f">>> {message.content}" if message.content else _("*(message with attachments only)*"),
+            color=discord.Color.red(),
+            timestamp=message.created_at,
+        )
+        embed.set_author(
+            name=f"{message.author.display_name} ({message.author.id})",
+            icon_url=message.author.display_avatar,
+        )
+        embed.set_thumbnail(url=message.author.display_avatar)
+        attachment_summary = self._attachment_summary(attachment_snapshots)
+        if attachment_summary:
+            embed.add_field(
+                name=_("Attachments:"),
+                value=attachment_summary,
+                inline=False,
+            )
+        embed.add_field(
+            name=_("Trigger reasons:"),
+            value="\n".join(f"- {reason}" for reason in suspicion_reasons),
+            inline=False,
+        )
+        embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
+
+        review_channel = None
+        if config.get("review_channel") is not None:
+            review_channel = self._get_text_channel_or_thread(message.guild, config["review_channel"])
+
+        message_deleted = False
+        if action == "review":
+            if review_channel is not None:
+                await self._send_review(
+                    message,
+                    config,
+                    embed,
+                    review_channel,
+                    logs_channel,
+                    attachment_snapshots,
+                )
+                await self._increment_stat(message.guild, "spam_reviews")
+                await self._increment_stat(message.guild, "spam_catches")
+            else:
+                embed.color = discord.Color.orange()
+                embed.add_field(
+                    name=_("Action:"),
+                    value=_("No action taken. Spam review needs a review channel."),
+                    inline=False,
+                )
+                await self._send_log(logs_channel, embed, attachment_snapshots)
+            message_deleted = await self._delete_spam_current_message(message)
+            await self._finish_spam_response(message, message_deleted=message_deleted)
+            return True
+
+        action_label, failed = await self._execute_action(
+            message,
+            config,
+            reason="Same message in multiple channels",
+            action=action,
+        )
+        embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
+        if failed:
+            embed.color = discord.Color.dark_red()
+            embed.add_field(name=_("Staff check needed:"), value=_("Spam action failed."), inline=False)
+        else:
+            await self._increment_stat(message.guild, "spam_catches")
+            if action == "kick":
+                await self._increment_stat(message.guild, "spam_kicks")
+            elif action == "ban":
+                await self._increment_stat(message.guild, "spam_bans")
+        await self._send_log(logs_channel, embed, attachment_snapshots)
+        message_deleted = await self._delete_spam_current_message(message)
+        await self._finish_spam_response(message, message_deleted=message_deleted)
+        return True
 
     async def _handle_firstpost_message(
         self,
@@ -1923,6 +2101,8 @@ class Honeypot(Cog):
             return
         logs_channel = self._get_text_channel_or_thread(message.guild, config.get("logs_channel"))
         if await self._is_protected_member(message.author):
+            return
+        if await self._handle_spam_message(message, config, logs_channel):
             return
         if await self._handle_firstpost_message(message, config, logs_channel):
             return
@@ -2916,6 +3096,90 @@ class Honeypot(Cog):
         else:
             await ctx.send(_("Cached purge retention is fixed at 2 minutes."))
 
+    # ─── spam sub-group ────────────────────────────────────────────────
+
+    @honeypot.group()
+    async def spam(self, ctx: commands.Context) -> None:
+        """Detect repeated messages across channels."""
+
+    @spam.command(name="toggle")
+    async def spam_toggle(self, ctx: commands.Context, value: bool = None) -> None:
+        """Enable or disable repeated message detection."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).spam_enabled()
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
+        else:
+            await self.config.guild(ctx.guild).spam_enabled.set(value)
+            await ctx.send(_("✅ Spam detection set to {value}").format(value=value))
+
+    @spam.command(name="action")
+    async def spam_action(self, ctx: commands.Context, value: str = None) -> None:
+        """Action for repeated message detections."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).spam_action()
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=v,
+                    options=self._format_options(CORE_ACTION_OPTIONS),
+                )
+            )
+        elif value not in CORE_ACTION_OPTIONS:
+            await ctx.send(_("Choose one of: {options}").format(options=self._format_options(CORE_ACTION_OPTIONS)))
+        else:
+            await self.config.guild(ctx.guild).spam_action.set(value)
+            await ctx.send(_("✅ Spam action set to {value}").format(value=value))
+
+    @spam.command(name="window")
+    async def spam_window(self, ctx: commands.Context, seconds: int = None) -> None:
+        """Seconds in the repeated message window."""
+        if seconds is None:
+            v = await self.config.guild(ctx.guild).spam_window_seconds()
+            await ctx.send(_("Spam window: {seconds}s").format(seconds=v))
+        elif seconds < SPAM_WINDOW_MIN_SECONDS or seconds > SPAM_WINDOW_MAX_SECONDS:
+            await ctx.send(
+                _("Seconds must be between {minimum} and {maximum}.").format(
+                    minimum=SPAM_WINDOW_MIN_SECONDS,
+                    maximum=SPAM_WINDOW_MAX_SECONDS,
+                )
+            )
+        else:
+            await self.config.guild(ctx.guild).spam_window_seconds.set(seconds)
+            await ctx.send(_("✅ Spam window set to {seconds}s").format(seconds=seconds))
+
+    @spam.command(name="channels")
+    async def spam_channels(self, ctx: commands.Context, count: int = None) -> None:
+        """Different channels required for duplicate spam detection."""
+        if count is None:
+            v = await self.config.guild(ctx.guild).spam_min_channels()
+            await ctx.send(_("Spam channel threshold: {count}").format(count=v))
+        elif count < SPAM_CHANNEL_MIN or count > SPAM_CHANNEL_MAX:
+            await ctx.send(
+                _("Channel count must be between {minimum} and {maximum}.").format(
+                    minimum=SPAM_CHANNEL_MIN,
+                    maximum=SPAM_CHANNEL_MAX,
+                )
+            )
+        else:
+            await self.config.guild(ctx.guild).spam_min_channels.set(count)
+            await ctx.send(_("✅ Spam channel threshold set to {count}").format(count=count))
+
+    @spam.command(name="status")
+    async def spam_status(self, ctx: commands.Context) -> None:
+        """Show spam detection status."""
+        config = await self.config.guild(ctx.guild).all()
+        lines = [
+            f"Enabled: {self._format_bool_setting(config.get('spam_enabled', False))}",
+            f"Action: {config.get('spam_action', 'review')}",
+            f"Window: {config.get('spam_window_seconds', 10)}s",
+            f"Channels: {config.get('spam_min_channels', 2)}",
+        ]
+        await ctx.send(_("**Spam status:**\n") + box("\n".join(lines)))
+
     # ─── firstpost sub-group ────────────────────────────────────────────
 
     @honeypot.group()
@@ -3650,6 +3914,21 @@ class Honeypot(Cog):
             ],
         )
 
+    @config_dump.command(name="spam")
+    async def config_spam(self, ctx: commands.Context) -> None:
+        """Show spam detection configuration."""
+        config = await self.config.guild(ctx.guild).all()
+        await self._send_config_dump(
+            ctx,
+            _("Spam config"),
+            [
+                (_("Enabled"), self._format_bool_setting(config.get("spam_enabled", False))),
+                (_("Action"), config.get("spam_action", "review")),
+                (_("Window"), _("{seconds}s").format(seconds=config.get("spam_window_seconds", 10))),
+                (_("Channels"), config.get("spam_min_channels", 2)),
+            ],
+        )
+
     @config_dump.command(name="fakeactivity")
     async def config_fakeactivity(self, ctx: commands.Context) -> None:
         """Show fake activity configuration."""
@@ -3777,6 +4056,7 @@ class Honeypot(Cog):
                 (_("Honeypot channels"), self._format_honeypot_channel_list(ctx.guild, self._honeypot_channel_ids_from_config(config))),
                 (_("Logs channel"), self._format_channel_setting(ctx.guild, config.get("logs_channel"))),
                 (_("Review"), self._format_bool_setting(config.get("review_enabled", False))),
+                (_("Spam"), self._format_bool_setting(config.get("spam_enabled", False))),
                 (_("Joinwatch"), self._format_bool_setting(config.get("joinwatch_enabled", False))),
                 (_("Joinwatch auto-role"), self._format_bool_setting(config.get("joinwatch_auto_role_enabled", False))),
                 (_("Bait role"), self._format_bool_setting(config.get("baitrole_enabled", False))),
@@ -3815,6 +4095,13 @@ class Honeypot(Cog):
                 "Firstpost kicks": stats["firstpost_kicks"],
                 "Firstpost bans": stats["firstpost_bans"],
                 "Early catches": stats["early_catches"],
+            },
+            "Spam": {
+                "Spam hits": stats["spam_hits"],
+                "Spam reviews": stats["spam_reviews"],
+                "Spam kicks": stats["spam_kicks"],
+                "Spam bans": stats["spam_bans"],
+                "Spam catches": stats["spam_catches"],
             },
             "Review": {
                 "Reviews sent": stats["reviewed"],
@@ -3861,6 +4148,7 @@ class Honeypot(Cog):
             f"  {_('Bans')}: {stats['banned']}",
             f"  {_('Sent for Review')}: {stats['reviewed']}",
             f"  {_('Early catches')}: {stats['early_catches']}",
+            f"  {_('Spam catches')}: {stats['spam_catches']}",
             f"  {_('Auto roles applied')}: {stats['joinwatch_auto_roles']}",
             f"  {_('Auto role punishments')}: {stats['joinwatch_auto_role_punishments']}",
         ]
@@ -3891,6 +4179,7 @@ class Honeypot(Cog):
         checks.append(("Honeypot enabled", bool(config.get("enabled")), "Run `honeypot core toggle true`."))
         checks.append(("Action configured", config.get("action") in ("kick", "ban", "review", "none"), "Run `honeypot core action`."))
         checks.append(("Firstpost action configured", config.get("firstpost_action", "review") in CORE_ACTION_OPTIONS, "Run `honeypot firstpost action`."))
+        checks.append(("Spam action configured", config.get("spam_action", "review") in CORE_ACTION_OPTIONS, "Run `honeypot spam action`."))
         checks.append(("Honeypot channel exists", bool(honeypot_channels), "Run `honeypot channel add`."))
         checks.append(("Logs channel exists", logs_channel is not None, "Run `honeypot channel logs`."))
         if (
@@ -3900,6 +4189,10 @@ class Honeypot(Cog):
             or (
                 config.get("firstpost_enabled", False)
                 and config.get("firstpost_action", "review") == "review"
+            )
+            or (
+                config.get("spam_enabled", False)
+                and config.get("spam_action", "review") == "review"
             )
         ):
             checks.append(("Review channel exists", review_channel is not None, "Run `honeypot review channel`."))
