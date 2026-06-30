@@ -137,6 +137,7 @@ DEFAULT_ATTACHMENT_PATTERNS = [
 ]
 
 GENERIC_ATTACHMENT_NAME_RE = re.compile(r"^(?:image(?: ?\(\d+\))?|\d+)$", re.IGNORECASE)
+WORD_KEYWORD_RE = re.compile(r"^[\w ]+$")
 IMAGE_ATTACHMENT_EXTENSIONS = {
     ".avif",
     ".bmp",
@@ -148,6 +149,15 @@ IMAGE_ATTACHMENT_EXTENSIONS = {
     ".tiff",
     ".webp",
 }
+
+
+def keyword_matches_content(keyword: str, content: str) -> bool:
+    keyword = keyword.strip().lower()
+    if not keyword:
+        return False
+    if WORD_KEYWORD_RE.fullmatch(keyword):
+        return re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", content) is not None
+    return keyword in content
 
 
 class ReviewView(discord.ui.View):
@@ -1373,7 +1383,7 @@ class Honeypot(Cog):
         if message.author.created_at > datetime.now(timezone.utc) - timedelta(days=7):
             reasons.append(_("Account is under 7 days old"))
         scam_keywords = config.get("scam_keywords") or SCAM_KEYWORDS
-        matched_keywords = [kw for kw in scam_keywords if kw.lower() in content]
+        matched_keywords = [kw for kw in scam_keywords if keyword_matches_content(kw, content)]
         if matched_keywords:
             reasons.append(_("Matched keywords: {keywords}").format(keywords=", ".join(matched_keywords[:5])))
         if message.attachments and message.author.created_at > datetime.now(timezone.utc) - timedelta(days=14):
@@ -1529,13 +1539,11 @@ class Honeypot(Cog):
         reasons: list[str] = []
         content = message.content.strip().lower()
         scam_keywords = config.get("scam_keywords") or SCAM_KEYWORDS
-        matched_keywords = [kw for kw in scam_keywords if kw.lower() in content]
+        matched_keywords = [kw for kw in scam_keywords if keyword_matches_content(kw, content)]
         if matched_keywords:
             reasons.append(_("Matched keywords: {keywords}").format(keywords=", ".join(matched_keywords[:5])))
         if attachment_count <= 0:
             return reasons
-        if not content:
-            reasons.append(_("First post with empty attachment message"))
         if attachment_count >= 2:
             reasons.append(_("First post with multiple attachments"))
         return reasons
