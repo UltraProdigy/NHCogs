@@ -137,6 +137,7 @@ DEFAULT_ATTACHMENT_PATTERNS = [
 ]
 
 GENERIC_ATTACHMENT_NAME_RE = re.compile(r"^(?:image(?: ?\(\d+\))?|\d+)$", re.IGNORECASE)
+ATTACHMENT_ONLY_SCAM_KEYWORDS = {"bro"}
 WORD_KEYWORD_RE = re.compile(r"^[\w ]+$")
 IMAGE_ATTACHMENT_EXTENSIONS = {
     ".avif",
@@ -158,6 +159,23 @@ def keyword_matches_content(keyword: str, content: str) -> bool:
     if WORD_KEYWORD_RE.fullmatch(keyword):
         return re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", content) is not None
     return keyword in content
+
+
+def matched_scam_keywords(
+    keywords: typing.Iterable[str],
+    content: str,
+    *,
+    include_attachment_only: bool = False,
+) -> list[str]:
+    return [
+        keyword
+        for keyword in keywords
+        if (
+            include_attachment_only
+            or keyword.strip().lower() not in ATTACHMENT_ONLY_SCAM_KEYWORDS
+        )
+        and keyword_matches_content(keyword, content)
+    ]
 
 
 class ReviewView(discord.ui.View):
@@ -1386,7 +1404,7 @@ class Honeypot(Cog):
         if message.author.created_at > datetime.now(timezone.utc) - timedelta(days=7):
             reasons.append(_("Account is under 7 days old"))
         scam_keywords = config.get("scam_keywords") or SCAM_KEYWORDS
-        matched_keywords = [kw for kw in scam_keywords if keyword_matches_content(kw, content)]
+        matched_keywords = matched_scam_keywords(scam_keywords, content)
         if matched_keywords:
             reasons.append(_("Matched keywords: {keywords}").format(keywords=", ".join(matched_keywords[:5])))
         if message.attachments and message.author.created_at > datetime.now(timezone.utc) - timedelta(days=14):
@@ -1556,7 +1574,11 @@ class Honeypot(Cog):
             reasons.append(_("First post with four attachments"))
         elif attachment_count == 2:
             scam_keywords = config.get("scam_keywords") or SCAM_KEYWORDS
-            matched_keywords = [kw for kw in scam_keywords if keyword_matches_content(kw, content)]
+            matched_keywords = matched_scam_keywords(
+                scam_keywords,
+                content,
+                include_attachment_only=True,
+            )
             if matched_keywords:
                 reasons.append(
                     _("First post with two attachments and keywords: {keywords}").format(
