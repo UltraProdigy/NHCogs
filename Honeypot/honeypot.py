@@ -498,6 +498,7 @@ class Honeypot(Cog):
             whitelisted_roles=[],
             purge_enabled=True,
             purge_minutes=5,
+            firstpost_collect_enabled=False,
             firstpost_enabled=False,
             firstpost_action="review",
             fake_activity_enabled=False,
@@ -1615,9 +1616,13 @@ class Honeypot(Cog):
         config: dict,
         logs_channel: discord.TextChannel | discord.Thread | None,
     ) -> bool:
-        if not config.get("firstpost_enabled", False):
+        firstpost_enabled = config.get("firstpost_enabled", False)
+        collect_enabled = config.get("firstpost_collect_enabled", False)
+        if not firstpost_enabled and not collect_enabled:
             return False
         if not await self._mark_firstpost_seen(message.guild, message.author.id):
+            return False
+        if not firstpost_enabled:
             return False
         suspicion_reasons = self._firstpost_suspicion_reasons(message, config)
         if not suspicion_reasons:
@@ -2930,7 +2935,26 @@ class Honeypot(Cog):
             )
         else:
             await self.config.guild(ctx.guild).firstpost_enabled.set(value)
+            if value:
+                await self.config.guild(ctx.guild).firstpost_collect_enabled.set(False)
             await ctx.send(_("✅ Firstpost enabled set to {value}").format(value=value))
+
+    @firstpost.command(name="collect")
+    async def firstpost_collect(self, ctx: commands.Context, value: bool = None) -> None:
+        """Collect first observed senders without taking action."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).firstpost_collect_enabled()
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
+        else:
+            await self.config.guild(ctx.guild).firstpost_collect_enabled.set(value)
+            if value:
+                await self.config.guild(ctx.guild).firstpost_enabled.set(False)
+            await ctx.send(_("✅ Firstpost collect set to {value}").format(value=value))
 
     @firstpost.command(name="action")
     async def firstpost_action(self, ctx: commands.Context, value: str = None) -> None:
@@ -2956,6 +2980,7 @@ class Honeypot(Cog):
         seen_count = await self._count_firstpost_seen_authors(ctx.guild.id)
         lines = [
             f"Enabled: {self._format_bool_setting(config.get('firstpost_enabled', False))}",
+            f"Collect: {self._format_bool_setting(config.get('firstpost_collect_enabled', False))}",
             f"Action: {config.get('firstpost_action', 'review')}",
             f"Seen authors: {seen_count}",
         ]
@@ -3620,6 +3645,7 @@ class Honeypot(Cog):
             _("Firstpost config"),
             [
                 (_("Enabled"), self._format_bool_setting(config.get("firstpost_enabled", False))),
+                (_("Collect"), self._format_bool_setting(config.get("firstpost_collect_enabled", False))),
                 (_("Action"), config.get("firstpost_action", "review")),
             ],
         )

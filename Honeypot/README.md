@@ -68,6 +68,7 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | Command | Description |
 |---------|-------------|
 | `!honeypot firstpost toggle <bool>` | Enable or disable suspicious first-post detection |
+| `!honeypot firstpost collect <bool>` | Collect first observed senders without taking action |
 | `!honeypot firstpost action <review\|kick\|ban\|none>` | Action for suspicious first observed messages |
 | `!honeypot firstpost status` | Show firstpost status and seen-author count |
 
@@ -197,6 +198,8 @@ suspicious when it has exactly 4 attachments, or exactly 2 attachments with
 configured scam keywords.
 The keyword `bro` is treated as attachment-only: it does not trigger by itself,
 but can satisfy the 2-attachment firstpost rule.
+`firstpost collect` and active firstpost detection are mutually exclusive:
+enabling one disables the other.
 
 Default scam keywords: `free nitro`, `giveaway`, `steam gift`, `free discord`, `discord.gift`,
 `claim your`, `you won`, `free vbucks`, `free robux`, `free coins`, `boost your server`,
