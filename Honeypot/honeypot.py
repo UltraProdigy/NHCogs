@@ -3,6 +3,7 @@ import io
 import logging
 import random
 import re
+import sqlite3
 import typing
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,7 @@ from discord.ext import tasks
 from AAA3A_utils import Cog
 from redbot.core import Config, commands, modlog
 from redbot.core.bot import Red
+from redbot.core.data_manager import cog_data_path
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.chat_formatting import box, pagify
 
@@ -50,6 +52,12 @@ DEFAULT_STATS = {
     "purged_messages": 0,
     "cached_purge_deletes": 0,
     "forward_purge_deletes": 0,
+    "firstpost_seen": 0,
+    "firstpost_hits": 0,
+    "firstpost_reviews": 0,
+    "firstpost_kicks": 0,
+    "firstpost_bans": 0,
+    "early_catches": 0,
     "joinwatch_total_joins": 0,
     "joinwatch_young_joins": 0,
     "joinwatch_auto_roles_scheduled": 0,
@@ -459,6 +467,9 @@ class Honeypot(Cog):
             whitelisted_roles=[],
             purge_enabled=True,
             purge_minutes=5,
+            firstpost_enabled=False,
+            firstpost_action="review",
+            firstpost_bait_texts=["bro"],
             fake_activity_enabled=False,
             fake_activity_interval=10,
             fake_activity_messages=[],
@@ -499,11 +510,115 @@ class Honeypot(Cog):
             lambda: defaultdict(deque)
         )
         self._hot_purge_users: dict[int, dict[int, datetime]] = defaultdict(dict)
+        self._firstpost_db_path = cog_data_path(self) / "firstpost_seen.sqlite"
+        self._firstpost_db_lock: asyncio.Lock = asyncio.Lock()
+        self._firstpost_seen_authors: dict[int, set[int]] = defaultdict(set)
+        self._firstpost_dirty_seen_authors: dict[int, set[int]] = defaultdict(set)
+        self._firstpost_loaded_guilds: set[int] = set()
 
     async def _increment_stat(self, guild: discord.Guild, key: str, amount: int = 1) -> None:
         async with self.config.guild(guild).stats() as stats:
             stats.setdefault(key, 0)
             stats[key] += amount
+
+    def _init_firstpost_seen_store_sync(self) -> None:
+        self._firstpost_db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self._firstpost_db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS firstpost_seen_authors (
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    first_seen_at INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, user_id)
+                )
+                """
+            )
+
+    async def _init_firstpost_seen_store(self) -> None:
+        await asyncio.to_thread(self._init_firstpost_seen_store_sync)
+
+    def _load_firstpost_seen_authors_sync(self, guild_id: int) -> set[int]:
+        with sqlite3.connect(self._firstpost_db_path) as conn:
+            rows = conn.execute(
+                "SELECT user_id FROM firstpost_seen_authors WHERE guild_id = ?",
+                (str(guild_id),),
+            ).fetchall()
+        return {int(row[0]) for row in rows}
+
+    def _count_firstpost_seen_authors_sync(self, guild_id: int) -> int:
+        with sqlite3.connect(self._firstpost_db_path) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM firstpost_seen_authors WHERE guild_id = ?",
+                (str(guild_id),),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    async def _count_firstpost_seen_authors(self, guild_id: int) -> int:
+        return await asyncio.to_thread(self._count_firstpost_seen_authors_sync, guild_id)
+
+    async def _ensure_firstpost_seen_loaded(self, guild_id: int) -> None:
+        if guild_id in self._firstpost_loaded_guilds:
+            return
+        async with self._firstpost_db_lock:
+            if guild_id in self._firstpost_loaded_guilds:
+                return
+            seen = await asyncio.to_thread(self._load_firstpost_seen_authors_sync, guild_id)
+            self._firstpost_seen_authors[guild_id].update(seen)
+            self._firstpost_loaded_guilds.add(guild_id)
+
+    def _flush_firstpost_seen_authors_sync(
+        self, dirty: dict[int, set[int]], first_seen_at: int
+    ) -> None:
+        rows = [
+            (str(guild_id), str(user_id), first_seen_at)
+            for guild_id, user_ids in dirty.items()
+            for user_id in user_ids
+        ]
+        if not rows:
+            return
+        with sqlite3.connect(self._firstpost_db_path) as conn:
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO firstpost_seen_authors
+                (guild_id, user_id, first_seen_at)
+                VALUES (?, ?, ?)
+                """,
+                rows,
+            )
+
+    async def _flush_firstpost_seen_authors(self) -> None:
+        async with self._firstpost_db_lock:
+            dirty = {
+                guild_id: set(user_ids)
+                for guild_id, user_ids in self._firstpost_dirty_seen_authors.items()
+                if user_ids
+            }
+        if not dirty:
+            return
+        await asyncio.to_thread(
+            self._flush_firstpost_seen_authors_sync,
+            dirty,
+            int(datetime.now(timezone.utc).timestamp()),
+        )
+        async with self._firstpost_db_lock:
+            for guild_id, user_ids in dirty.items():
+                remaining = self._firstpost_dirty_seen_authors.get(guild_id)
+                if remaining is None:
+                    continue
+                remaining.difference_update(user_ids)
+                if not remaining:
+                    self._firstpost_dirty_seen_authors.pop(guild_id, None)
+
+    async def _mark_firstpost_seen(self, guild: discord.Guild, user_id: int) -> bool:
+        await self._ensure_firstpost_seen_loaded(guild.id)
+        async with self._firstpost_db_lock:
+            if user_id in self._firstpost_seen_authors[guild.id]:
+                return False
+            self._firstpost_seen_authors[guild.id].add(user_id)
+            self._firstpost_dirty_seen_authors[guild.id].add(user_id)
+        await self._increment_stat(guild, "firstpost_seen")
+        return True
 
     async def _store_pending_review(
         self,
@@ -1073,10 +1188,12 @@ class Honeypot(Cog):
 
     async def cog_load(self) -> None:
         await super().cog_load()
+        await self._init_firstpost_seen_store()
         self.fake_activity_loop.start()
         self.review_timeout_loop.start()
         self.joinwatch_auto_role_loop.start()
         self.purge_cache_cleanup_loop.start()
+        self.firstpost_seen_flush_loop.start()
         self._restore_task = asyncio.create_task(self._restore_pending_reviews())
 
     async def cog_unload(self) -> None:
@@ -1084,6 +1201,7 @@ class Honeypot(Cog):
         self.review_timeout_loop.cancel()
         self.joinwatch_auto_role_loop.cancel()
         self.purge_cache_cleanup_loop.cancel()
+        self.firstpost_seen_flush_loop.cancel()
         if self._restore_task is not None:
             self._restore_task.cancel()
         pending_sweeps = tuple(self._post_ban_sweep_tasks)
@@ -1092,7 +1210,12 @@ class Honeypot(Cog):
         if pending_sweeps:
             await asyncio.gather(*pending_sweeps, return_exceptions=True)
         self._post_ban_sweep_tasks.clear()
+        await self._flush_firstpost_seen_authors()
         await super().cog_unload()
+
+    @tasks.loop(seconds=60)
+    async def firstpost_seen_flush_loop(self) -> None:
+        await self._flush_firstpost_seen_authors()
 
     @tasks.loop(minutes=1)
     async def purge_cache_cleanup_loop(self) -> None:
@@ -1400,6 +1523,145 @@ class Honeypot(Cog):
             )
             return False
 
+    def _firstpost_suspicion_reasons(
+        self, message: discord.Message, config: dict
+    ) -> list[str]:
+        attachment_count = len(message.attachments)
+        if attachment_count <= 0:
+            return []
+        reasons: list[str] = []
+        content = message.content.strip().lower()
+        bait_texts = {
+            str(text).strip().lower()
+            for text in config.get("firstpost_bait_texts", [])
+            if str(text).strip()
+        }
+        if not content:
+            reasons.append(_("First post with empty attachment message"))
+        if content and content in bait_texts:
+            reasons.append(_("First post with bait attachment message"))
+        if attachment_count >= 2:
+            reasons.append(_("First post with multiple attachments"))
+        return reasons
+
+    async def _delete_firstpost_current_message(self, message: discord.Message) -> bool:
+        try:
+            await message.delete()
+            return True
+        except discord.NotFound:
+            return True
+        except discord.HTTPException:
+            log.debug("Failed to delete firstpost message from user %s", message.author.id)
+            return False
+
+    async def _finish_firstpost_response(
+        self, message: discord.Message, *, message_deleted: bool
+    ) -> None:
+        purged = await self._cached_purge_user_messages(
+            message.guild,
+            message.author.id,
+            exclude_message_id=message.id if message_deleted else None,
+        )
+        if purged:
+            await self._increment_stat(message.guild, "purged_messages", purged)
+            await self._increment_stat(message.guild, "cached_purge_deletes", purged)
+
+    async def _handle_firstpost_message(
+        self,
+        message: discord.Message,
+        config: dict,
+        logs_channel: discord.TextChannel | discord.Thread | None,
+    ) -> bool:
+        if not config.get("firstpost_enabled", False):
+            return False
+        if not await self._mark_firstpost_seen(message.guild, message.author.id):
+            return False
+        suspicion_reasons = self._firstpost_suspicion_reasons(message, config)
+        if not suspicion_reasons:
+            return False
+        await self._increment_stat(message.guild, "firstpost_hits")
+        action = config.get("firstpost_action", "review")
+        if action not in CORE_ACTION_OPTIONS:
+            action = "review"
+        if action == "none":
+            return False
+
+        attachment_snapshots = await self._snapshot_attachments(message)
+        embed: discord.Embed = discord.Embed(
+            title=_("Firstpost hit"),
+            description=f">>> {message.content}" if message.content else _("*(message with attachments only)*"),
+            color=discord.Color.red(),
+            timestamp=message.created_at,
+        )
+        embed.set_author(
+            name=f"{message.author.display_name} ({message.author.id})",
+            icon_url=message.author.display_avatar,
+        )
+        embed.set_thumbnail(url=message.author.display_avatar)
+        attachment_summary = self._attachment_summary(attachment_snapshots)
+        if attachment_summary:
+            embed.add_field(
+                name=_("Attachments:"),
+                value=attachment_summary,
+                inline=False,
+            )
+        embed.add_field(
+            name=_("Trigger reasons:"),
+            value="\n".join(f"- {reason}" for reason in suspicion_reasons),
+            inline=False,
+        )
+        embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
+
+        review_channel = None
+        if config.get("review_channel") is not None:
+            review_channel = self._get_text_channel_or_thread(message.guild, config["review_channel"])
+
+        message_deleted = False
+        if action == "review":
+            if review_channel is not None:
+                await self._send_review(
+                    message,
+                    config,
+                    embed,
+                    review_channel,
+                    logs_channel,
+                    attachment_snapshots,
+                )
+                await self._increment_stat(message.guild, "firstpost_reviews")
+                await self._increment_stat(message.guild, "early_catches")
+            else:
+                embed.color = discord.Color.orange()
+                embed.add_field(
+                    name=_("Action:"),
+                    value=_("No action taken. Firstpost review needs a review channel."),
+                    inline=False,
+                )
+                await self._send_log(logs_channel, embed, attachment_snapshots)
+            message_deleted = await self._delete_firstpost_current_message(message)
+            await self._finish_firstpost_response(message, message_deleted=message_deleted)
+            return True
+
+        action_label, failed = await self._execute_action(
+            message,
+            config,
+            reason="Suspicious first observed message.",
+            action=action,
+        )
+        embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
+        if failed:
+            embed.color = discord.Color.dark_red()
+            embed.add_field(name=_("Staff check needed:"), value=_("Firstpost action failed."), inline=False)
+        else:
+            await self._increment_stat(message.guild, "early_catches")
+            if action == "kick":
+                await self._increment_stat(message.guild, "firstpost_kicks")
+            elif action == "ban":
+                await self._increment_stat(message.guild, "firstpost_bans")
+        await self._send_log(logs_channel, embed, attachment_snapshots)
+        message_deleted = await self._delete_firstpost_current_message(message)
+        await self._finish_firstpost_response(message, message_deleted=message_deleted)
+        return True
+
     def _schedule_post_ban_sweep_if_enabled(
         self, guild: discord.Guild, user_id: int, config: dict
     ) -> None:
@@ -1609,13 +1871,15 @@ class Honeypot(Cog):
                 await self._increment_stat(message.guild, "forward_purge_deletes")
             return
         config = await self.config.guild(message.guild).all()
-        configured_honeypot_channel_ids = self._honeypot_channel_ids_from_config(config)
-        if message.channel.id not in configured_honeypot_channel_ids:
-            return
         if not config["enabled"]:
             return
         logs_channel = self._get_text_channel_or_thread(message.guild, config.get("logs_channel"))
         if await self._is_protected_member(message.author):
+            return
+        if await self._handle_firstpost_message(message, config, logs_channel):
+            return
+        configured_honeypot_channel_ids = self._honeypot_channel_ids_from_config(config)
+        if message.channel.id not in configured_honeypot_channel_ids:
             return
 
         attachment_snapshots = await self._snapshot_attachments(message)
@@ -2604,6 +2868,57 @@ class Honeypot(Cog):
         else:
             await ctx.send(_("Cached purge retention is fixed at 2 minutes."))
 
+    # ─── firstpost sub-group ────────────────────────────────────────────
+
+    @honeypot.group()
+    async def firstpost(self, ctx: commands.Context) -> None:
+        """Detect suspicious first observed messages."""
+
+    @firstpost.command(name="toggle")
+    async def firstpost_toggle(self, ctx: commands.Context, value: bool = None) -> None:
+        """Enable or disable firstpost detection."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).firstpost_enabled()
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
+        else:
+            await self.config.guild(ctx.guild).firstpost_enabled.set(value)
+            await ctx.send(_("✅ Firstpost enabled set to {value}").format(value=value))
+
+    @firstpost.command(name="action")
+    async def firstpost_action(self, ctx: commands.Context, value: str = None) -> None:
+        """Action for suspicious first observed messages."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).firstpost_action()
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=v,
+                    options=self._format_options(CORE_ACTION_OPTIONS),
+                )
+            )
+        elif value not in CORE_ACTION_OPTIONS:
+            await ctx.send(_("Choose one of: {options}").format(options=self._format_options(CORE_ACTION_OPTIONS)))
+        else:
+            await self.config.guild(ctx.guild).firstpost_action.set(value)
+            await ctx.send(_("✅ Firstpost action set to {value}").format(value=value))
+
+    @firstpost.command(name="status")
+    async def firstpost_status(self, ctx: commands.Context) -> None:
+        """Show firstpost status."""
+        config = await self.config.guild(ctx.guild).all()
+        seen_count = await self._count_firstpost_seen_authors(ctx.guild.id)
+        lines = [
+            f"Enabled: {self._format_bool_setting(config.get('firstpost_enabled', False))}",
+            f"Action: {config.get('firstpost_action', 'review')}",
+            f"Bait texts: {', '.join(config.get('firstpost_bait_texts') or [])}",
+            f"Seen authors: {seen_count}",
+        ]
+        await ctx.send(_("**Firstpost status:**\n") + box("\n".join(lines)))
+
     # ─── fakeactivity sub-group ───────────────────────────────────────
 
     @honeypot.group()
@@ -3254,6 +3569,20 @@ class Honeypot(Cog):
             ],
         )
 
+    @config_dump.command(name="firstpost")
+    async def config_firstpost(self, ctx: commands.Context) -> None:
+        """Show firstpost configuration."""
+        config = await self.config.guild(ctx.guild).all()
+        await self._send_config_dump(
+            ctx,
+            _("Firstpost config"),
+            [
+                (_("Enabled"), self._format_bool_setting(config.get("firstpost_enabled", False))),
+                (_("Action"), config.get("firstpost_action", "review")),
+                (_("Bait texts"), ", ".join(config.get("firstpost_bait_texts") or [])),
+            ],
+        )
+
     @config_dump.command(name="fakeactivity")
     async def config_fakeactivity(self, ctx: commands.Context) -> None:
         """Show fake activity configuration."""
@@ -3412,6 +3741,14 @@ class Honeypot(Cog):
                 "Cached purge deletes": stats["cached_purge_deletes"],
                 "Forward purge deletes": stats["forward_purge_deletes"],
             },
+            "Firstpost": {
+                "Firstpost seen": stats["firstpost_seen"],
+                "Firstpost hits": stats["firstpost_hits"],
+                "Firstpost reviews": stats["firstpost_reviews"],
+                "Firstpost kicks": stats["firstpost_kicks"],
+                "Firstpost bans": stats["firstpost_bans"],
+                "Early catches": stats["early_catches"],
+            },
             "Review": {
                 "Reviews sent": stats["reviewed"],
                 "Active pending reviews": len(pending_reviews),
@@ -3456,6 +3793,7 @@ class Honeypot(Cog):
             f"  {_('Messages')}: {stats['detections']}",
             f"  {_('Bans')}: {stats['banned']}",
             f"  {_('Sent for Review')}: {stats['reviewed']}",
+            f"  {_('Early catches')}: {stats['early_catches']}",
             f"  {_('Auto roles applied')}: {stats['joinwatch_auto_roles']}",
             f"  {_('Auto role punishments')}: {stats['joinwatch_auto_role_punishments']}",
         ]
@@ -3485,9 +3823,18 @@ class Honeypot(Cog):
         review_channel = self._get_text_channel_or_thread(ctx.guild, config.get("review_channel"))
         checks.append(("Honeypot enabled", bool(config.get("enabled")), "Run `honeypot core toggle true`."))
         checks.append(("Action configured", config.get("action") in ("kick", "ban", "review", "none"), "Run `honeypot core action`."))
+        checks.append(("Firstpost action configured", config.get("firstpost_action", "review") in CORE_ACTION_OPTIONS, "Run `honeypot firstpost action`."))
         checks.append(("Honeypot channel exists", bool(honeypot_channels), "Run `honeypot channel add`."))
         checks.append(("Logs channel exists", logs_channel is not None, "Run `honeypot channel logs`."))
-        if config.get("fallback_action") == "review" or config.get("review_enabled") or config.get("whitelist_mode") == "review":
+        if (
+            config.get("fallback_action") == "review"
+            or config.get("review_enabled")
+            or config.get("whitelist_mode") == "review"
+            or (
+                config.get("firstpost_enabled", False)
+                and config.get("firstpost_action", "review") == "review"
+            )
+        ):
             checks.append(("Review channel exists", review_channel is not None, "Run `honeypot review channel`."))
         if config.get("mute_role"):
             mute_role = ctx.guild.get_role(config["mute_role"])

@@ -63,6 +63,14 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot purge toggle <bool>` | Delete recent cached messages from caught users |
 | `!honeypot purge minutes` | Show fixed cache retention |
 
+### firstpost
+
+| Command | Description |
+|---------|-------------|
+| `!honeypot firstpost toggle <bool>` | Enable or disable suspicious first-post detection |
+| `!honeypot firstpost action <review\|kick\|ban\|none>` | Action for suspicious first observed messages |
+| `!honeypot firstpost status` | Show firstpost status and seen-author count |
+
 ### fakeactivity
 
 | Command | Description |
@@ -138,6 +146,7 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot config channel` | Show channel and ping role settings |
 | `!honeypot config punishment` | Show punishment settings |
 | `!honeypot config purge` | Show purge settings |
+| `!honeypot config firstpost` | Show firstpost settings |
 | `!honeypot config fakeactivity` | Show fake activity settings |
 | `!honeypot config review` | Show review settings and pending review count |
 | `!honeypot config roles` | Show whitelist role settings |
@@ -183,6 +192,10 @@ A message is considered suspicious if:
 - Has 2+ generic attachment names (e.g. `image.jpeg`, `image(1).jpeg`, `1.jpeg`)
 - Has 2+ attachments matching configured filename-base regexes
 
+If firstpost is enabled, a user's first observed message is also considered
+suspicious when it has empty content with attachments, bait text such as `bro`
+with attachments, or 2+ attachments.
+
 Default scam keywords: `free nitro`, `giveaway`, `steam gift`, `free discord`, `discord.gift`,
 `claim your`, `you won`, `free vbucks`, `free robux`, `free coins`, `boost your server`,
 `limited time`, `exclusive offer`, `free membership`, `hack`, `crack`, `generator`.
@@ -209,7 +222,8 @@ as repeat honeypot activity and forces a ban with the reason `Suspicious Activit
 ## Stats
 
 `stats` shows a compact public-facing summary: messages, bans,
-sent-for-review cases, auto-roles applied, and auto role punishments.
+sent-for-review cases, early catches, auto-roles applied, and auto role
+punishments.
 
 `modstats` is the detailed moderator view. `Total detections` counts every
 non-exempt message caught in the honeypot channel. `Suspicious detections`
@@ -230,6 +244,8 @@ part of every detection.
 Cached purge stores recent message IDs observed through Discord Gateway events
 for 2 minutes, then deletes those known messages directly. After a purge trigger,
 the bot also forward-purges new messages from that user for 1 minute.
+
+`Early catches` counts suspicious first observed messages handled by firstpost.
 
 The `Joinwatch` stats section tracks non-bot joins while joinwatch is enabled.
 `Young joins` counts accounts below the configured `joinwatch max_age`
@@ -324,8 +340,10 @@ Both are enabled by default in RedBot v3.5+.
 
 ## Data Storage
 
-Only guild configuration: channel IDs, role IDs, booleans, numeric settings, custom messages, and
-pending review metadata. No persistent user data.
+Guild configuration stores channel IDs, role IDs, booleans, numeric settings,
+custom messages, and pending review metadata. Firstpost seen authors are stored
+separately in `firstpost_seen.sqlite` under the cog data directory so large
+servers do not inflate Red Config.
 
 ## Operational Notes
 
