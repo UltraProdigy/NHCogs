@@ -298,6 +298,7 @@ class ReviewView(discord.ui.View):
         if member is None and action not in ("ban", "ignore"):
             return (_("User is no longer in the server."), None)
         if action == "ignore":
+            self.cog._deactivate_forward_purge(guild.id, self.target_id)
             if member is not None and self.pending_mute_role_id is not None:
                 mute_role = guild.get_role(self.pending_mute_role_id)
                 if mute_role is not None and mute_role in member.roles:
@@ -345,6 +346,7 @@ class ReviewView(discord.ui.View):
                 await member.kick(reason=reason)
                 await self._create_modlog_case(guild, member, action, reason, interaction.user)
                 await self.cog._increment_stat(guild, "kicked")
+                await self.cog._purge_after_review_action(guild, self.target_id)
                 return (None, _("Kicked"))
             elif action == "ban":
                 target = member if member is not None else await self.cog._get_user_or_object(self.target_id)
@@ -356,6 +358,7 @@ class ReviewView(discord.ui.View):
                 self.cog._schedule_post_ban_sweep_if_enabled(guild, target.id, config)
                 await self._create_modlog_case(guild, target, action, reason, interaction.user)
                 await self.cog._increment_stat(guild, "banned")
+                await self.cog._purge_after_review_action(guild, target.id)
                 return (None, _("Banned"))
         except discord.HTTPException:
             await self.cog._increment_stat(guild, "failed_actions")
@@ -1452,6 +1455,11 @@ class Honeypot(Cog):
             seconds=FORWARD_PURGE_SECONDS
         )
 
+    def _deactivate_forward_purge(self, guild_id: int, user_id: int) -> None:
+        users = self._hot_purge_users.get(guild_id)
+        if users is not None:
+            users.pop(user_id, None)
+
     def _is_forward_purge_active(self, guild_id: int, user_id: int) -> bool:
         expires_at = self._hot_purge_users.get(guild_id, {}).get(user_id)
         if expires_at is None:
@@ -1516,6 +1524,12 @@ class Honeypot(Cog):
         self._activate_forward_purge(guild.id, user_id)
         return deleted
 
+    async def _purge_after_review_action(self, guild: discord.Guild, user_id: int) -> None:
+        deleted = await self._cached_purge_user_messages(guild, user_id)
+        if deleted:
+            await self._increment_stat(guild, "purged_messages", deleted)
+            await self._increment_stat(guild, "cached_purge_deletes", deleted)
+
     async def _delete_forward_purge_message(self, message: discord.Message) -> bool:
         try:
             await message.delete()
@@ -1538,14 +1552,17 @@ class Honeypot(Cog):
         attachment_count = len(message.attachments)
         reasons: list[str] = []
         content = message.content.strip().lower()
-        scam_keywords = config.get("scam_keywords") or SCAM_KEYWORDS
-        matched_keywords = [kw for kw in scam_keywords if keyword_matches_content(kw, content)]
-        if matched_keywords:
-            reasons.append(_("Matched keywords: {keywords}").format(keywords=", ".join(matched_keywords[:5])))
-        if attachment_count <= 0:
-            return reasons
-        if attachment_count >= 2:
-            reasons.append(_("First post with multiple attachments"))
+        if attachment_count == 4:
+            reasons.append(_("First post with four attachments"))
+        elif attachment_count == 2:
+            scam_keywords = config.get("scam_keywords") or SCAM_KEYWORDS
+            matched_keywords = [kw for kw in scam_keywords if keyword_matches_content(kw, content)]
+            if matched_keywords:
+                reasons.append(
+                    _("First post with two attachments and keywords: {keywords}").format(
+                        keywords=", ".join(matched_keywords[:5])
+                    )
+                )
         return reasons
 
     async def _delete_firstpost_current_message(self, message: discord.Message) -> bool:
