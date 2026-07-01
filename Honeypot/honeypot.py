@@ -2017,14 +2017,14 @@ class Honeypot(Cog):
                     await self._increment_stat(message.guild, "pending_mutes")
                     embed.add_field(
                         name=_("Pending review mute:"),
-                        value=_("Temporary mute applied while the review is pending."),
+                        value=_("Mute successful :white_check_mark:"),
                         inline=False,
                     )
                 except discord.HTTPException:
                     await self._increment_stat(message.guild, "pending_mute_failures")
                     embed.add_field(
                         name=_("Pending review mute:"),
-                        value=_("I couldn't apply the temporary mute role."),
+                        value=_("Mute failed :x:"),
                         inline=False,
                     )
         attachment_urls = [a.url for a in message.attachments]
