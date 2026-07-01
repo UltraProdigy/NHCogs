@@ -241,6 +241,17 @@ class ReviewView(discord.ui.View):
             if isinstance(child, discord.ui.Button):
                 child.disabled = True
 
+    @staticmethod
+    def _remove_review_expiry_field(embed: discord.Embed) -> None:
+        for index in reversed(
+            [
+                index
+                for index, field in enumerate(embed.fields)
+                if field.name == _("Review expires in:")
+            ]
+        ):
+            embed.remove_field(index)
+
     async def _create_modlog_case(
         self,
         guild: discord.Guild,
@@ -278,6 +289,7 @@ class ReviewView(discord.ui.View):
         embed = self.review_message.embeds[0] if self.review_message and self.review_message.embeds else None
         if embed:
             embed.color = discord.Color.green()
+            self._remove_review_expiry_field(embed)
             reviewed_value = (
                 f"{interaction.user.mention} ({interaction.user.id})\n"
                 f"{discord.utils.format_dt(datetime.now(timezone.utc), style='F')}"
@@ -1419,6 +1431,7 @@ class Honeypot(Cog):
         embed = view.review_message.embeds[0] if view.review_message and view.review_message.embeds else None
         if embed:
             embed.color = discord.Color.green()
+            ReviewView._remove_review_expiry_field(embed)
             embed.add_field(
                 name=_("Reviewed by:"),
                 value=_("Timed out"),
