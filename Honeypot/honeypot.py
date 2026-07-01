@@ -2143,6 +2143,11 @@ class Honeypot(Cog):
                 value=attachment_summary,
                 inline=False,
             )
+        embed.add_field(
+            name=_("Channel:"),
+            value=getattr(message.channel, "mention", f"<#{message.channel.id}>"),
+            inline=True,
+        )
         account_age = datetime.now(timezone.utc) - message.author.created_at
         embed.add_field(
             name=_("Account age:"),
@@ -2259,6 +2264,12 @@ class Honeypot(Cog):
         )
 
         if should_review and review_channel is not None:
+            if not suspicious or force_fallback:
+                embed.add_field(
+                    name=_("Review reason:"),
+                    value=_("Message posted in a honeypot channel without matching suspicious rules"),
+                    inline=False,
+                )
             await self._send_review(message, config, embed, review_channel, logs_channel, attachment_snapshots)
             return
 
