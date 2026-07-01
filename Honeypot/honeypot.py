@@ -278,11 +278,27 @@ class ReviewView(discord.ui.View):
         embed = self.review_message.embeds[0] if self.review_message and self.review_message.embeds else None
         if embed:
             embed.color = discord.Color.green()
-            embed.add_field(
-                name=_("Reviewed by:"),
-                value=f"{interaction.user.mention} ({interaction.user.id})",
-                inline=False,
+            reviewed_value = (
+                f"{interaction.user.mention} ({interaction.user.id})\n"
+                f"{discord.utils.format_dt(datetime.now(timezone.utc), style='F')}"
             )
+            status_field_index = next(
+                (
+                    index
+                    for index, field in enumerate(embed.fields)
+                    if field.name == _("Status:") or field.value == _("Pending moderator review")
+                ),
+                None,
+            )
+            if status_field_index is None:
+                embed.add_field(name=_("Reviewed by:"), value=reviewed_value, inline=False)
+            else:
+                embed.set_field_at(
+                    status_field_index,
+                    name=_("Reviewed by:"),
+                    value=reviewed_value,
+                    inline=False,
+                )
             embed.add_field(
                 name=_("Action taken:"),
                 value=action_taken,
