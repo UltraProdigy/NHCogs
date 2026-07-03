@@ -214,6 +214,8 @@ class ReviewView(discord.ui.View):
         pending_mute_role_id: int | None = None,
         review_timeout_minutes: int = 1440,
         expires_at: datetime | None = None,
+        message_fingerprint: str | None = None,
+        channel_ids: list[int] | None = None,
     ) -> None:
         super().__init__(timeout=None)
         self.cog = cog
@@ -222,6 +224,14 @@ class ReviewView(discord.ui.View):
         self.content = content
         self.attachment_urls = attachment_urls
         self.pending_mute_role_id = pending_mute_role_id
+        self.message_fingerprint = message_fingerprint
+        normalized_channel_ids = []
+        for channel_id in channel_ids or []:
+            try:
+                normalized_channel_ids.append(int(channel_id))
+            except (TypeError, ValueError):
+                continue
+        self.channel_ids = list(dict.fromkeys(normalized_channel_ids))
         self.created_at = datetime.now(timezone.utc)
         self.expires_at = expires_at or self.created_at + timedelta(minutes=review_timeout_minutes)
         self.review_message: discord.Message | None = None
@@ -724,6 +734,8 @@ class Honeypot(Cog):
                 "attachment_urls": view.attachment_urls,
                 "pending_mute_role_id": view.pending_mute_role_id,
                 "expires_at": view.expires_at.isoformat(),
+                "message_fingerprint": view.message_fingerprint,
+                "channel_ids": view.channel_ids,
             }
 
     async def _delete_pending_review(self, guild: discord.Guild, review_message_id: int | None) -> None:
@@ -1384,6 +1396,8 @@ class Honeypot(Cog):
                         data.get("attachment_urls", []),
                         pending_mute_role_id=data.get("pending_mute_role_id"),
                         expires_at=expires_at,
+                        message_fingerprint=data.get("message_fingerprint"),
+                        channel_ids=data.get("channel_ids", []),
                     )
                     view.active_key = int(review_message_id)
                     review_channel = self._get_text_channel_or_thread(guild, data.get("review_channel_id"))
@@ -2001,6 +2015,159 @@ class Honeypot(Cog):
         label = _("The member has been kicked.") if action == "kick" else _("The member has been banned.")
         return (label, None)
 
+    def _format_review_channels(self, guild: discord.Guild, channel_ids: list[int]) -> str:
+        values = []
+        for channel_id in dict.fromkeys(channel_ids):
+            channel = self._get_text_channel_or_thread(guild, channel_id)
+            values.append(getattr(channel, "mention", f"<#{channel_id}>"))
+        return "\n".join(values) or _("Unknown channel")
+
+    @staticmethod
+    def _embed_field_index(embed: discord.Embed, *names: str) -> int | None:
+        for index, field in enumerate(embed.fields):
+            if field.name in names:
+                return index
+        return None
+
+    def _upsert_embed_field(
+        self,
+        embed: discord.Embed,
+        name: str,
+        value: str,
+        *,
+        inline: bool = False,
+        aliases: tuple[str, ...] = (),
+    ) -> None:
+        index = self._embed_field_index(embed, name, *aliases)
+        if index is None:
+            embed.add_field(name=name, value=value, inline=inline)
+        else:
+            embed.set_field_at(index, name=name, value=value, inline=inline)
+
+    @staticmethod
+    def _embed_trigger_reasons(embed: discord.Embed) -> list[str]:
+        index = Honeypot._embed_field_index(embed, _("Trigger reasons:"))
+        if index is None:
+            return []
+        reasons = []
+        for line in embed.fields[index].value.splitlines():
+            reason = line.strip()
+            if reason.startswith("- "):
+                reason = reason[2:].strip()
+            if reason:
+                reasons.append(reason)
+        return reasons
+
+    def _merge_embed_trigger_reasons(self, target: discord.Embed, source: discord.Embed) -> None:
+        reasons = list(dict.fromkeys(self._embed_trigger_reasons(target) + self._embed_trigger_reasons(source)))
+        if not reasons:
+            return
+        self._upsert_embed_field(
+            target,
+            _("Trigger reasons:"),
+            "\n".join(f"- {reason}" for reason in reasons),
+            inline=False,
+        )
+
+    async def _find_active_review_for_user(self, guild_id: int, user_id: int) -> ReviewView | None:
+        async with self._views_lock:
+            for view in self._active_views.values():
+                if (
+                    view.guild_id == guild_id
+                    and view.target_id == user_id
+                    and view.review_message is not None
+                    and not view._resolution_started
+                ):
+                    return view
+        return None
+
+    async def _update_pending_review_merge_data(self, guild: discord.Guild, view: ReviewView) -> None:
+        if view.active_key is None:
+            return
+        async with self.config.guild(guild).pending_reviews() as pending_reviews:
+            pending_review = pending_reviews.get(str(view.active_key))
+            if pending_review is not None:
+                pending_review["message_fingerprint"] = view.message_fingerprint
+                pending_review["channel_ids"] = view.channel_ids
+
+    async def _send_review_addendum(
+        self,
+        review_message: discord.Message,
+        message: discord.Message,
+        embed: discord.Embed,
+        attachment_snapshots: list[dict[str, typing.Any]],
+    ) -> None:
+        addendum = discord.Embed(
+            title=_("Additional message while review is pending"),
+            description=f">>> {message.content}" if message.content else _("*(message with attachments only)*"),
+            color=discord.Color.orange(),
+            timestamp=message.created_at,
+        )
+        addendum.add_field(
+            name=_("Review:"),
+            value=review_message.jump_url,
+            inline=False,
+        )
+        addendum.add_field(
+            name=_("Channel:"),
+            value=getattr(message.channel, "mention", f"<#{message.channel.id}>"),
+            inline=True,
+        )
+        attachment_summary = self._attachment_summary(attachment_snapshots)
+        if attachment_summary:
+            addendum.add_field(name=_("Attachments:"), value=attachment_summary, inline=False)
+        self._merge_embed_trigger_reasons(addendum, embed)
+        kwargs: dict[str, typing.Any] = {
+            "content": _("Additional message while review is pending: {url}").format(url=review_message.jump_url),
+            "embed": addendum,
+            "allowed_mentions": discord.AllowedMentions.none(),
+            "mention_author": False,
+        }
+        files = self._attachment_files(attachment_snapshots)
+        if files:
+            kwargs["files"] = files
+        try:
+            await review_message.reply(**kwargs)
+        except discord.HTTPException:
+            log.debug("Failed to send review addendum for review message %s", review_message.id)
+
+    async def _merge_into_active_review(
+        self,
+        view: ReviewView,
+        message: discord.Message,
+        embed: discord.Embed,
+        attachment_snapshots: list[dict[str, typing.Any]],
+    ) -> bool:
+        if view.review_message is None:
+            return False
+        active_embed = view.review_message.embeds[0] if view.review_message.embeds else None
+        if active_embed is None:
+            return False
+        merged_embed = discord.Embed.from_dict(active_embed.to_dict())
+        if message.channel.id not in view.channel_ids:
+            view.channel_ids.append(message.channel.id)
+        current_fingerprint = message_spam_fingerprint(message)
+        same_fingerprint = view.message_fingerprint in (None, current_fingerprint)
+        if view.message_fingerprint is None:
+            view.message_fingerprint = current_fingerprint
+        self._upsert_embed_field(
+            merged_embed,
+            _("Channels:"),
+            self._format_review_channels(message.guild, view.channel_ids),
+            inline=False,
+            aliases=(_("Channel:"),),
+        )
+        self._merge_embed_trigger_reasons(merged_embed, embed)
+        try:
+            await view.review_message.edit(embed=merged_embed, view=view)
+        except discord.HTTPException:
+            log.debug("Failed to merge review message %s", view.review_message.id)
+            return False
+        await self._update_pending_review_merge_data(message.guild, view)
+        if not same_fingerprint:
+            await self._send_review_addendum(view.review_message, message, embed, attachment_snapshots)
+        return True
+
     async def _send_review(
         self,
         message: discord.Message,
@@ -2012,12 +2179,21 @@ class Honeypot(Cog):
     ) -> None:
         embed.color = discord.Color.gold()
         embed.title = _("Review needed")
-        if not any(field.name == _("Channel:") for field in embed.fields):
-            embed.add_field(
-                name=_("Channel:"),
-                value=getattr(message.channel, "mention", f"<#{message.channel.id}>"),
-                inline=True,
-            )
+        active_review = await self._find_active_review_for_user(message.guild.id, message.author.id)
+        if active_review is not None and await self._merge_into_active_review(
+            active_review,
+            message,
+            embed,
+            attachment_snapshots,
+        ):
+            return
+        self._upsert_embed_field(
+            embed,
+            _("Channels:"),
+            self._format_review_channels(message.guild, [message.channel.id]),
+            inline=False,
+            aliases=(_("Channel:"),),
+        )
         embed.add_field(
             name=_("Status:"),
             value=_("Pending moderator review"),
@@ -2055,6 +2231,8 @@ class Honeypot(Cog):
             attachment_urls,
             pending_mute_role_id=pending_mute_role_id,
             review_timeout_minutes=config.get("review_timeout_minutes", 1440),
+            message_fingerprint=message_spam_fingerprint(message),
+            channel_ids=[message.channel.id],
         )
         embed.add_field(
             name=_("Review expires in:"),
