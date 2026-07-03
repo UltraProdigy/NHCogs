@@ -2012,6 +2012,12 @@ class Honeypot(Cog):
     ) -> None:
         embed.color = discord.Color.gold()
         embed.title = _("Review needed")
+        if not any(field.name == _("Channel:") for field in embed.fields):
+            embed.add_field(
+                name=_("Channel:"),
+                value=getattr(message.channel, "mention", f"<#{message.channel.id}>"),
+                inline=True,
+            )
         embed.add_field(
             name=_("Status:"),
             value=_("Pending moderator review"),
@@ -2074,18 +2080,6 @@ class Honeypot(Cog):
             self._active_views[sent.id] = view
         await self._store_pending_review(message.guild, view, review_channel.id, sent.id)
         await self._increment_stat(message.guild, "reviewed")
-        if logs_channel is not None:
-            try:
-                await logs_channel.send(
-                    _("Queued for review: {user} ({user_id}) in {channel}.").format(
-                        user=message.author.mention,
-                        user_id=message.author.id,
-                        channel=review_channel.mention,
-                    ),
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except discord.HTTPException:
-                log.debug("Failed to send queued review log in guild %s", message.guild.id)
 
     async def _send_log(
         self,
@@ -2119,24 +2113,24 @@ class Honeypot(Cog):
             return
         if message.webhook_id is not None:
             return
-        self._record_recent_user_message(message)
-        if self._is_forward_purge_active(message.guild.id, message.author.id):
-            if await self._delete_forward_purge_message(message):
-                await self._increment_stat(message.guild, "purged_messages")
-                await self._increment_stat(message.guild, "forward_purge_deletes")
-            return
         config = await self.config.guild(message.guild).all()
         if not config["enabled"]:
             return
         logs_channel = self._get_text_channel_or_thread(message.guild, config.get("logs_channel"))
         if await self._is_protected_member(message.author):
             return
-        if await self._handle_spam_message(message, config, logs_channel):
-            return
-        if await self._handle_firstpost_message(message, config, logs_channel):
+        self._record_recent_user_message(message)
+        if self._is_forward_purge_active(message.guild.id, message.author.id):
+            if await self._delete_forward_purge_message(message):
+                await self._increment_stat(message.guild, "purged_messages")
+                await self._increment_stat(message.guild, "forward_purge_deletes")
             return
         configured_honeypot_channel_ids = self._honeypot_channel_ids_from_config(config)
         if message.channel.id not in configured_honeypot_channel_ids:
+            if await self._handle_spam_message(message, config, logs_channel):
+                return
+            if await self._handle_firstpost_message(message, config, logs_channel):
+                return
             return
 
         attachment_snapshots = await self._snapshot_attachments(message)
