@@ -10,7 +10,14 @@ import discord
 from redbot.core import Config, commands
 from redbot.core.data_manager import cog_data_path
 
-from .activity_storage import ActivityStore, DailySummary, TimelineDay, TopChannel, UserStats
+from .activity_storage import (
+    ActivityStore,
+    ChannelUserCount,
+    DailySummary,
+    TimelineDay,
+    TopChannel,
+    UserStats,
+)
 from .voice_activity import VoiceChannelVisitTracker
 
 
@@ -309,7 +316,7 @@ class NHMisc(commands.Cog):
 
         file = self._build_chatchart_file(ctx.guild, counts, days)
         await ctx.send(
-            content=f"Channel activity chart for the last {days} days.",
+            content=self._build_chatchart_summary(ctx.guild, counts, days),
             file=file,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -906,7 +913,7 @@ class NHMisc(commands.Cog):
         return "\n".join(lines)
 
     def _build_chatchart_file(
-        self, guild: discord.Guild, counts: list, days: int
+        self, guild: discord.Guild, counts: list[ChannelUserCount], days: int
     ) -> discord.File:
         try:
             import matplotlib
@@ -924,10 +931,11 @@ class NHMisc(commands.Cog):
         values: list[int] = []
         for count in top_counts:
             member = guild.get_member(count.user_id)
-            labels.append(member.display_name if member is not None else str(count.user_id))
+            name = member.display_name if member is not None else str(count.user_id)
+            labels.append(f"{name} ({count.message_count})")
             values.append(count.message_count)
         if other_count:
-            labels.append("Other")
+            labels.append(f"Other ({other_count})")
             values.append(other_count)
 
         figure, axis = plt.subplots(figsize=(8, 6))
@@ -944,3 +952,16 @@ class NHMisc(commands.Cog):
         plt.close(figure)
         buffer.seek(0)
         return discord.File(buffer, filename="chatchart.png")
+
+    def _build_chatchart_summary(
+        self, guild: discord.Guild, counts: list[ChannelUserCount], days: int
+    ) -> str:
+        lines = [f"Channel activity chart for the last {days} retained days.", "", "Top users:"]
+        for index, count in enumerate(counts[:10], start=1):
+            member = guild.get_member(count.user_id)
+            name = member.display_name if member is not None else str(count.user_id)
+            lines.append(f"{index}. {name} ({count.user_id}) - {count.message_count} messages")
+        other_count = sum(count.message_count for count in counts[10:])
+        if other_count:
+            lines.append(f"Other - {other_count} messages")
+        return "\n".join(lines)

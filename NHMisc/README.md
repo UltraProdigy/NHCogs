@@ -180,7 +180,8 @@ shown as `0`.
 
 Creates a pie chart of message activity for the channel where the command is used. If the
 command is used in a thread, it charts that specific thread. The requested day count is
-capped to the configured detail retention.
+capped to the configured detail retention. The chart labels and message text include the
+message count for each shown user.
 
 ### User Command
 
