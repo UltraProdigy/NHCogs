@@ -316,7 +316,6 @@ class NHMisc(commands.Cog):
 
         file = self._build_chatchart_file(ctx.guild, counts, days)
         await ctx.send(
-            content=f"Channel activity chart for the last {days} retained days.",
             file=file,
             allowed_mentions=discord.AllowedMentions.none(),
         )
