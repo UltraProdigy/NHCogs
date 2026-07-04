@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 
 import discord
 from redbot.core import Config, commands
+from redbot.core.data_manager import cog_data_path
 
+from .activity_storage import ActivityStore, DailySummary, TimelineDay, TopChannel, UserStats
 from .voice_activity import VoiceChannelVisitTracker
 
 
@@ -15,6 +18,9 @@ log = logging.getLogger("red.NHMisc")
 
 DEFAULT_VCJUMPING_VISIT_COUNT = 3
 DEFAULT_VCJUMPING_WINDOW_SECONDS = 30
+DEFAULT_ACTIVITY_DETAIL_RETENTION_DAYS = 31
+DEFAULT_ACTIVITY_HISTORY_RETENTION_DAYS = -1
+RETENTION_CONFIRMATION = "I understand"
 
 
 class NHMisc(commands.Cog):
@@ -33,22 +39,33 @@ class NHMisc(commands.Cog):
             alert_channel=None,
             vcjumping_visit_count=DEFAULT_VCJUMPING_VISIT_COUNT,
             vcjumping_window_seconds=DEFAULT_VCJUMPING_WINDOW_SECONDS,
+            activity_channel=None,
+            activity_detail_retention_days=DEFAULT_ACTIVITY_DETAIL_RETENTION_DAYS,
+            activity_history_retention_days=DEFAULT_ACTIVITY_HISTORY_RETENTION_DAYS,
         )
         self._voice_visits = VoiceChannelVisitTracker()
         self._audit_log_tasks: set[asyncio.Task] = set()
+        self._activity_store = ActivityStore(cog_data_path(self) / "activity.sqlite")
+        self._activity_task: asyncio.Task | None = None
+
+    async def cog_load(self) -> None:
+        await self._activity_store.initialize()
+        self._activity_task = asyncio.create_task(self._activity_midnight_loop())
 
     def cog_unload(self) -> None:
         for task in self._audit_log_tasks:
             task.cancel()
+        if self._activity_task is not None:
+            self._activity_task.cancel()
 
     @commands.group(name="nhmisc", invoke_without_command=True)
     @commands.guild_only()
-    @commands.admin_or_permissions(manage_guild=True)
     async def nhmisc(self, ctx: commands.Context) -> None:
         """Configure NHMisc."""
         await ctx.send_help()
 
     @nhmisc.command(name="channel")
+    @commands.admin_or_permissions(manage_guild=True)
     async def nhmisc_channel(self, ctx: commands.Context, channel: discord.TextChannel) -> None:
         """Set the text channel used for voice event logs."""
         missing_permissions = self._missing_log_permissions(ctx.guild, channel)
@@ -59,6 +76,7 @@ class NHMisc(commands.Cog):
         await ctx.send(f"Voice log channel set to {channel.mention}.")
 
     @nhmisc.group(name="alert", invoke_without_command=True)
+    @commands.admin_or_permissions(manage_guild=True)
     async def nhmisc_alert(self, ctx: commands.Context) -> None:
         """Configure alert logging."""
         await ctx.send_help()
@@ -76,11 +94,12 @@ class NHMisc(commands.Cog):
         await ctx.send(f"Alert channel set to {channel.mention}.")
 
     @nhmisc.group(name="vcjumping", invoke_without_command=True)
+    @commands.admin_or_permissions(manage_guild=True)
     async def nhmisc_vcjumping(self, ctx: commands.Context) -> None:
         """Configure voice channel jumping detection."""
         await ctx.send_help()
 
-    @nhmisc_vcjumping.command(name="visits", aliases=["channels"])
+    @nhmisc_vcjumping.command(name="visits")
     async def nhmisc_vcjumping_visits(self, ctx: commands.Context, count: int) -> None:
         """Set how many voice channel entries trigger VC jumping alerts."""
         if count < 2:
@@ -99,6 +118,7 @@ class NHMisc(commands.Cog):
         await ctx.send(f"VC jumping window set to {seconds} seconds.")
 
     @nhmisc.command(name="status")
+    @commands.admin_or_permissions(manage_guild=True)
     async def nhmisc_status(self, ctx: commands.Context) -> None:
         """Show the current voice log configuration."""
         config = await self.config.guild(ctx.guild).all()
@@ -115,6 +135,218 @@ class NHMisc(commands.Cog):
                 count=config["vcjumping_visit_count"],
                 seconds=config["vcjumping_window_seconds"],
             )
+        )
+
+    @nhmisc.group(name="activity", invoke_without_command=True)
+    async def nhmisc_activity(self, ctx: commands.Context) -> None:
+        """Configure and inspect passive message activity summaries."""
+        await ctx.send_help()
+
+    @nhmisc_activity.command(name="channel")
+    async def nhmisc_activity_channel(
+        self, ctx: commands.Context, channel: discord.TextChannel
+    ) -> None:
+        """Set the channel used for automatic daily activity summaries."""
+        await self._require_manage_guild(ctx)
+        missing_permissions = self._missing_log_permissions(ctx.guild, channel)
+        if missing_permissions is not None:
+            raise commands.UserFeedbackCheckFailure(missing_permissions)
+
+        await self.config.guild(ctx.guild).activity_channel.set(channel.id)
+        await ctx.send(f"Activity summary channel set to {channel.mention}.")
+
+    @nhmisc_activity.command(name="current")
+    async def nhmisc_activity_current(self, ctx: commands.Context) -> None:
+        """Preview the current UTC day's activity without closing it."""
+        await self._require_activity_staff(ctx)
+        await self._close_stale_activity_days_for_guild(ctx.guild, send_reports=True)
+        today = self._utc_today()
+        summary = await self._activity_store.build_current_summary(
+            ctx.guild.id, today, ctx.guild.member_count or 0
+        )
+        if summary is None:
+            await ctx.send("No activity data has been collected for the current UTC day.")
+            return
+
+        await ctx.send(embed=self._build_daily_summary_embed(summary, title_prefix="Current day"))
+
+    @nhmisc_activity.command(name="latest")
+    async def nhmisc_activity_latest(self, ctx: commands.Context) -> None:
+        """Repost the latest retained closed daily activity summary."""
+        await self._require_activity_staff(ctx)
+        await self._close_stale_activity_days_for_guild(ctx.guild, send_reports=True)
+        summary = await self._activity_store.get_latest_summary(ctx.guild.id)
+        if summary is None:
+            await ctx.send("No retained daily activity summary is available.")
+            return
+
+        await ctx.send(embed=self._build_daily_summary_embed(summary, title_prefix="Latest day"))
+
+    @nhmisc_activity.command(name="timeline")
+    async def nhmisc_activity_timeline(self, ctx: commands.Context, days: int) -> None:
+        """Show a compact timeline for retained closed daily summaries."""
+        await self._require_activity_staff(ctx)
+        await self._close_stale_activity_days_for_guild(ctx.guild, send_reports=True)
+        if days < 1:
+            raise commands.UserFeedbackCheckFailure("Days must be at least 1.")
+
+        config = await self.config.guild(ctx.guild).all()
+        history_retention = int(config["activity_history_retention_days"])
+        if history_retention == 0:
+            await ctx.send("Historical activity summaries are not retained on this server.")
+            return
+        if history_retention > 0 and days > history_retention:
+            days = history_retention
+
+        end_date = self._utc_today() - timedelta(days=1)
+        timeline = await self._activity_store.get_timeline(ctx.guild.id, end_date, days)
+        top_channels = await self._activity_store.get_timeline_top_channels(
+            ctx.guild.id, end_date, days
+        )
+        await ctx.send(embed=self._build_timeline_embed(timeline, top_channels, days))
+
+    @nhmisc_activity.command(name="retention")
+    async def nhmisc_activity_retention(self, ctx: commands.Context, days: int) -> None:
+        """Set how many days of per-user/channel detail rows are retained."""
+        await self._require_manage_guild(ctx)
+        if days < 1:
+            raise commands.UserFeedbackCheckFailure("Detail retention must be at least 1 day.")
+
+        cutoff = self._utc_today() - timedelta(days=days - 1)
+        rows_to_delete = await self._activity_store.count_detail_rows_older_than(
+            ctx.guild.id, cutoff
+        )
+        if rows_to_delete:
+            confirmed = await self._confirm_retention_delete(
+                ctx,
+                (
+                    f"Changing detail retention to {days} days will permanently delete "
+                    f"{rows_to_delete} user/channel detail rows older than {cutoff.isoformat()}.\n"
+                    f"Reply with `{RETENTION_CONFIRMATION}` to continue."
+                ),
+            )
+            if not confirmed:
+                return
+            deleted = await self._activity_store.prune_detail_rows_older_than(ctx.guild.id, cutoff)
+            await ctx.send(f"Deleted {deleted} detail rows.")
+
+        await self.config.guild(ctx.guild).activity_detail_retention_days.set(days)
+        await ctx.send(f"Activity detail retention set to {days} days.")
+
+    @nhmisc_activity.command(name="historyretention")
+    async def nhmisc_activity_history_retention(self, ctx: commands.Context, days: int) -> None:
+        """Set how many closed daily aggregate summaries are retained."""
+        await self._require_manage_guild(ctx)
+        if days < -1:
+            raise commands.UserFeedbackCheckFailure(
+                "History retention must be -1, 0, or a positive number of days."
+            )
+
+        cutoff = self._history_retention_cutoff(days)
+        summary_rows = top_rows = 0
+        if cutoff is not None:
+            summary_rows, top_rows = await self._activity_store.count_history_rows_older_than(
+                ctx.guild.id, cutoff
+            )
+        if summary_rows or top_rows:
+            confirmed = await self._confirm_retention_delete(
+                ctx,
+                (
+                    f"Changing history retention to {days} will permanently delete "
+                    f"{summary_rows} daily summary rows and {top_rows} top-channel rows "
+                    f"older than {cutoff.isoformat()}.\n"
+                    f"Reply with `{RETENTION_CONFIRMATION}` to continue."
+                ),
+            )
+            if not confirmed:
+                return
+            deleted_summary, deleted_top = await self._activity_store.prune_history_rows_older_than(
+                ctx.guild.id, cutoff
+            )
+            await ctx.send(
+                f"Deleted {deleted_summary} daily summary rows and {deleted_top} top-channel rows."
+            )
+
+        await self.config.guild(ctx.guild).activity_history_retention_days.set(days)
+        await ctx.send(f"Activity history retention set to {days}.")
+
+    @nhmisc.command(name="usermodstats")
+    async def nhmisc_usermodstats(
+        self, ctx: commands.Context, target: str, range_text: str
+    ) -> None:
+        """Show moderator-only message activity stats for a user."""
+        await self._require_activity_staff(ctx)
+        await self._close_stale_activity_days_for_guild(ctx.guild, send_reports=True)
+        user_id = self._parse_user_id(target)
+        days = self._parse_range_days(range_text)
+        days = await self._cap_detail_days(ctx.guild, days)
+        end_date = self._utc_today()
+        stats = await self._activity_store.get_user_stats(ctx.guild.id, user_id, end_date, days)
+
+        title = f"User activity: {self._format_user_reference(ctx.guild, user_id)}"
+        await ctx.send(embed=self._build_user_stats_embed(title, stats, days))
+
+    @nhmisc.command(name="chatchart")
+    async def nhmisc_chatchart(self, ctx: commands.Context, days: int) -> None:
+        """Render a pie chart of user activity in the current channel."""
+        await self._require_activity_staff(ctx)
+        await self._close_stale_activity_days_for_guild(ctx.guild, send_reports=True)
+        if days < 1:
+            raise commands.UserFeedbackCheckFailure("Days must be at least 1.")
+
+        days = await self._cap_detail_days(ctx.guild, days)
+        channel_id = self._activity_parent_channel_id(ctx.channel)
+        counts = await self._activity_store.get_channel_user_counts(
+            ctx.guild.id,
+            channel_id,
+            self._activity_thread_id(ctx.channel),
+            self._utc_today(),
+            days,
+        )
+        if not counts:
+            await ctx.send(f"No retained activity data for this channel in the last {days} days.")
+            return
+
+        file = self._build_chatchart_file(ctx.guild, counts, days)
+        await ctx.send(
+            content=f"Channel activity chart for the last {days} days.",
+            file=file,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @commands.command(name="selfchart")
+    @commands.guild_only()
+    async def selfchart(self, ctx: commands.Context) -> None:
+        """Show your own simplified activity stats for the last 7 retained days."""
+        days = await self._cap_detail_days(ctx.guild, 7)
+        stats = await self._activity_store.get_user_stats(
+            ctx.guild.id, ctx.author.id, self._utc_today(), days
+        )
+        embed = self._build_selfchart_embed(ctx.author, stats, days)
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        """Passively collect message activity counters."""
+        guild = message.guild
+        if guild is None:
+            return
+        if message.author.bot or message.webhook_id is not None:
+            return
+        if message.type is not discord.MessageType.default:
+            return
+
+        now = datetime.now(timezone.utc)
+        today = now.date()
+        await self._close_stale_activity_days_for_guild(guild, send_reports=True)
+        await self._activity_store.record_message(
+            guild.id,
+            today,
+            now.hour,
+            message.author.id,
+            self._activity_parent_channel_id(message.channel),
+            self._activity_thread_id(message.channel),
+            now,
         )
 
     @commands.Cog.listener()
@@ -326,3 +558,389 @@ class NHMisc(commands.Cog):
         except discord.HTTPException:
             log.exception("Failed to send voice log message to channel %s", channel.id)
         return None
+
+    async def _activity_midnight_loop(self) -> None:
+        await self.bot.wait_until_ready()
+        while True:
+            try:
+                await self._close_stale_activity_days_for_all_guilds(send_reports=True)
+            except Exception:
+                log.exception("Failed to close stale activity days")
+            try:
+                now = datetime.now(timezone.utc)
+                next_midnight = datetime.combine(
+                    now.date() + timedelta(days=1),
+                    datetime_time.min,
+                    tzinfo=timezone.utc,
+                ) + timedelta(seconds=5)
+                await asyncio.sleep(max(1.0, (next_midnight - now).total_seconds()))
+            except asyncio.CancelledError:
+                raise
+
+    async def _close_stale_activity_days_for_all_guilds(self, send_reports: bool) -> None:
+        for guild in list(self.bot.guilds):
+            await self._close_stale_activity_days_for_guild(guild, send_reports=send_reports)
+
+    async def _close_stale_activity_days_for_guild(
+        self, guild: discord.Guild, send_reports: bool
+    ) -> None:
+        today = self._utc_today()
+        summaries = await self._activity_store.close_stale_days(
+            guild.id, today, guild.member_count or 0
+        )
+        if not summaries:
+            return
+
+        config = await self.config.guild(guild).all()
+        channel = self._get_log_channel(guild, config["activity_channel"])
+        for summary in summaries:
+            if send_reports and channel is not None:
+                await self._send_activity_summary(channel, summary)
+            await self._apply_activity_history_retention(
+                guild.id, int(config["activity_history_retention_days"]), summary.date_utc
+            )
+
+        await self._apply_activity_detail_retention(
+            guild.id, int(config["activity_detail_retention_days"])
+        )
+
+    async def _send_activity_summary(
+        self, channel: discord.TextChannel, summary: DailySummary
+    ) -> None:
+        try:
+            await channel.send(
+                embed=self._build_daily_summary_embed(summary, title_prefix="Daily"),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            log.exception("Failed to send activity summary to channel %s", channel.id)
+
+    async def _apply_activity_detail_retention(self, guild_id: int, days: int) -> None:
+        if days < 1:
+            return
+        cutoff = self._utc_today() - timedelta(days=days - 1)
+        await self._activity_store.prune_detail_rows_older_than(guild_id, cutoff)
+
+    async def _apply_activity_history_retention(
+        self, guild_id: int, days: int, closed_date: date
+    ) -> None:
+        if days == -1:
+            return
+        if days == 0:
+            await self._activity_store.delete_history_for_date(guild_id, closed_date)
+            return
+        cutoff = self._utc_today() - timedelta(days=days)
+        await self._activity_store.prune_history_rows_older_than(guild_id, cutoff)
+
+    async def _require_manage_guild(self, ctx: commands.Context) -> None:
+        permissions = getattr(ctx.author, "guild_permissions", None)
+        has_permission = bool(permissions and permissions.manage_guild)
+        if has_permission or await self.bot.is_admin(ctx.author):
+            return
+        raise commands.UserFeedbackCheckFailure("You need Manage Server permission.")
+
+    async def _require_activity_staff(self, ctx: commands.Context) -> None:
+        permissions = getattr(ctx.author, "guild_permissions", None)
+        has_permission = bool(
+            permissions and (permissions.manage_messages or permissions.manage_guild)
+        )
+        if has_permission or await self.bot.is_admin(ctx.author):
+            return
+        raise commands.UserFeedbackCheckFailure(
+            "You need Manage Messages or Manage Server permission."
+        )
+
+    async def _confirm_retention_delete(self, ctx: commands.Context, warning: str) -> bool:
+        await ctx.send(warning)
+
+        def check(message: discord.Message) -> bool:
+            return (
+                message.author.id == ctx.author.id
+                and message.channel.id == ctx.channel.id
+                and message.content == RETENTION_CONFIRMATION
+            )
+
+        try:
+            await self.bot.wait_for("message", check=check, timeout=60)
+        except asyncio.TimeoutError:
+            await ctx.send("Retention change cancelled.")
+            return False
+        return True
+
+    def _utc_today(self) -> date:
+        return datetime.now(timezone.utc).date()
+
+    def _history_retention_cutoff(self, days: int) -> date | None:
+        if days == -1:
+            return None
+        if days == 0:
+            return self._utc_today() + timedelta(days=1)
+        return self._utc_today() - timedelta(days=days)
+
+    async def _cap_detail_days(self, guild: discord.Guild, days: int) -> int:
+        config = await self.config.guild(guild).all()
+        retention = max(1, int(config["activity_detail_retention_days"]))
+        return min(days, retention)
+
+    def _parse_range_days(self, value: str) -> int:
+        normalized = value.strip().lower()
+        if not normalized.endswith("d") or not normalized[:-1].isdigit():
+            raise commands.UserFeedbackCheckFailure("Range must be one of: 1d, 7d, 14d, 30d.")
+        days = int(normalized[:-1])
+        if days not in {1, 7, 14, 30}:
+            raise commands.UserFeedbackCheckFailure("Range must be one of: 1d, 7d, 14d, 30d.")
+        return days
+
+    def _parse_user_id(self, value: str) -> int:
+        stripped = value.strip()
+        if stripped.startswith("<@") and stripped.endswith(">"):
+            stripped = stripped[2:-1]
+            if stripped.startswith("!"):
+                stripped = stripped[1:]
+        if not stripped.isdigit():
+            raise commands.UserFeedbackCheckFailure("Pass a user mention or raw Discord user ID.")
+        return int(stripped)
+
+    def _activity_parent_channel_id(self, channel: object) -> int:
+        parent = getattr(channel, "parent", None)
+        if isinstance(channel, discord.Thread) and parent is not None:
+            return parent.id
+        return getattr(channel, "id")
+
+    def _activity_thread_id(self, channel: object) -> int | None:
+        if isinstance(channel, discord.Thread):
+            return channel.id
+        return None
+
+    def _format_channel(self, channel_id: int) -> str:
+        return f"<#{channel_id}>"
+
+    def _format_user_reference(self, guild: discord.Guild, user_id: int) -> str:
+        member = guild.get_member(user_id)
+        if member is not None:
+            return f"{member.display_name} ({user_id})"
+        return f"<@{user_id}> ({user_id})"
+
+    def _format_int(self, value: int) -> str:
+        return f"{value:,}"
+
+    def _format_percent_of_server(self, active_users: int, member_count: int) -> str:
+        if member_count <= 0:
+            return "n/d"
+        return f"{(active_users / member_count) * 100:.1f}%"
+
+    def _format_top_channels(self, top_channels: list[TopChannel]) -> str:
+        if not top_channels:
+            return "n/d"
+        return "\n".join(
+            (
+                f"{top.rank}. {self._format_channel(top.channel_id)} - "
+                f"{self._format_int(top.message_count)} messages"
+            )
+            for top in top_channels
+        )
+
+    def _build_daily_summary_embed(
+        self, summary: DailySummary, title_prefix: str
+    ) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"{title_prefix} activity summary - {summary.date_utc.isoformat()} UTC",
+            color=discord.Color.blue(),
+        )
+        embed.add_field(
+            name="Messages",
+            value=self._format_int(summary.total_messages),
+            inline=True,
+        )
+        embed.add_field(
+            name="Active users",
+            value=(
+                f"{self._format_int(summary.active_users)} "
+                f"({self._format_percent_of_server(summary.active_users, summary.member_count_at_close)})"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Thresholds",
+            value=(
+                f"10+: {self._format_int(summary.users_10_plus)}\n"
+                f"50+: {self._format_int(summary.users_50_plus)}\n"
+                f"100+: {self._format_int(summary.users_100_plus)}"
+            ),
+            inline=True,
+        )
+        peak_hour = f"{summary.peak_hour_utc:02d}:00 UTC" if summary.peak_hour_utc is not None else "n/d"
+        embed.add_field(
+            name="Channels",
+            value=(
+                f"Active: {self._format_int(summary.channels_with_activity)}\n"
+                f"Peak hour: {peak_hour}\n"
+                f"Avg/user: {summary.messages_per_active_user:.1f}"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Top channels",
+            value=self._format_top_channels(summary.top_channels),
+            inline=False,
+        )
+        return embed
+
+    def _build_timeline_embed(
+        self, timeline: list[TimelineDay], top_channels: list[TopChannel], days: int
+    ) -> discord.Embed:
+        include_percent = days <= 7
+        header = "Date       Msgs  Users  %Srv  10+ 50+ 100+" if include_percent else "Date       Msgs  Users  10+ 50+ 100+"
+        lines = [header]
+        summaries: list[DailySummary] = []
+        for day in timeline:
+            summary = day.summary
+            if summary is None:
+                if include_percent:
+                    lines.append(f"{day.date_utc.isoformat()} n/d   n/d    n/d   n/d n/d n/d")
+                else:
+                    lines.append(f"{day.date_utc.isoformat()} n/d   n/d    n/d n/d n/d")
+                continue
+            summaries.append(summary)
+            if include_percent:
+                lines.append(
+                    f"{day.date_utc.isoformat()} "
+                    f"{summary.total_messages:<5} {summary.active_users:<6} "
+                    f"{self._format_percent_of_server(summary.active_users, summary.member_count_at_close):<5} "
+                    f"{summary.users_10_plus:<3} {summary.users_50_plus:<3} {summary.users_100_plus:<4}"
+                )
+            else:
+                lines.append(
+                    f"{day.date_utc.isoformat()} "
+                    f"{summary.total_messages:<5} {summary.active_users:<6} "
+                    f"{summary.users_10_plus:<3} {summary.users_50_plus:<3} {summary.users_100_plus:<4}"
+                )
+
+        table = "\n".join(lines)
+        if len(table) > 3900:
+            visible_lines = lines[:120]
+            visible_lines.append("...")
+            table = "\n".join(visible_lines)
+
+        embed = discord.Embed(
+            title=f"Activity timeline - last {days} closed days",
+            color=discord.Color.blue(),
+            description=f"```text\n{table}\n```",
+        )
+        if summaries:
+            avg_messages = sum(summary.total_messages for summary in summaries) / len(summaries)
+            avg_users = sum(summary.active_users for summary in summaries) / len(summaries)
+            best = max(summaries, key=lambda summary: summary.total_messages)
+            embed.add_field(
+                name="Range",
+                value=(
+                    f"Avg/day: {avg_messages:.0f} msgs\n"
+                    f"Avg active users: {avg_users:.0f}\n"
+                    f"Best day: {best.date_utc.isoformat()} "
+                    f"({self._format_int(best.total_messages)} msgs)"
+                ),
+                inline=False,
+            )
+        else:
+            embed.add_field(name="Range", value="n/d", inline=False)
+        embed.add_field(
+            name="Top channels in range",
+            value=self._format_top_channels(top_channels),
+            inline=False,
+        )
+        return embed
+
+    def _build_user_stats_embed(self, title: str, stats: UserStats, days: int) -> discord.Embed:
+        embed = discord.Embed(title=title, color=discord.Color.blue())
+        embed.add_field(name="Range", value=f"last {days} days", inline=True)
+        embed.add_field(name="Total messages", value=self._format_int(stats.total_messages), inline=True)
+        embed.add_field(name="Active days", value=self._format_int(stats.active_days), inline=True)
+        embed.add_field(
+            name="Average per active day",
+            value=f"{stats.average_per_active_day:.1f}",
+            inline=True,
+        )
+        embed.add_field(
+            name="Top channels",
+            value=self._format_top_channels(stats.top_channels),
+            inline=False,
+        )
+        embed.add_field(
+            name="Daily breakdown",
+            value=f"```text\n{self._format_daily_rows(stats.date_rows)}\n```",
+            inline=False,
+        )
+        return embed
+
+    def _build_selfchart_embed(
+        self, member: discord.Member | discord.User, stats: UserStats, days: int
+    ) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Your activity - last {days} days",
+            color=discord.Color.blue(),
+        )
+        embed.add_field(name="Total messages", value=self._format_int(stats.total_messages), inline=True)
+        top_channel = stats.top_channels[0] if stats.top_channels else None
+        embed.add_field(
+            name="Top channel",
+            value=(
+                f"{self._format_channel(top_channel.channel_id)} - "
+                f"{self._format_int(top_channel.message_count)} messages"
+                if top_channel
+                else "n/d"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Daily messages",
+            value=f"```text\n{self._format_daily_rows(stats.date_rows)}\n```",
+            inline=False,
+        )
+        return embed
+
+    def _format_daily_rows(self, rows: list[tuple[date, int | None]]) -> str:
+        lines = ["Date       Msgs"]
+        for day, count in rows:
+            value = "n/d" if count is None else str(count)
+            lines.append(f"{day.isoformat()} {value}")
+        return "\n".join(lines)
+
+    def _build_chatchart_file(
+        self, guild: discord.Guild, counts: list, days: int
+    ) -> discord.File:
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError as exc:
+            raise commands.UserFeedbackCheckFailure(
+                "Matplotlib is required for chatchart but is not installed."
+            ) from exc
+
+        top_counts = counts[:10]
+        other_count = sum(count.message_count for count in counts[10:])
+        labels: list[str] = []
+        values: list[int] = []
+        for count in top_counts:
+            member = guild.get_member(count.user_id)
+            labels.append(member.display_name if member is not None else str(count.user_id))
+            values.append(count.message_count)
+        if other_count:
+            labels.append("Other")
+            values.append(other_count)
+
+        figure, axis = plt.subplots(figsize=(8, 6))
+        axis.pie(
+            values,
+            labels=labels,
+            autopct=lambda percent: f"{percent:.1f}%" if percent >= 3 else "",
+            startangle=90,
+        )
+        axis.axis("equal")
+        axis.set_title(f"Messages by user - last {days} days")
+        buffer = io.BytesIO()
+        figure.savefig(buffer, format="png", bbox_inches="tight", dpi=160)
+        plt.close(figure)
+        buffer.seek(0)
+        return discord.File(buffer, filename="chatchart.png")

@@ -11,13 +11,15 @@
     "utility",
     "redbot"
   ],
-  "requirements": [],
+  "requirements": [
+    "matplotlib"
+  ],
   "min_bot_version": "3.5.0",
   "min_python_version": [
     3,
     10,
     0
   ],
-  "end_user_data_statement": "This cog does not persistently store data or metadata about users."
+  "end_user_data_statement": "This cog stores Discord user IDs with passively collected message-count aggregates for configurable short-term activity detail retention. Closed daily summary history stores aggregate counts and channel IDs, but not user IDs."
 }
 
