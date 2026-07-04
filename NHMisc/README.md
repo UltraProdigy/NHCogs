@@ -90,7 +90,7 @@ Daily summaries include:
 - users with at least 10, 50, and 100 messages;
 - number of active channels;
 - average messages per active user;
-- peak UTC hour for that day;
+- peak hour shown as a Discord-localized timestamp;
 - top 3 channels as Discord channel mentions.
 
 ### Activity Commands

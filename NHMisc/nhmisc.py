@@ -775,7 +775,7 @@ class NHMisc(commands.Cog):
             ),
             inline=True,
         )
-        peak_hour = f"{summary.peak_hour_utc:02d}:00 UTC" if summary.peak_hour_utc is not None else "n/d"
+        peak_hour = self._format_peak_hour(summary)
         embed.add_field(
             name="Channels",
             value=(
@@ -791,6 +791,18 @@ class NHMisc(commands.Cog):
             inline=False,
         )
         return embed
+
+    def _format_peak_hour(self, summary: DailySummary) -> str:
+        if summary.peak_hour_utc is None:
+            return "n/d"
+        peak_time = datetime(
+            summary.date_utc.year,
+            summary.date_utc.month,
+            summary.date_utc.day,
+            summary.peak_hour_utc,
+            tzinfo=timezone.utc,
+        )
+        return f"<t:{int(peak_time.timestamp())}:t>"
 
     def _build_timeline_embed(
         self, timeline: list[TimelineDay], top_channels: list[TopChannel], days: int
