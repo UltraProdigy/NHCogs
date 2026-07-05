@@ -601,7 +601,7 @@ class NHMisc(commands.Cog):
             return
         if message.author.bot or message.webhook_id is not None:
             return
-        if message.type is not discord.MessageType.default:
+        if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
             return
 
         now = datetime.now(timezone.utc)
