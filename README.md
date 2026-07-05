@@ -207,7 +207,7 @@ existing summary rows.
 ### Moderator Tools
 
 ```ini
-[p]nhmisc usermodstats @User 7d
+[p]nhmisc usermodstats @User 7
 ```
 
 Shows moderator-only message stats for one user.
@@ -215,15 +215,11 @@ Shows moderator-only message stats for one user.
 You can also use a raw Discord user ID:
 
 ```ini
-[p]nhmisc usermodstats 123456789012345678 30d
+[p]nhmisc usermodstats 123456789012345678 30
 ```
 
-Supported ranges:
-
-- `1d`
-- `7d`
-- `14d`
-- `30d`
+Pass any positive number of days. The requested range is capped to the configured detail
+retention.
 
 The output includes total messages, active days, average messages per active day, top
 channels, and a daily breakdown. Missing retained data is shown as `n/d`; real zeroes are

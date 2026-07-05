@@ -1154,11 +1154,11 @@ class NHMisc(commands.Cog):
 
     def _parse_range_days(self, value: str) -> int:
         normalized = value.strip().lower()
-        if not normalized.endswith("d") or not normalized[:-1].isdigit():
-            raise commands.UserFeedbackCheckFailure("Range must be one of: 1d, 7d, 14d, 30d.")
-        days = int(normalized[:-1])
-        if days not in {1, 7, 14, 30}:
-            raise commands.UserFeedbackCheckFailure("Range must be one of: 1d, 7d, 14d, 30d.")
+        if not normalized.isdigit():
+            raise commands.UserFeedbackCheckFailure("Range must be a positive number of days.")
+        days = int(normalized)
+        if days < 1:
+            raise commands.UserFeedbackCheckFailure("Range must be at least 1 day.")
         return days
 
     def _parse_user_id(self, value: str) -> int:
