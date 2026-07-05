@@ -229,11 +229,11 @@ class NHMisc(commands.Cog):
             ctx.guild.id, existing_role_ids
         )
         if not orphaned_roles:
-            await ctx.send("No orphaned sticky role DB entries found.")
+            await ctx.send("No sticky role DB entries need review.")
             return
 
         await ctx.send(
-            f"Found {len(orphaned_roles)} orphaned sticky role DB entries. "
+            f"Found {len(orphaned_roles)} sticky role DB entries that need review. "
             "I will ask about them one by one."
         )
         for role_id, config_exists, saved_rows in orphaned_roles:
@@ -491,7 +491,6 @@ class NHMisc(commands.Cog):
             (
                 "Sticky role snapshot written\n"
                 f"User: {member.mention} (`{member.id}`)\n"
-                f"Configured sticky roles: {self._format_role_id_set(member.guild, configured_roles)}\n"
                 f"Saved roles: {self._format_role_id_set(member.guild, saved_role_ids)}"
             ),
         )
@@ -528,7 +527,6 @@ class NHMisc(commands.Cog):
                     "Sticky role snapshot read\n"
                     f"User: {member.mention} (`{member.id}`)\n"
                     f"Saved roles: {self._format_role_id_set(member.guild, saved_role_ids)}\n"
-                    f"Configured sticky roles: {self._format_role_id_set(member.guild, configured_role_ids)}\n"
                     "Restorable roles: none\n"
                     f"Skipped roles: {self._format_role_id_set(member.guild, skipped_role_ids)}\n"
                     "Result: nothing restorable."
@@ -559,7 +557,6 @@ class NHMisc(commands.Cog):
                 "Sticky role snapshot read\n"
                 f"User: {member.mention} (`{member.id}`)\n"
                 f"Saved roles: {self._format_role_id_set(member.guild, saved_role_ids)}\n"
-                f"Configured sticky roles: {self._format_role_id_set(member.guild, configured_role_ids)}\n"
                 f"Restorable roles: {self._format_role_id_set(member.guild, restorable_role_ids)}\n"
                 f"Skipped roles: {self._format_role_id_set(member.guild, skipped_role_ids)}\n"
                 f"Result: {result}."
@@ -979,7 +976,7 @@ class NHMisc(commands.Cog):
             f"Saved user-role rows: {saved_rows}\n"
             "Reply with one of:\n"
             "`remove` - delete this role from sticky DB and saved users\n"
-            "`keep` - leave DB unchanged\n"
+            "`keep` - stop configuring this role as sticky, but keep saved user rows\n"
             "`change <role mention or ID>` - move config and saved users to another role",
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -1017,7 +1014,14 @@ class NHMisc(commands.Cog):
                 )
                 return
             if command == "keep" and not argument:
-                await channel.send("Sticky role DB entry kept unchanged.")
+                config_removed = await self._sticky_roles.unconfigure_sticky_role(
+                    guild.id, role_id
+                )
+                await channel.send(
+                    "Sticky role config removed, saved user-role rows kept.\n"
+                    f"Config row removed: {'yes' if config_removed else 'no'}\n"
+                    f"Saved user-role rows kept: {saved_rows}"
+                )
                 return
             if command == "change":
                 await self._handle_sticky_role_db_change(

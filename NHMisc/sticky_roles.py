@@ -24,6 +24,12 @@ class StickyRoleStore:
         async with self._lock:
             return await asyncio.to_thread(self._remove_sticky_role_sync, guild_id, role_id)
 
+    async def unconfigure_sticky_role(self, guild_id: int, role_id: int) -> bool:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._unconfigure_sticky_role_sync, guild_id, role_id
+            )
+
     async def replace_sticky_role(
         self, guild_id: int, old_role_id: int, new_role_id: int
     ) -> tuple[bool, int, int]:
@@ -120,6 +126,14 @@ class StickyRoleStore:
             )
             return config_cursor.rowcount > 0, member_cursor.rowcount
 
+    def _unconfigure_sticky_role_sync(self, guild_id: int, role_id: int) -> bool:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM sticky_role_config WHERE guild_id = ? AND role_id = ?",
+                (guild_id, role_id),
+            )
+            return cursor.rowcount > 0
+
     def _replace_sticky_role_sync(
         self, guild_id: int, old_role_id: int, new_role_id: int
     ) -> tuple[bool, int, int]:
@@ -206,7 +220,7 @@ class StickyRoleStore:
         return [
             (role_id, bool(config_exists), int(saved_rows))
             for role_id, (config_exists, saved_rows) in sorted(states.items())
-            if role_id not in existing_role_ids
+            if role_id not in existing_role_ids or (not config_exists and int(saved_rows) > 0)
         ]
 
     def _get_sticky_roles_sync(self, guild_id: int) -> set[int]:

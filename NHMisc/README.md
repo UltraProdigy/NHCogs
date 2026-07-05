@@ -87,8 +87,9 @@ Lists sticky roles configured for the server.
 [p]nhmisc stickyroles scan
 ```
 
-Scans the sticky role database for role IDs that no longer exist on Discord and asks how
-to handle each one. Choices are `remove`, `keep`, or `change <role mention or ID>`.
+Scans the sticky role database for entries that need review: missing Discord roles and
+saved user-role rows that are no longer configured as sticky. Choices are `remove`,
+`keep`, or `change <role mention or ID>`.
 
 ```ini
 [p]nhmisc stickyroles debuglogging toggle true
