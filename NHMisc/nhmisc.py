@@ -18,6 +18,7 @@ from .activity_storage import (
     TopChannel,
     UserStats,
 )
+from .sticky_roles import StickyRoleMigrationPreview, StickyRoleStore
 from .voice_activity import VoiceChannelVisitTracker
 
 
@@ -28,6 +29,8 @@ DEFAULT_VCJUMPING_WINDOW_SECONDS = 30
 DEFAULT_ACTIVITY_DETAIL_RETENTION_DAYS = 31
 DEFAULT_ACTIVITY_HISTORY_RETENTION_DAYS = -1
 RETENTION_CONFIRMATION = "I understand"
+REACTROLES_CONFIG_IDENTIFIER = 287804310509584387
+MIGRATION_CONFIRMATION = "I understand"
 
 
 class NHMisc(commands.Cog):
@@ -49,14 +52,18 @@ class NHMisc(commands.Cog):
             activity_channel=None,
             activity_detail_retention_days=DEFAULT_ACTIVITY_DETAIL_RETENTION_DAYS,
             activity_history_retention_days=DEFAULT_ACTIVITY_HISTORY_RETENTION_DAYS,
+            sticky_debug_logging_enabled=False,
+            sticky_debug_logging_channel=None,
         )
         self._voice_visits = VoiceChannelVisitTracker()
         self._audit_log_tasks: set[asyncio.Task] = set()
         self._activity_store = ActivityStore(cog_data_path(self) / "activity.sqlite")
+        self._sticky_roles = StickyRoleStore(cog_data_path(self) / "sticky_roles.sqlite")
         self._activity_task: asyncio.Task | None = None
 
     async def cog_load(self) -> None:
         await self._activity_store.initialize()
+        await self._sticky_roles.initialize()
         self._activity_task = asyncio.create_task(self._activity_midnight_loop())
 
     def cog_unload(self) -> None:
@@ -142,6 +149,124 @@ class NHMisc(commands.Cog):
                 count=config["vcjumping_visit_count"],
                 seconds=config["vcjumping_window_seconds"],
             )
+        )
+
+    @nhmisc.group(name="stickyroles", invoke_without_command=True)
+    async def nhmisc_stickyroles(self, ctx: commands.Context) -> None:
+        """Configure sticky role persistence."""
+        await self._require_manage_guild(ctx)
+        await ctx.send_help()
+
+    @nhmisc_stickyroles.command(name="add")
+    async def nhmisc_stickyroles_add(self, ctx: commands.Context, role: str) -> None:
+        """Mark a role as sticky by role mention or raw role ID."""
+        await self._require_manage_guild(ctx)
+        role_id = self._parse_role_id(role)
+        discord_role = ctx.guild.get_role(role_id)
+        if discord_role is None:
+            raise commands.UserFeedbackCheckFailure("That role does not exist on this server.")
+        if not self._can_restore_role(ctx.guild, discord_role):
+            raise commands.UserFeedbackCheckFailure(
+                "I cannot restore that role. Check Manage Roles and role hierarchy."
+            )
+
+        added = await self._sticky_roles.add_sticky_role(ctx.guild.id, role_id)
+        if added:
+            await ctx.send(
+                f"{discord_role.mention} is now sticky.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await ctx.send(
+                f"{discord_role.mention} is already sticky.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    @nhmisc_stickyroles.command(name="remove")
+    async def nhmisc_stickyroles_remove(self, ctx: commands.Context, role: str) -> None:
+        """Remove a sticky role by role mention or raw role ID."""
+        await self._require_manage_guild(ctx)
+        role_id = self._parse_role_id(role)
+        config_removed, saved_rows_removed = await self._sticky_roles.remove_sticky_role(
+            ctx.guild.id, role_id
+        )
+        role_label = self._format_role_reference(ctx.guild, role_id)
+        if config_removed:
+            await ctx.send(
+                f"{role_label} is no longer sticky. Removed {saved_rows_removed} saved user-role rows.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await ctx.send(
+                f"{role_label} was not configured as sticky. Removed {saved_rows_removed} saved user-role rows.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    @nhmisc_stickyroles.command(name="list")
+    async def nhmisc_stickyroles_list(self, ctx: commands.Context) -> None:
+        """List sticky roles configured for this server."""
+        await self._require_manage_guild(ctx)
+        role_ids = await self._sticky_roles.get_sticky_roles(ctx.guild.id)
+        if not role_ids:
+            await ctx.send("No sticky roles are configured on this server.")
+            return
+
+        lines = ["Sticky roles:"]
+        for role_id in sorted(role_ids):
+            lines.append(f"- {self._format_role_reference(ctx.guild, role_id)}")
+        await self._send_paginated_text(ctx, "\n".join(lines))
+
+    @nhmisc_stickyroles.group(name="debuglogging", invoke_without_command=True)
+    async def nhmisc_stickyroles_debuglogging(self, ctx: commands.Context) -> None:
+        """Configure sticky role debug logging."""
+        await self._require_manage_guild(ctx)
+        await ctx.send_help()
+
+    @nhmisc_stickyroles_debuglogging.command(name="toggle")
+    async def nhmisc_stickyroles_debuglogging_toggle(
+        self, ctx: commands.Context, enabled: bool
+    ) -> None:
+        """Enable or disable sticky role debug logging."""
+        await self._require_manage_guild(ctx)
+        await self.config.guild(ctx.guild).sticky_debug_logging_enabled.set(enabled)
+        state = "enabled" if enabled else "disabled"
+        await ctx.send(f"Sticky role debug logging {state}.")
+
+    @nhmisc_stickyroles_debuglogging.command(name="channel")
+    async def nhmisc_stickyroles_debuglogging_channel(
+        self, ctx: commands.Context, channel: discord.TextChannel
+    ) -> None:
+        """Set the sticky role debug logging channel."""
+        await self._require_manage_guild(ctx)
+        missing_permissions = self._missing_log_permissions(ctx.guild, channel)
+        if missing_permissions is not None:
+            raise commands.UserFeedbackCheckFailure(missing_permissions)
+
+        await self.config.guild(ctx.guild).sticky_debug_logging_channel.set(channel.id)
+        await ctx.send(f"Sticky role debug logging channel set to {channel.mention}.")
+
+    @nhmisc_stickyroles.command(name="migrate", hidden=True)
+    async def nhmisc_stickyroles_migrate(self, ctx: commands.Context) -> None:
+        """Import sticky role data from the old ReactRoles cog."""
+        await self._require_manage_guild(ctx)
+        rows, migration_roles, missing_roles = await self._read_reactroles_sticky_data()
+        preview = await self._sticky_roles.preview_migration(
+            rows, migration_roles, missing_roles
+        )
+        await self._send_paginated_text(ctx, self._format_sticky_migration_preview(preview))
+
+        confirmed = await self._confirm_sticky_migration(ctx)
+        if not confirmed:
+            return
+
+        result = await self._sticky_roles.apply_migration(rows, migration_roles, missing_roles)
+        await ctx.send(
+            "ReactRoles sticky role migration finished.\n"
+            f"Roles already configured: {result.already_configured_role_count}\n"
+            f"Roles added: {result.new_configured_role_count}\n"
+            f"Saved user-role rows already present: {result.existing_member_role_count}\n"
+            f"Saved user-role rows added: {result.new_member_role_count}\n"
+            f"Saved user-role rows skipped: {result.skipped_member_role_count}"
         )
 
     @nhmisc.group(name="activity", invoke_without_command=True)
@@ -330,6 +455,108 @@ class NHMisc(commands.Cog):
         )
         embed = self._build_selfchart_embed(ctx.author, stats, days)
         await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member) -> None:
+        """Snapshot configured sticky roles when a member leaves."""
+        configured_roles = await self._sticky_roles.get_sticky_roles(member.guild.id)
+        if not configured_roles:
+            await self._send_sticky_debug_log(
+                member.guild,
+                (
+                    "Sticky role snapshot write skipped\n"
+                    f"User: {member.mention} (`{member.id}`)\n"
+                    "Reason: no sticky roles are configured on this server."
+                ),
+            )
+            return
+
+        current_role_ids = {role.id for role in member.roles}
+        saved_role_ids = configured_roles & current_role_ids
+        await self._sticky_roles.replace_member_roles(
+            member.guild.id,
+            member.id,
+            saved_role_ids,
+        )
+        await self._send_sticky_debug_log(
+            member.guild,
+            (
+                "Sticky role snapshot written\n"
+                f"User: {member.mention} (`{member.id}`)\n"
+                f"Configured sticky roles: {self._format_role_id_set(member.guild, configured_roles)}\n"
+                f"Saved roles: {self._format_role_id_set(member.guild, saved_role_ids)}"
+            ),
+        )
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member) -> None:
+        """Restore saved sticky roles when a member rejoins."""
+        saved_role_ids = await self._sticky_roles.get_member_roles(member.guild.id, member.id)
+        if not saved_role_ids:
+            await self._send_sticky_debug_log(
+                member.guild,
+                (
+                    "Sticky role snapshot read\n"
+                    f"User: {member.mention} (`{member.id}`)\n"
+                    "Saved roles: none\n"
+                    "Result: nothing to restore."
+                ),
+            )
+            return
+
+        configured_role_ids = await self._sticky_roles.get_sticky_roles(member.guild.id)
+        roles: list[discord.Role] = []
+        for role_id in sorted(saved_role_ids & configured_role_ids):
+            role = member.guild.get_role(role_id)
+            if role is not None and self._can_restore_role(member.guild, role):
+                roles.append(role)
+
+        restorable_role_ids = {role.id for role in roles}
+        skipped_role_ids = saved_role_ids - restorable_role_ids
+        if not roles:
+            await self._send_sticky_debug_log(
+                member.guild,
+                (
+                    "Sticky role snapshot read\n"
+                    f"User: {member.mention} (`{member.id}`)\n"
+                    f"Saved roles: {self._format_role_id_set(member.guild, saved_role_ids)}\n"
+                    f"Configured sticky roles: {self._format_role_id_set(member.guild, configured_role_ids)}\n"
+                    "Restorable roles: none\n"
+                    f"Skipped roles: {self._format_role_id_set(member.guild, skipped_role_ids)}\n"
+                    "Result: nothing restorable."
+                ),
+            )
+            return
+
+        result = "restored"
+        try:
+            await member.add_roles(*roles, reason="Restoring sticky roles")
+        except discord.Forbidden:
+            result = "failed: missing permissions"
+            log.warning(
+                "Missing permissions to restore sticky roles for member %s in guild %s",
+                member.id,
+                member.guild.id,
+            )
+        except discord.HTTPException:
+            result = "failed: Discord API error"
+            log.exception(
+                "Failed to restore sticky roles for member %s in guild %s",
+                member.id,
+                member.guild.id,
+            )
+        await self._send_sticky_debug_log(
+            member.guild,
+            (
+                "Sticky role snapshot read\n"
+                f"User: {member.mention} (`{member.id}`)\n"
+                f"Saved roles: {self._format_role_id_set(member.guild, saved_role_ids)}\n"
+                f"Configured sticky roles: {self._format_role_id_set(member.guild, configured_role_ids)}\n"
+                f"Restorable roles: {self._format_role_id_set(member.guild, restorable_role_ids)}\n"
+                f"Skipped roles: {self._format_role_id_set(member.guild, skipped_role_ids)}\n"
+                f"Result: {result}."
+            ),
+        )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -655,6 +882,220 @@ class NHMisc(commands.Cog):
         raise commands.UserFeedbackCheckFailure(
             "You need Manage Messages or Manage Server permission."
         )
+
+    def _parse_role_id(self, value: str) -> int:
+        stripped = value.strip()
+        if stripped.startswith("<@&") and stripped.endswith(">"):
+            stripped = stripped[3:-1]
+        if not stripped.isdigit():
+            raise commands.UserFeedbackCheckFailure("Pass a role mention or raw Discord role ID.")
+        return int(stripped)
+
+    def _can_restore_role(self, guild: discord.Guild, role: discord.Role) -> bool:
+        me = guild.me
+        if me is None:
+            return False
+        if role.is_default() or role.managed:
+            return False
+        if not me.guild_permissions.manage_roles:
+            return False
+        return role < me.top_role
+
+    def _format_role_reference(self, guild: discord.Guild, role_id: int) -> str:
+        role = guild.get_role(role_id)
+        if role is None:
+            return f"`{role_id}` (missing)"
+        return f"{role.mention} (`{role_id}`)"
+
+    def _format_role_id_set(self, guild: discord.Guild, role_ids: set[int]) -> str:
+        if not role_ids:
+            return "none"
+        return ", ".join(
+            self._format_role_reference(guild, role_id) for role_id in sorted(role_ids)
+        )
+
+    async def _send_sticky_debug_log(self, guild: discord.Guild, content: str) -> None:
+        config = await self.config.guild(guild).all()
+        if not config["sticky_debug_logging_enabled"]:
+            return
+
+        channel = self._get_log_channel(guild, config["sticky_debug_logging_channel"])
+        if channel is None:
+            return
+
+        try:
+            await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            log.exception("Failed to send sticky role debug log to guild %s", guild.id)
+
+    async def _read_reactroles_sticky_data(
+        self,
+    ) -> tuple[list[tuple[int, int, int]], dict[int, dict[int, str]], set[tuple[int, int]]]:
+        old_config = Config.get_conf(
+            None,
+            identifier=REACTROLES_CONFIG_IDENTIFIER,
+            cog_name="ReactRoles",
+            force_registration=False,
+        )
+        old_roles = await old_config.all_roles()
+        old_members = await old_config.all_members()
+
+        sticky_role_ids: set[int] = set()
+        for role_id, data in old_roles.items():
+            if not isinstance(data, dict) or data.get("sticky") is not True:
+                continue
+            try:
+                sticky_role_ids.add(int(role_id))
+            except (TypeError, ValueError):
+                continue
+
+        rows: set[tuple[int, int, int]] = set()
+        missing_roles: set[tuple[int, int]] = set()
+        for guild_id, users in old_members.items():
+            try:
+                guild_id_int = int(guild_id)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(users, dict):
+                continue
+
+            guild = self.bot.get_guild(guild_id_int)
+            for user_id, data in users.items():
+                try:
+                    user_id_int = int(user_id)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+
+                for role_id in self._normalize_role_id_list(data.get("roles", [])):
+                    if role_id not in sticky_role_ids:
+                        continue
+                    rows.add((guild_id_int, user_id_int, role_id))
+                    if guild is None or guild.get_role(role_id) is None:
+                        missing_roles.add((guild_id_int, role_id))
+
+        migration_roles: dict[int, dict[int, str]] = {}
+        for guild in self.bot.guilds:
+            for role_id in sorted(sticky_role_ids):
+                role = guild.get_role(role_id)
+                if role is not None:
+                    migration_roles.setdefault(guild.id, {})[role_id] = role.name
+
+        resolved_role_ids = {
+            role_id for role_map in migration_roles.values() for role_id in role_map
+        }
+        for role_id in sticky_role_ids - resolved_role_ids:
+            if not any(missing_role_id == role_id for _, missing_role_id in missing_roles):
+                missing_roles.add((0, role_id))
+
+        return sorted(rows), migration_roles, missing_roles
+
+    def _normalize_role_id_list(self, values: object) -> set[int]:
+        if not isinstance(values, list):
+            return set()
+        role_ids: set[int] = set()
+        for value in values:
+            try:
+                role_ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return role_ids
+
+    def _format_sticky_migration_preview(
+        self, preview: StickyRoleMigrationPreview
+    ) -> str:
+        lines = [
+            "ReactRoles sticky role migration dry-run",
+            "",
+            f"Guilds with saved member rows: {preview.guild_count}",
+            f"Users with saved member rows: {preview.user_count}",
+            f"Unique sticky roles in saved rows: {preview.unique_role_count}",
+            f"Saved user-role rows found: {preview.candidate_member_role_count}",
+            f"Saved user-role rows already in NHMisc: {preview.existing_member_role_count}",
+            f"Saved user-role rows that would be added: {preview.new_member_role_count}",
+            f"Saved user-role rows that would be skipped: {preview.skipped_member_role_count}",
+            "",
+            f"Roles already configured in NHMisc: {preview.already_configured_role_count}",
+        ]
+        lines.extend(self._format_migration_role_lines(preview.already_configured_roles))
+        lines.append("")
+        lines.append(f"Roles that would be added as sticky: {preview.new_configured_role_count}")
+        lines.extend(self._format_migration_role_lines(preview.new_configured_roles))
+        lines.append("")
+        lines.append(f"Roles that cannot be migrated: {preview.missing_config_role_count}")
+        lines.extend(self._format_missing_migration_roles(preview.missing_roles))
+        if preview.skipped_member_role_count:
+            lines.extend(
+                [
+                    "",
+                    (
+                        "WARNING: "
+                        f"{preview.skipped_member_role_count} saved user-role entries will not "
+                        "be migrated because their role is missing or cannot be resolved."
+                    ),
+                ]
+            )
+        return "\n".join(lines)
+
+    def _format_migration_role_lines(self, roles: list[tuple[int, int, str]]) -> list[str]:
+        if not roles:
+            return ["- none"]
+        lines: list[str] = []
+        for guild_id, role_id, fallback_name in roles:
+            guild = self.bot.get_guild(guild_id)
+            guild_label = f"{guild.name} (`{guild_id}`)" if guild is not None else f"`{guild_id}`"
+            role_label = self._format_role_reference(guild, role_id) if guild is not None else f"`{role_id}`"
+            if guild is None:
+                role_label = f"{fallback_name} (`{role_id}`)"
+            lines.append(f"- {role_label} in {guild_label}")
+        return lines
+
+    def _format_missing_migration_roles(self, roles: list[tuple[int, int]]) -> list[str]:
+        if not roles:
+            return ["- none"]
+        lines: list[str] = []
+        for guild_id, role_id in roles:
+            if guild_id == 0:
+                lines.append(f"- `{role_id}` - role is not visible in any guild")
+                continue
+            guild = self.bot.get_guild(guild_id)
+            guild_label = f"{guild.name} (`{guild_id}`)" if guild is not None else f"`{guild_id}`"
+            lines.append(f"- `{role_id}` in {guild_label} - role or guild is not visible")
+        return lines
+
+    async def _confirm_sticky_migration(self, ctx: commands.Context) -> bool:
+        await ctx.send(
+            "This will import ReactRoles sticky role data into NHMisc.\n"
+            "It will not delete old ReactRoles data.\n"
+            f"Reply exactly: `{MIGRATION_CONFIRMATION}`"
+        )
+
+        def check(message: discord.Message) -> bool:
+            return (
+                message.author.id == ctx.author.id
+                and message.channel.id == ctx.channel.id
+                and message.content == MIGRATION_CONFIRMATION
+            )
+
+        try:
+            await self.bot.wait_for("message", check=check, timeout=60)
+        except asyncio.TimeoutError:
+            await ctx.send("Sticky role migration cancelled.")
+            return False
+        return True
+
+    async def _send_paginated_text(self, ctx: commands.Context, content: str) -> None:
+        page = ""
+        for line in content.splitlines():
+            candidate = f"{page}\n{line}" if page else line
+            if len(candidate) > 1900:
+                await ctx.send(page, allowed_mentions=discord.AllowedMentions.none())
+                page = line
+            else:
+                page = candidate
+        if page:
+            await ctx.send(page, allowed_mentions=discord.AllowedMentions.none())
 
     async def _confirm_retention_delete(self, ctx: commands.Context, warning: str) -> bool:
         await ctx.send(warning)
