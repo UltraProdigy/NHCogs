@@ -18,7 +18,7 @@ from .activity_storage import (
     TopChannel,
     UserStats,
 )
-from .sticky_roles import StickyRoleMigrationPreview, StickyRoleStore
+from .sticky_roles import StickyRoleStore
 from .voice_activity import VoiceChannelVisitTracker
 
 
@@ -29,8 +29,6 @@ DEFAULT_VCJUMPING_WINDOW_SECONDS = 30
 DEFAULT_ACTIVITY_DETAIL_RETENTION_DAYS = 31
 DEFAULT_ACTIVITY_HISTORY_RETENTION_DAYS = -1
 RETENTION_CONFIRMATION = "I understand"
-REACTROLES_CONFIG_IDENTIFIER = 287804310509584387
-MIGRATION_CONFIRMATION = "I understand"
 
 
 class NHMisc(commands.Cog):
@@ -244,30 +242,6 @@ class NHMisc(commands.Cog):
 
         await self.config.guild(ctx.guild).sticky_debug_logging_channel.set(channel.id)
         await ctx.send(f"Sticky role debug logging channel set to {channel.mention}.")
-
-    @nhmisc_stickyroles.command(name="migrate", hidden=True)
-    async def nhmisc_stickyroles_migrate(self, ctx: commands.Context) -> None:
-        """Import sticky role data from the old ReactRoles cog."""
-        await self._require_manage_guild(ctx)
-        rows, migration_roles, missing_roles = await self._read_reactroles_sticky_data()
-        preview = await self._sticky_roles.preview_migration(
-            rows, migration_roles, missing_roles
-        )
-        await self._send_paginated_text(ctx, self._format_sticky_migration_preview(preview))
-
-        confirmed = await self._confirm_sticky_migration(ctx)
-        if not confirmed:
-            return
-
-        result = await self._sticky_roles.apply_migration(rows, migration_roles, missing_roles)
-        await ctx.send(
-            "ReactRoles sticky role migration finished.\n"
-            f"Roles already configured: {result.already_configured_role_count}\n"
-            f"Roles added: {result.new_configured_role_count}\n"
-            f"Saved user-role rows already present: {result.existing_member_role_count}\n"
-            f"Saved user-role rows added: {result.new_member_role_count}\n"
-            f"Saved user-role rows skipped: {result.skipped_member_role_count}"
-        )
 
     @nhmisc.group(name="activity", invoke_without_command=True)
     async def nhmisc_activity(self, ctx: commands.Context) -> None:
@@ -927,163 +901,6 @@ class NHMisc(commands.Cog):
             await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException:
             log.exception("Failed to send sticky role debug log to guild %s", guild.id)
-
-    async def _read_reactroles_sticky_data(
-        self,
-    ) -> tuple[list[tuple[int, int, int]], dict[int, dict[int, str]], set[tuple[int, int]]]:
-        old_config = Config.get_conf(
-            None,
-            identifier=REACTROLES_CONFIG_IDENTIFIER,
-            cog_name="ReactRoles",
-            force_registration=False,
-        )
-        old_roles = await old_config.all_roles()
-        old_members = await old_config.all_members()
-
-        sticky_role_ids: set[int] = set()
-        for role_id, data in old_roles.items():
-            if not isinstance(data, dict) or data.get("sticky") is not True:
-                continue
-            try:
-                sticky_role_ids.add(int(role_id))
-            except (TypeError, ValueError):
-                continue
-
-        rows: set[tuple[int, int, int]] = set()
-        missing_roles: set[tuple[int, int]] = set()
-        for guild_id, users in old_members.items():
-            try:
-                guild_id_int = int(guild_id)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(users, dict):
-                continue
-
-            guild = self.bot.get_guild(guild_id_int)
-            for user_id, data in users.items():
-                try:
-                    user_id_int = int(user_id)
-                except (TypeError, ValueError):
-                    continue
-                if not isinstance(data, dict):
-                    continue
-
-                for role_id in self._normalize_role_id_list(data.get("roles", [])):
-                    if role_id not in sticky_role_ids:
-                        continue
-                    rows.add((guild_id_int, user_id_int, role_id))
-                    if guild is None or guild.get_role(role_id) is None:
-                        missing_roles.add((guild_id_int, role_id))
-
-        migration_roles: dict[int, dict[int, str]] = {}
-        for guild in self.bot.guilds:
-            for role_id in sorted(sticky_role_ids):
-                role = guild.get_role(role_id)
-                if role is not None:
-                    migration_roles.setdefault(guild.id, {})[role_id] = role.name
-
-        resolved_role_ids = {
-            role_id for role_map in migration_roles.values() for role_id in role_map
-        }
-        for role_id in sticky_role_ids - resolved_role_ids:
-            if not any(missing_role_id == role_id for _, missing_role_id in missing_roles):
-                missing_roles.add((0, role_id))
-
-        return sorted(rows), migration_roles, missing_roles
-
-    def _normalize_role_id_list(self, values: object) -> set[int]:
-        if not isinstance(values, list):
-            return set()
-        role_ids: set[int] = set()
-        for value in values:
-            try:
-                role_ids.add(int(value))
-            except (TypeError, ValueError):
-                continue
-        return role_ids
-
-    def _format_sticky_migration_preview(
-        self, preview: StickyRoleMigrationPreview
-    ) -> str:
-        lines = [
-            "ReactRoles sticky role migration dry-run",
-            "",
-            f"Guilds with saved member rows: {preview.guild_count}",
-            f"Users with saved member rows: {preview.user_count}",
-            f"Unique sticky roles in saved rows: {preview.unique_role_count}",
-            f"Saved user-role rows found: {preview.candidate_member_role_count}",
-            f"Saved user-role rows already in NHMisc: {preview.existing_member_role_count}",
-            f"Saved user-role rows that would be added: {preview.new_member_role_count}",
-            f"Saved user-role rows that would be skipped: {preview.skipped_member_role_count}",
-            "",
-            f"Roles already configured in NHMisc: {preview.already_configured_role_count}",
-        ]
-        lines.extend(self._format_migration_role_lines(preview.already_configured_roles))
-        lines.append("")
-        lines.append(f"Roles that would be added as sticky: {preview.new_configured_role_count}")
-        lines.extend(self._format_migration_role_lines(preview.new_configured_roles))
-        lines.append("")
-        lines.append(f"Roles that cannot be migrated: {preview.missing_config_role_count}")
-        lines.extend(self._format_missing_migration_roles(preview.missing_roles))
-        if preview.skipped_member_role_count:
-            lines.extend(
-                [
-                    "",
-                    (
-                        "WARNING: "
-                        f"{preview.skipped_member_role_count} saved user-role entries will not "
-                        "be migrated because their role is missing or cannot be resolved."
-                    ),
-                ]
-            )
-        return "\n".join(lines)
-
-    def _format_migration_role_lines(self, roles: list[tuple[int, int, str]]) -> list[str]:
-        if not roles:
-            return ["- none"]
-        lines: list[str] = []
-        for guild_id, role_id, fallback_name in roles:
-            guild = self.bot.get_guild(guild_id)
-            guild_label = f"{guild.name} (`{guild_id}`)" if guild is not None else f"`{guild_id}`"
-            role_label = self._format_role_reference(guild, role_id) if guild is not None else f"`{role_id}`"
-            if guild is None:
-                role_label = f"{fallback_name} (`{role_id}`)"
-            lines.append(f"- {role_label} in {guild_label}")
-        return lines
-
-    def _format_missing_migration_roles(self, roles: list[tuple[int, int]]) -> list[str]:
-        if not roles:
-            return ["- none"]
-        lines: list[str] = []
-        for guild_id, role_id in roles:
-            if guild_id == 0:
-                lines.append(f"- `{role_id}` - role is not visible in any guild")
-                continue
-            guild = self.bot.get_guild(guild_id)
-            guild_label = f"{guild.name} (`{guild_id}`)" if guild is not None else f"`{guild_id}`"
-            lines.append(f"- `{role_id}` in {guild_label} - role or guild is not visible")
-        return lines
-
-    async def _confirm_sticky_migration(self, ctx: commands.Context) -> bool:
-        await ctx.send(
-            "This will import ReactRoles sticky role data into NHMisc.\n"
-            "It will not delete old ReactRoles data.\n"
-            f"Reply exactly: `{MIGRATION_CONFIRMATION}`"
-        )
-
-        def check(message: discord.Message) -> bool:
-            return (
-                message.author.id == ctx.author.id
-                and message.channel.id == ctx.channel.id
-                and message.content == MIGRATION_CONFIRMATION
-            )
-
-        try:
-            await self.bot.wait_for("message", check=check, timeout=60)
-        except asyncio.TimeoutError:
-            await ctx.send("Sticky role migration cancelled.")
-            return False
-        return True
 
     async def _send_paginated_text(self, ctx: commands.Context, content: str) -> None:
         page = ""
