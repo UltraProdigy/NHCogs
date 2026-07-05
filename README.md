@@ -76,13 +76,21 @@ assign it.
 ```
 
 Removes a role from sticky-role tracking. Removing a sticky role also removes that role
-from all saved sticky-role snapshots.
+from all saved sticky-role snapshots. If the role exists in the sticky role database,
+the bot first asks whether to `remove`, `keep`, or `change <role mention or ID>`.
 
 ```ini
 [p]nhmisc stickyroles list
 ```
 
 Lists sticky roles configured for the server.
+
+```ini
+[p]nhmisc stickyroles scan
+```
+
+Scans the sticky role database for role IDs that no longer exist on Discord and asks how
+to handle each one. Choices are `remove`, `keep`, or `change <role mention or ID>`.
 
 ```ini
 [p]nhmisc stickyroles debuglogging toggle true
@@ -97,6 +105,9 @@ snapshot writes on member leave and snapshot reads/restores on member join.
 ```
 
 Sets the channel used for sticky-role debug logs.
+
+This channel is also used for deleted-role prompts when Discord deletes a role that is
+still present in the sticky role database.
 
 ## Activity Analytics
 

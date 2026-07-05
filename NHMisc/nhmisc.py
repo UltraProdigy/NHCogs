@@ -185,20 +185,26 @@ class NHMisc(commands.Cog):
         """Remove a sticky role by role mention or raw role ID."""
         await self._require_manage_guild(ctx)
         role_id = self._parse_role_id(role)
-        config_removed, saved_rows_removed = await self._sticky_roles.remove_sticky_role(
+        config_exists, saved_rows = await self._sticky_roles.get_role_state(
             ctx.guild.id, role_id
         )
-        role_label = self._format_role_reference(ctx.guild, role_id)
-        if config_removed:
+        if not config_exists and saved_rows == 0:
             await ctx.send(
-                f"{role_label} is no longer sticky. Removed {saved_rows_removed} saved user-role rows.",
+                f"{self._format_role_reference(ctx.guild, role_id)} is not present in the sticky role DB.",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-        else:
-            await ctx.send(
-                f"{role_label} was not configured as sticky. Removed {saved_rows_removed} saved user-role rows.",
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            return
+
+        await self._prompt_sticky_role_db_action(
+            guild=ctx.guild,
+            channel=ctx.channel,
+            role_id=role_id,
+            role_name=self._role_name_for_prompt(ctx.guild, role_id),
+            config_exists=config_exists,
+            saved_rows=saved_rows,
+            reason="manual remove command",
+            requester=ctx.author,
+        )
 
     @nhmisc_stickyroles.command(name="list")
     async def nhmisc_stickyroles_list(self, ctx: commands.Context) -> None:
@@ -213,6 +219,34 @@ class NHMisc(commands.Cog):
         for role_id in sorted(role_ids):
             lines.append(f"- {self._format_role_reference(ctx.guild, role_id)}")
         await self._send_paginated_text(ctx, "\n".join(lines))
+
+    @nhmisc_stickyroles.command(name="scan")
+    async def nhmisc_stickyroles_scan(self, ctx: commands.Context) -> None:
+        """Scan sticky role DB for role IDs missing from Discord."""
+        await self._require_manage_guild(ctx)
+        existing_role_ids = {role.id for role in ctx.guild.roles}
+        orphaned_roles = await self._sticky_roles.get_orphaned_roles(
+            ctx.guild.id, existing_role_ids
+        )
+        if not orphaned_roles:
+            await ctx.send("No orphaned sticky role DB entries found.")
+            return
+
+        await ctx.send(
+            f"Found {len(orphaned_roles)} orphaned sticky role DB entries. "
+            "I will ask about them one by one."
+        )
+        for role_id, config_exists, saved_rows in orphaned_roles:
+            await self._prompt_sticky_role_db_action(
+                guild=ctx.guild,
+                channel=ctx.channel,
+                role_id=role_id,
+                role_name=None,
+                config_exists=config_exists,
+                saved_rows=saved_rows,
+                reason="manual orphan scan",
+                requester=ctx.author,
+            )
 
     @nhmisc_stickyroles.group(name="debuglogging", invoke_without_command=True)
     async def nhmisc_stickyroles_debuglogging(self, ctx: commands.Context) -> None:
@@ -530,6 +564,36 @@ class NHMisc(commands.Cog):
                 f"Skipped roles: {self._format_role_id_set(member.guild, skipped_role_ids)}\n"
                 f"Result: {result}."
             ),
+        )
+
+    @commands.Cog.listener()
+    async def on_guild_role_delete(self, role: discord.Role) -> None:
+        """Ask how to handle sticky role DB rows when a Discord role is deleted."""
+        config_exists, saved_rows = await self._sticky_roles.get_role_state(
+            role.guild.id, role.id
+        )
+        if not config_exists and saved_rows == 0:
+            return
+
+        config = await self.config.guild(role.guild).all()
+        channel = self._get_log_channel(role.guild, config["sticky_debug_logging_channel"])
+        if channel is None:
+            log.warning(
+                "Sticky role %s was deleted in guild %s but no sticky debug channel is set",
+                role.id,
+                role.guild.id,
+            )
+            return
+
+        await self._prompt_sticky_role_db_action(
+            guild=role.guild,
+            channel=channel,
+            role_id=role.id,
+            role_name=role.name,
+            config_exists=config_exists,
+            saved_rows=saved_rows,
+            reason="Discord role deletion event",
+            requester=None,
         )
 
     @commands.Cog.listener()
@@ -886,6 +950,144 @@ class NHMisc(commands.Cog):
             return "none"
         return ", ".join(
             self._format_role_reference(guild, role_id) for role_id in sorted(role_ids)
+        )
+
+    def _role_name_for_prompt(self, guild: discord.Guild, role_id: int) -> str | None:
+        role = guild.get_role(role_id)
+        if role is None:
+            return None
+        return role.name
+
+    async def _prompt_sticky_role_db_action(
+        self,
+        *,
+        guild: discord.Guild,
+        channel: discord.abc.Messageable,
+        role_id: int,
+        role_name: str | None,
+        config_exists: bool,
+        saved_rows: int,
+        reason: str,
+        requester: discord.Member | discord.User | None,
+    ) -> None:
+        role_label = f"{role_name} (`{role_id}`)" if role_name else f"`{role_id}`"
+        await channel.send(
+            "Sticky role DB entry needs a decision.\n"
+            f"Role: {role_label}\n"
+            f"Trigger: {reason}\n"
+            f"Configured as sticky: {'yes' if config_exists else 'no'}\n"
+            f"Saved user-role rows: {saved_rows}\n"
+            "Reply with one of:\n"
+            "`remove` - delete this role from sticky DB and saved users\n"
+            "`keep` - leave DB unchanged\n"
+            "`change <role mention or ID>` - move config and saved users to another role",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+        deadline = time.monotonic() + 300
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await channel.send("Sticky role DB decision timed out. No changes were made.")
+                return
+
+            def check(message: discord.Message) -> bool:
+                return message.channel.id == channel.id and not message.author.bot
+
+            try:
+                message = await self.bot.wait_for("message", check=check, timeout=remaining)
+            except asyncio.TimeoutError:
+                await channel.send("Sticky role DB decision timed out. No changes were made.")
+                return
+
+            if not await self._can_answer_sticky_db_prompt(message, guild, requester):
+                continue
+
+            content = message.content.strip()
+            command, _, argument = content.partition(" ")
+            command = command.lower()
+            if command == "remove" and not argument:
+                config_removed, rows_removed = await self._sticky_roles.remove_sticky_role(
+                    guild.id, role_id
+                )
+                await channel.send(
+                    "Sticky role DB entry removed.\n"
+                    f"Config row removed: {'yes' if config_removed else 'no'}\n"
+                    f"Saved user-role rows removed: {rows_removed}"
+                )
+                return
+            if command == "keep" and not argument:
+                await channel.send("Sticky role DB entry kept unchanged.")
+                return
+            if command == "change":
+                await self._handle_sticky_role_db_change(
+                    channel, guild, role_id, argument.strip()
+                )
+                return
+
+            await channel.send(
+                "Invalid response. Use `remove`, `keep`, or `change <role mention or ID>`."
+            )
+
+    async def _can_answer_sticky_db_prompt(
+        self,
+        message: discord.Message,
+        guild: discord.Guild,
+        requester: discord.Member | discord.User | None,
+    ) -> bool:
+        if requester is not None:
+            return message.author.id == requester.id
+
+        member = message.author
+        if not isinstance(member, discord.Member):
+            member = guild.get_member(message.author.id)
+        permissions = getattr(member, "guild_permissions", None)
+        if permissions and permissions.manage_guild:
+            return True
+        return await self.bot.is_admin(message.author)
+
+    async def _handle_sticky_role_db_change(
+        self,
+        channel: discord.abc.Messageable,
+        guild: discord.Guild,
+        old_role_id: int,
+        role_argument: str,
+    ) -> None:
+        if not role_argument:
+            await channel.send("Missing replacement role. No changes were made.")
+            return
+
+        try:
+            new_role_id = self._parse_role_id(role_argument)
+        except commands.UserFeedbackCheckFailure as exc:
+            await channel.send(f"{exc} No changes were made.")
+            return
+
+        if new_role_id == old_role_id:
+            await channel.send("Replacement role is the same role ID. No changes were made.")
+            return
+
+        new_role = guild.get_role(new_role_id)
+        if new_role is None:
+            await channel.send("Replacement role does not exist on this server. No changes were made.")
+            return
+        if not self._can_restore_role(guild, new_role):
+            await channel.send(
+                "I cannot restore the replacement role. Check Manage Roles and role hierarchy. "
+                "No changes were made."
+            )
+            return
+
+        config_moved, old_rows_removed, new_rows_inserted = await self._sticky_roles.replace_sticky_role(
+            guild.id, old_role_id, new_role_id
+        )
+        await channel.send(
+            "Sticky role DB entry changed.\n"
+            f"Replacement role: {new_role.mention} (`{new_role.id}`)\n"
+            f"Config moved: {'yes' if config_moved else 'no'}\n"
+            f"Old saved user-role rows removed: {old_rows_removed}\n"
+            f"New saved user-role rows inserted: {new_rows_inserted}",
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     async def _send_sticky_debug_log(self, guild: discord.Guild, content: str) -> None:
