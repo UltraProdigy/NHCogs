@@ -57,6 +57,47 @@ Defaults:
 - VC jumping entries: `3`
 - VC jumping window: `30` seconds
 
+## Sticky Roles
+
+Sticky roles remember selected roles when a member leaves and restore them when the
+member rejoins. Roles are stored by Discord role ID, so role name changes do not matter.
+
+```ini
+[p]nhmisc stickyroles add @Role
+[p]nhmisc stickyroles add 123456789012345678
+```
+
+Marks a role as sticky. The role must exist on the server and the bot must be able to
+assign it.
+
+```ini
+[p]nhmisc stickyroles remove @Role
+[p]nhmisc stickyroles remove 123456789012345678
+```
+
+Removes a role from sticky-role tracking. Removing a sticky role also removes that role
+from all saved sticky-role snapshots.
+
+```ini
+[p]nhmisc stickyroles list
+```
+
+Lists sticky roles configured for the server.
+
+```ini
+[p]nhmisc stickyroles debuglogging toggle true
+[p]nhmisc stickyroles debuglogging toggle false
+```
+
+Enables or disables sticky-role debug logs. When enabled, the bot logs sticky-role
+snapshot writes on member leave and snapshot reads/restores on member join.
+
+```ini
+[p]nhmisc stickyroles debuglogging channel #sticky-debug
+```
+
+Sets the channel used for sticky-role debug logs.
+
 ## Activity Analytics
 
 Activity analytics passively counts normal user messages from Discord gateway events.
@@ -203,6 +244,8 @@ This command has no arguments and only shows the caller's own data.
 
 Configuration commands require Manage Server or bot admin permissions.
 
+Sticky-role commands require Manage Server or bot admin permissions.
+
 Server-wide activity commands and moderator tools require Manage Messages, Manage
 Server, or bot admin permissions.
 
@@ -214,3 +257,5 @@ own activity.
 The cog stores Discord user IDs with passively collected message-count aggregates for
 configurable short-term activity detail retention. Closed daily summary history stores
 aggregate counts and channel IDs, but not user IDs.
+
+Sticky roles are stored in a local SQLite database as guild IDs, user IDs, and role IDs.
