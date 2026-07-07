@@ -28,6 +28,11 @@ from redbot.core.utils.chat_formatting import box, pagify
 _ = Translator("Honeypot", __file__)
 log = logging.getLogger("red.Honeypot")
 
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover - optional metadata enrichment.
+    Image = None
+
 MAX_BAN_DELETE_MESSAGE_DAYS = 7
 SECONDS_PER_DAY = 24 * 60 * 60
 PURGE_PERMISSION_REQUIREMENTS = (
@@ -92,6 +97,8 @@ SPAM_CHANNEL_MAX = 10
 REVIEW_DUMP_START = datetime(2026, 5, 1, tzinfo=timezone.utc)
 REVIEW_DUMP_MAX_ZIP_BYTES = 95 * 1024 * 1024
 REVIEW_DUMP_ATTACHMENT_DELAY_SECONDS = 1
+IMAGE_SCAN_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+IMAGE_SCAN_COUNTS = (2, 4)
 REVIEW_KICK_FAIL_WARNING_MODES = ("false", "true", "manual")
 KICK_FAIL_WARNING_REASON = "Suspicious activity: target left before the kick could be applied."
 CORE_ACTION_OPTIONS = ("kick", "ban", "review", "none")
@@ -544,6 +551,71 @@ class KickFailWarnView(discord.ui.View):
         self.stop()
 
 
+class ImageScanReviewView(discord.ui.View):
+    def __init__(self, cog: "Honeypot", event_id: str, guild_id: int) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.event_id = event_id
+        self.guild_id = guild_id
+        self.review_message: discord.Message | None = None
+
+    @staticmethod
+    def _check_perms(interaction: discord.Interaction) -> bool:
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        return bool(permissions and permissions.moderate_members)
+
+    def _disable_all(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+    async def _set_decision(
+        self,
+        interaction: discord.Interaction,
+        decision: str,
+        label: str,
+    ) -> None:
+        if not self._check_perms(interaction):
+            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
+            return
+        await self.cog._imagescan_set_decision(self.guild_id, self.event_id, decision, interaction.user.id)
+        self._disable_all()
+        message = self.review_message or interaction.message
+        embed = message.embeds[0] if message and message.embeds else None
+        if embed:
+            embed.color = discord.Color.green()
+            reviewed_value = (
+                f"{interaction.user.mention} ({interaction.user.id})\n"
+                f"{discord.utils.format_dt(datetime.now(timezone.utc), style='F')}"
+            )
+            status_index = self.cog._embed_field_index(embed, _("Status:"))
+            if status_index is None:
+                embed.add_field(name=_("Classification:"), value=label, inline=False)
+            else:
+                embed.set_field_at(status_index, name=_("Classification:"), value=label, inline=False)
+            embed.add_field(name=_("Reviewed by:"), value=reviewed_value, inline=False)
+        if message is not None:
+            try:
+                await message.edit(content=_("✅ **Image scan classified**"), embed=embed, view=self)
+            except discord.HTTPException:
+                log.debug("Failed to edit imagescan review message %s", getattr(message, "id", None))
+        await interaction.followup.send(_("Classification saved: {label}").format(label=label), ephemeral=True)
+
+    @discord.ui.button(label="Confirm scam", style=discord.ButtonStyle.danger, custom_id="honeypot:imagescan:true_positive")
+    async def confirm_scam(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        await self._set_decision(interaction, "true_positive", _("True positive"))
+
+    @discord.ui.button(label="False positive", style=discord.ButtonStyle.secondary, custom_id="honeypot:imagescan:false_positive")
+    async def false_positive(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        await self._set_decision(interaction, "false_positive", _("False positive"))
+
+    @discord.ui.button(label="Ignore", style=discord.ButtonStyle.success, custom_id="honeypot:imagescan:ignored")
+    async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        await self._set_decision(interaction, "ignored", _("Ignored"))
+
+
 @cog_i18n(_)
 class Honeypot(Cog):
     """Create a trap channel and handle users who post in it."""
@@ -577,6 +649,8 @@ class Honeypot(Cog):
             spam_action="review",
             spam_window_seconds=10,
             spam_min_channels=2,
+            imagescan_enabled=False,
+            imagescan_channel=None,
             fake_activity_enabled=False,
             fake_activity_interval=10,
             fake_activity_messages=[],
@@ -623,6 +697,9 @@ class Honeypot(Cog):
         self._firstpost_dirty_seen_authors: dict[int, set[int]] = defaultdict(set)
         self._firstpost_loaded_guilds: set[int] = set()
         self._review_dump_lock: asyncio.Lock = asyncio.Lock()
+        self._imagescan_db_path = cog_data_path(self) / "imagescan.sqlite"
+        self._imagescan_files_path = cog_data_path(self) / "imagescan_files"
+        self._imagescan_db_lock: asyncio.Lock = asyncio.Lock()
 
     async def _increment_stat(self, guild: discord.Guild, key: str, amount: int = 1) -> None:
         async with self.config.guild(guild).stats() as stats:
@@ -645,6 +722,56 @@ class Honeypot(Cog):
 
     async def _init_firstpost_seen_store(self) -> None:
         await asyncio.to_thread(self._init_firstpost_seen_store_sync)
+
+    def _init_imagescan_store_sync(self) -> None:
+        self._imagescan_db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._imagescan_files_path.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS imagescan_events (
+                    event_id TEXT PRIMARY KEY,
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    message_jump_url TEXT NOT NULL,
+                    review_channel_id TEXT,
+                    review_message_id TEXT,
+                    created_at INTEGER NOT NULL,
+                    image_count INTEGER NOT NULL,
+                    content TEXT,
+                    decision TEXT NOT NULL DEFAULT 'pending',
+                    moderator_id TEXT,
+                    decided_at INTEGER
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS imagescan_events_message_idx
+                ON imagescan_events (guild_id, message_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS imagescan_files (
+                    event_id TEXT NOT NULL,
+                    file_index INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    content_type TEXT,
+                    sha256 TEXT NOT NULL,
+                    width INTEGER,
+                    height INTEGER,
+                    PRIMARY KEY (event_id, file_index)
+                )
+                """
+            )
+
+    async def _init_imagescan_store(self) -> None:
+        await asyncio.to_thread(self._init_imagescan_store_sync)
 
     def _load_firstpost_seen_authors_sync(self, guild_id: int) -> set[int]:
         with sqlite3.connect(self._firstpost_db_path) as conn:
@@ -1299,6 +1426,7 @@ class Honeypot(Cog):
     async def cog_load(self) -> None:
         await super().cog_load()
         await self._init_firstpost_seen_store()
+        await self._init_imagescan_store()
         self.fake_activity_loop.start()
         self.review_timeout_loop.start()
         self.joinwatch_auto_role_loop.start()
@@ -1423,6 +1551,32 @@ class Honeypot(Cog):
                         self._active_views[int(review_message_id)] = view
             except Exception:
                 log.exception("Failed to restore pending reviews for guild %s", guild_id)
+        await self._restore_imagescan_views()
+
+    def _pending_imagescan_views_sync(self) -> list[tuple[int, str, int]]:
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT guild_id, event_id, review_message_id
+                FROM imagescan_events
+                WHERE decision = 'pending'
+                AND review_message_id IS NOT NULL
+                """
+            ).fetchall()
+        return [(int(row[0]), str(row[1]), int(row[2])) for row in rows]
+
+    async def _restore_imagescan_views(self) -> None:
+        try:
+            rows = await asyncio.to_thread(self._pending_imagescan_views_sync)
+        except Exception:
+            log.exception("Failed to load pending image scan views")
+            return
+        for guild_id, event_id, review_message_id in rows:
+            try:
+                view = ImageScanReviewView(self, event_id, guild_id)
+                self.bot.add_view(view, message_id=review_message_id)
+            except Exception:
+                log.exception("Failed to restore image scan view %s", review_message_id)
 
     async def _expire_review(self, view: ReviewView) -> bool:
         if not await view._claim_resolution():
@@ -2307,6 +2461,7 @@ class Honeypot(Cog):
         logs_channel = self._get_text_channel_or_thread(message.guild, config.get("logs_channel"))
         if await self._is_protected_member(message.author):
             return
+        await self._handle_imagescan_message(message, config)
         self._record_recent_user_message(message)
         if self._is_forward_purge_active(message.guild.id, message.author.id):
             if await self._delete_forward_purge_message(message):
@@ -3234,6 +3389,404 @@ class Honeypot(Cog):
         except discord.HTTPException:
             log.debug("Failed to update review dump progress message %s", progress_message.id)
 
+    @staticmethod
+    def _imagescan_is_image_attachment(attachment: discord.Attachment) -> bool:
+        content_type = (attachment.content_type or "").lower()
+        if content_type.startswith("image/"):
+            return True
+        filename = (attachment.filename or "").lower()
+        return filename.endswith(IMAGE_SCAN_EXTENSIONS)
+
+    def _imagescan_trigger_attachments(self, message: discord.Message) -> list[discord.Attachment]:
+        image_attachments = [
+            attachment
+            for attachment in message.attachments
+            if self._imagescan_is_image_attachment(attachment)
+        ]
+        if len(image_attachments) not in IMAGE_SCAN_COUNTS:
+            return []
+        return image_attachments
+
+    @staticmethod
+    def _imagescan_safe_filename(filename: str | None, index: int) -> str:
+        fallback = f"image-{index}.jpg"
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or fallback).strip("._")
+        return safe or fallback
+
+    @staticmethod
+    def _imagescan_image_dimensions(data: bytes) -> tuple[int | None, int | None]:
+        if Image is None:
+            return None, None
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                return image.width, image.height
+        except Exception:
+            return None, None
+
+    async def _imagescan_copy_attachments(
+        self,
+        guild_id: int,
+        event_id: str,
+        attachments: list[discord.Attachment],
+    ) -> list[dict[str, typing.Any]] | None:
+        event_dir = self._imagescan_files_path / str(guild_id) / event_id
+        event_dir.mkdir(parents=True, exist_ok=True)
+        records: list[dict[str, typing.Any]] = []
+        for index, attachment in enumerate(attachments, 1):
+            filename = self._imagescan_safe_filename(attachment.filename, index)
+            path = event_dir / f"{index:03d}-{filename}"
+            try:
+                data = await attachment.read(use_cached=True)
+            except (discord.HTTPException, discord.Forbidden, discord.NotFound, TypeError) as exc:
+                log.debug("Failed to copy imagescan attachment %s for event %s: %s", attachment.filename, event_id, exc)
+                shutil.rmtree(event_dir, ignore_errors=True)
+                return None
+            width, height = self._imagescan_image_dimensions(data)
+            path.write_bytes(data)
+            records.append(
+                {
+                    "event_id": event_id,
+                    "file_index": index,
+                    "filename": attachment.filename or filename,
+                    "path": str(path),
+                    "size": len(data),
+                    "content_type": attachment.content_type,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "width": width,
+                    "height": height,
+                }
+            )
+        return records
+
+    def _imagescan_event_exists_sync(self, guild_id: int, message_id: int) -> bool:
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM imagescan_events WHERE guild_id = ? AND message_id = ?",
+                (str(guild_id), str(message_id)),
+            ).fetchone()
+        return row is not None
+
+    async def _imagescan_event_exists(self, guild_id: int, message_id: int) -> bool:
+        async with self._imagescan_db_lock:
+            return await asyncio.to_thread(self._imagescan_event_exists_sync, guild_id, message_id)
+
+    def _imagescan_insert_event_sync(
+        self,
+        event: dict[str, typing.Any],
+        files: list[dict[str, typing.Any]],
+    ) -> None:
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO imagescan_events
+                (
+                    event_id, guild_id, user_id, channel_id, message_id, message_jump_url,
+                    review_channel_id, review_message_id, created_at, image_count, content,
+                    decision, moderator_id, decided_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event["event_id"],
+                    event["guild_id"],
+                    event["user_id"],
+                    event["channel_id"],
+                    event["message_id"],
+                    event["message_jump_url"],
+                    event.get("review_channel_id"),
+                    event.get("review_message_id"),
+                    event["created_at"],
+                    event["image_count"],
+                    event.get("content"),
+                    event.get("decision", "pending"),
+                    event.get("moderator_id"),
+                    event.get("decided_at"),
+                ),
+            )
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO imagescan_files
+                (event_id, file_index, filename, path, size, content_type, sha256, width, height)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        file_record["event_id"],
+                        file_record["file_index"],
+                        file_record["filename"],
+                        file_record["path"],
+                        file_record["size"],
+                        file_record.get("content_type"),
+                        file_record["sha256"],
+                        file_record.get("width"),
+                        file_record.get("height"),
+                    )
+                    for file_record in files
+                ],
+            )
+
+    async def _imagescan_insert_event(
+        self,
+        event: dict[str, typing.Any],
+        files: list[dict[str, typing.Any]],
+    ) -> None:
+        async with self._imagescan_db_lock:
+            await asyncio.to_thread(self._imagescan_insert_event_sync, event, files)
+
+    def _imagescan_update_review_message_sync(
+        self,
+        guild_id: int,
+        event_id: str,
+        review_channel_id: int,
+        review_message_id: int,
+    ) -> None:
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.execute(
+                """
+                UPDATE imagescan_events
+                SET review_channel_id = ?, review_message_id = ?
+                WHERE guild_id = ? AND event_id = ?
+                """,
+                (str(review_channel_id), str(review_message_id), str(guild_id), event_id),
+            )
+
+    async def _imagescan_update_review_message(
+        self,
+        guild_id: int,
+        event_id: str,
+        review_channel_id: int,
+        review_message_id: int,
+    ) -> None:
+        async with self._imagescan_db_lock:
+            await asyncio.to_thread(
+                self._imagescan_update_review_message_sync,
+                guild_id,
+                event_id,
+                review_channel_id,
+                review_message_id,
+            )
+
+    def _imagescan_set_decision_sync(
+        self,
+        guild_id: int,
+        event_id: str,
+        decision: str,
+        moderator_id: int,
+    ) -> None:
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.execute(
+                """
+                UPDATE imagescan_events
+                SET decision = ?, moderator_id = ?, decided_at = ?
+                WHERE guild_id = ? AND event_id = ?
+                """,
+                (
+                    decision,
+                    str(moderator_id),
+                    int(datetime.now(timezone.utc).timestamp()),
+                    str(guild_id),
+                    event_id,
+                ),
+            )
+
+    async def _imagescan_set_decision(
+        self,
+        guild_id: int,
+        event_id: str,
+        decision: str,
+        moderator_id: int,
+    ) -> None:
+        async with self._imagescan_db_lock:
+            await asyncio.to_thread(
+                self._imagescan_set_decision_sync,
+                guild_id,
+                event_id,
+                decision,
+                moderator_id,
+            )
+
+    def _imagescan_counts_sync(self, guild_id: int) -> dict[str, int]:
+        counts = {"pending": 0, "true_positive": 0, "false_positive": 0, "ignored": 0}
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT decision, COUNT(*)
+                FROM imagescan_events
+                WHERE guild_id = ?
+                GROUP BY decision
+                """,
+                (str(guild_id),),
+            ).fetchall()
+        for decision, count in rows:
+            counts[str(decision)] = int(count)
+        return counts
+
+    async def _imagescan_counts(self, guild_id: int) -> dict[str, int]:
+        async with self._imagescan_db_lock:
+            return await asyncio.to_thread(self._imagescan_counts_sync, guild_id)
+
+    def _imagescan_export_rows_sync(self, guild_id: int) -> list[dict[str, typing.Any]]:
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            events = conn.execute(
+                """
+                SELECT *
+                FROM imagescan_events
+                WHERE guild_id = ?
+                ORDER BY created_at ASC
+                """,
+                (str(guild_id),),
+            ).fetchall()
+            files = conn.execute(
+                """
+                SELECT *
+                FROM imagescan_files
+                WHERE event_id IN (
+                    SELECT event_id FROM imagescan_events WHERE guild_id = ?
+                )
+                ORDER BY event_id ASC, file_index ASC
+                """,
+                (str(guild_id),),
+            ).fetchall()
+        files_by_event: dict[str, list[dict[str, typing.Any]]] = defaultdict(list)
+        for row in files:
+            files_by_event[str(row["event_id"])].append(dict(row))
+        rows: list[dict[str, typing.Any]] = []
+        for row in events:
+            item = dict(row)
+            item["files"] = files_by_event.get(str(row["event_id"]), [])
+            rows.append(item)
+        return rows
+
+    async def _imagescan_export_rows(self, guild_id: int) -> list[dict[str, typing.Any]]:
+        async with self._imagescan_db_lock:
+            return await asyncio.to_thread(self._imagescan_export_rows_sync, guild_id)
+
+    def _imagescan_review_files(self, file_records: list[dict[str, typing.Any]]) -> list[discord.File]:
+        files: list[discord.File] = []
+        for record in file_records[:10]:
+            path = Path(record["path"])
+            if not path.exists():
+                continue
+            files.append(discord.File(path, filename=path.name))
+        return files
+
+    async def _imagescan_send_review(
+        self,
+        message: discord.Message,
+        event_id: str,
+        review_channel: discord.TextChannel | discord.Thread,
+        file_records: list[dict[str, typing.Any]],
+    ) -> discord.Message | None:
+        embed = discord.Embed(
+            title=_("Image scan shadow review"),
+            description=f">>> {message.content}" if message.content else _("*(message with images only)*"),
+            color=discord.Color.blurple(),
+            timestamp=message.created_at,
+        )
+        embed.set_author(
+            name=f"{message.author.display_name} ({message.author.id})",
+            icon_url=message.author.display_avatar,
+        )
+        embed.add_field(
+            name=_("User:"),
+            value=f"{message.author.mention} (`{message.author.id}`)",
+            inline=False,
+        )
+        embed.add_field(
+            name=_("Channel:"),
+            value=getattr(message.channel, "mention", f"<#{message.channel.id}>"),
+            inline=True,
+        )
+        embed.add_field(name=_("Message:"), value=message.jump_url, inline=False)
+        embed.add_field(name=_("Image count:"), value=str(len(file_records)), inline=True)
+        embed.add_field(
+            name=_("Scan reason:"),
+            value=_("Exactly {count} image attachments").format(count=len(file_records)),
+            inline=False,
+        )
+        embed.add_field(name=_("Status:"), value=_("Pending classification"), inline=False)
+        embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
+        view = ImageScanReviewView(self, event_id, message.guild.id)
+        kwargs: dict[str, typing.Any] = {
+            "embed": embed,
+            "view": view,
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+        files = self._imagescan_review_files(file_records)
+        if files:
+            kwargs["files"] = files
+        try:
+            sent = await review_channel.send(**kwargs)
+        except discord.HTTPException as exc:
+            log.warning("Failed to send imagescan review for message %s: %s", message.id, exc)
+            return None
+        view.review_message = sent
+        return sent
+
+    async def _handle_imagescan_message(self, message: discord.Message, config: dict) -> None:
+        if not config.get("imagescan_enabled", False):
+            return
+        review_channel_id = config.get("imagescan_channel")
+        if review_channel_id is None:
+            return
+        review_channel = self._get_text_channel_or_thread(message.guild, review_channel_id)
+        if review_channel is None:
+            return
+        attachments = self._imagescan_trigger_attachments(message)
+        if not attachments:
+            return
+        if await self._imagescan_event_exists(message.guild.id, message.id):
+            return
+        event_id = str(message.id)
+        file_records = await self._imagescan_copy_attachments(message.guild.id, event_id, attachments)
+        if file_records is None:
+            return
+        event = {
+            "event_id": event_id,
+            "guild_id": str(message.guild.id),
+            "user_id": str(message.author.id),
+            "channel_id": str(message.channel.id),
+            "message_id": str(message.id),
+            "message_jump_url": message.jump_url,
+            "review_channel_id": None,
+            "review_message_id": None,
+            "created_at": int(message.created_at.timestamp()),
+            "image_count": len(file_records),
+            "content": message.content or None,
+            "decision": "pending",
+            "moderator_id": None,
+            "decided_at": None,
+        }
+        await self._imagescan_insert_event(event, file_records)
+        sent = await self._imagescan_send_review(message, event_id, review_channel, file_records)
+        if sent is not None:
+            await self._imagescan_update_review_message(message.guild.id, event_id, review_channel.id, sent.id)
+
+    async def _imagescan_create_dump_archives(self, guild_id: int) -> tuple[Path, list[Path]]:
+        temp_root = Path(tempfile.mkdtemp(prefix="honeypot-imagescan-dump-"))
+        data_root = temp_root / "data"
+        zip_root = temp_root / "zips"
+        files_root = data_root / "files"
+        data_root.mkdir(parents=True, exist_ok=True)
+        zip_root.mkdir(parents=True, exist_ok=True)
+        rows = await self._imagescan_export_rows(guild_id)
+        with (data_root / "imagescan.jsonl").open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        if self._imagescan_db_path.exists():
+            shutil.copy2(self._imagescan_db_path, data_root / "imagescan.sqlite")
+        source_files_root = self._imagescan_files_path / str(guild_id)
+        if source_files_root.exists():
+            for source in source_files_root.rglob("*"):
+                if not source.is_file():
+                    continue
+                target = files_root / str(guild_id) / source.relative_to(source_files_root)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+        archives = self._review_dump_zip_chunks(data_root, zip_root, REVIEW_DUMP_MAX_ZIP_BYTES)
+        return temp_root, archives
+
     # ─── Commands ─────────────────────────────────────────────────────────
 
     @commands.guild_only()
@@ -3688,6 +4241,79 @@ class Honeypot(Cog):
             f"Channels: {config.get('spam_min_channels', 2)}",
         ]
         await ctx.send(_("**Spam status:**\n") + box("\n".join(lines)))
+
+    # ─── imagescan sub-group ───────────────────────────────────────────
+
+    @honeypot.group(name="imagescan")
+    async def imagescan(self, ctx: commands.Context) -> None:
+        """Collect image shadow-review training data."""
+
+    @imagescan.command(name="toggle")
+    async def imagescan_toggle(self, ctx: commands.Context, value: bool = None) -> None:
+        """Enable or disable image scan shadow reviews."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).imagescan_enabled()
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
+        else:
+            if value and await self.config.guild(ctx.guild).imagescan_channel() is None:
+                raise commands.UserFeedbackCheckFailure(
+                    _("Set an image scan channel first with `honeypot imagescan channel`.")
+                )
+            await self.config.guild(ctx.guild).imagescan_enabled.set(value)
+            await ctx.send(_("✅ Image scan enabled set to {value}").format(value=value))
+
+    @imagescan.command(name="channel")
+    async def imagescan_channel(
+        self,
+        ctx: commands.Context,
+        channel: discord.TextChannel | discord.Thread = None,
+    ) -> None:
+        """Set the image scan shadow review channel."""
+        if channel is None:
+            channel_id = await self.config.guild(ctx.guild).imagescan_channel()
+            current = self._get_text_channel_or_thread(ctx.guild, channel_id)
+            await ctx.send(_("Current image scan channel: {channel}").format(channel=current.mention if current else "None"))
+            return
+        await self.config.guild(ctx.guild).imagescan_channel.set(channel.id)
+        await ctx.send(_("✅ Image scan channel set to {channel}").format(channel=channel.mention))
+
+    @imagescan.command(name="status")
+    async def imagescan_status(self, ctx: commands.Context) -> None:
+        """Show image scan status."""
+        config = await self.config.guild(ctx.guild).all()
+        channel = self._get_text_channel_or_thread(ctx.guild, config.get("imagescan_channel"))
+        counts = await self._imagescan_counts(ctx.guild.id)
+        lines = [
+            f"Enabled: {self._format_bool_setting(config.get('imagescan_enabled', False))}",
+            f"Channel: {channel.mention if channel else 'None'}",
+            f"Pending: {counts.get('pending', 0)}",
+            f"True positives: {counts.get('true_positive', 0)}",
+            f"False positives: {counts.get('false_positive', 0)}",
+            f"Ignored: {counts.get('ignored', 0)}",
+            f"Files: {self._imagescan_files_path}",
+        ]
+        await ctx.send(_("**Image scan status:**\n") + box("\n".join(lines)))
+
+    @imagescan.command(name="dump")
+    async def imagescan_dump(self, ctx: commands.Context) -> None:
+        """Export image scan events and copied files."""
+        temp_root: Path | None = None
+        try:
+            temp_root, archives = await self._imagescan_create_dump_archives(ctx.guild.id)
+            if not archives:
+                await ctx.send(_("No image scan dump files were created."))
+                return
+            await ctx.send(_("Image scan dump created. Sending {count} file(s).").format(count=len(archives)))
+            for archive in archives:
+                await ctx.send(file=discord.File(archive))
+        finally:
+            if temp_root is not None:
+                shutil.rmtree(temp_root, ignore_errors=True)
 
     # ─── firstpost sub-group ────────────────────────────────────────────
 
