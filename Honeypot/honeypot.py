@@ -3081,10 +3081,8 @@ class Honeypot(Cog):
         if not message.embeds:
             return False
         fields = Honeypot._review_dump_field_map(message.embeds[0])
-        action = fields.get("action taken", "").lower()
-        if "ban" not in action or "dry-run" in action:
-            return False
-        if message.content and "review resolved" not in message.content.lower():
+        action = (fields.get("action taken") or fields.get("action") or "").lower()
+        if "ban" not in action or "dry-run" in action or "failed" in action:
             return False
         return True
 
@@ -3176,7 +3174,8 @@ class Honeypot(Cog):
             "review_jump_url": review_message.jump_url,
             "review_created_at": review_message.created_at.isoformat(),
             "target_user_id": self._review_dump_extract_user_id(embed, fields),
-            "completed_action": fields.get("action taken"),
+            "case_type": "manual_review" if fields.get("action taken") else "honeypot_hit",
+            "completed_action": fields.get("action taken") or fields.get("action"),
             "reviewed_by": fields.get("reviewed by"),
             "channels": fields.get("channels") or fields.get("channel"),
             "channel_ids": self._review_dump_clean_mentions(fields.get("channels") or fields.get("channel")),
