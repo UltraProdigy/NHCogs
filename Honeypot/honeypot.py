@@ -1,13 +1,19 @@
 import asyncio
 import hashlib
 import io
+import json
 import logging
+import math
+import shutil
 import random
 import re
 import sqlite3
+import tempfile
 import typing
+import zipfile
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import discord
 from discord.ext import tasks
@@ -83,6 +89,9 @@ SPAM_WINDOW_MIN_SECONDS = 3
 SPAM_WINDOW_MAX_SECONDS = 60
 SPAM_CHANNEL_MIN = 2
 SPAM_CHANNEL_MAX = 10
+REVIEW_DUMP_START = datetime(2026, 5, 1, tzinfo=timezone.utc)
+REVIEW_DUMP_MAX_ZIP_BYTES = 95 * 1024 * 1024
+REVIEW_DUMP_ATTACHMENT_DELAY_SECONDS = 1
 REVIEW_KICK_FAIL_WARNING_MODES = ("false", "true", "manual")
 KICK_FAIL_WARNING_REASON = "Suspicious activity: target left before the kick could be applied."
 CORE_ACTION_OPTIONS = ("kick", "ban", "review", "none")
@@ -613,6 +622,7 @@ class Honeypot(Cog):
         self._firstpost_seen_authors: dict[int, set[int]] = defaultdict(set)
         self._firstpost_dirty_seen_authors: dict[int, set[int]] = defaultdict(set)
         self._firstpost_loaded_guilds: set[int] = set()
+        self._review_dump_lock: asyncio.Lock = asyncio.Lock()
 
     async def _increment_stat(self, guild: discord.Guild, key: str, amount: int = 1) -> None:
         async with self.config.guild(guild).stats() as stats:
@@ -3040,6 +3050,191 @@ class Honeypot(Cog):
                 except discord.HTTPException:
                     log.debug("Failed to send bait role log for user %s in guild %s", after.id, after.guild.id)
 
+    @staticmethod
+    def _review_dump_field_map(embed: discord.Embed) -> dict[str, str]:
+        return {str(field.name).strip().rstrip(":").lower(): str(field.value) for field in embed.fields}
+
+    @staticmethod
+    def _review_dump_clean_mentions(value: str | None) -> list[str]:
+        if not value:
+            return []
+        return re.findall(r"<#(\d+)>", value)
+
+    @staticmethod
+    def _review_dump_extract_user_id(embed: discord.Embed, fields: dict[str, str]) -> int | None:
+        candidates = [
+            fields.get("user"),
+            fields.get("user id"),
+            embed.description,
+            embed.title,
+        ]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            match = re.search(r"\b(\d{15,25})\b", str(candidate))
+            if match:
+                return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _review_dump_is_banned_review(message: discord.Message) -> bool:
+        if not message.embeds:
+            return False
+        fields = Honeypot._review_dump_field_map(message.embeds[0])
+        action = fields.get("action taken", "").lower()
+        if "ban" not in action or "dry-run" in action:
+            return False
+        if message.content and "review resolved" not in message.content.lower():
+            return False
+        return True
+
+    @staticmethod
+    def _review_dump_message_record(message: discord.Message, parent_review_id: int | None = None) -> dict[str, typing.Any]:
+        embed = message.embeds[0] if message.embeds else None
+        fields = Honeypot._review_dump_field_map(embed) if embed else {}
+        record: dict[str, typing.Any] = {
+            "message_id": str(message.id),
+            "parent_review_message_id": str(parent_review_id) if parent_review_id is not None else None,
+            "jump_url": message.jump_url,
+            "created_at": message.created_at.isoformat(),
+            "content": message.content or None,
+            "embed": None,
+            "attachment_count": len(message.attachments),
+        }
+        if embed:
+            record["embed"] = {
+                "title": embed.title,
+                "description": embed.description,
+                "timestamp": embed.timestamp.isoformat() if embed.timestamp else None,
+                "fields": fields,
+            }
+        return record
+
+    async def _review_dump_download_attachment(
+        self,
+        attachment: discord.Attachment,
+        case_dir: Path,
+        prefix: str,
+        index: int,
+    ) -> dict[str, typing.Any]:
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", attachment.filename or f"attachment-{index}")
+        archive_name = f"{prefix}-{index:03d}-{safe_name}"
+        target = case_dir / archive_name
+        result: dict[str, typing.Any] = {
+            "filename": attachment.filename,
+            "archive_path": target.as_posix(),
+            "size": attachment.size,
+            "content_type": attachment.content_type,
+            "url": attachment.url,
+            "sha256": None,
+            "error": None,
+        }
+        try:
+            data = await attachment.read(use_cached=True)
+            target.write_bytes(data)
+            result["size"] = len(data)
+            result["sha256"] = hashlib.sha256(data).hexdigest()
+            await asyncio.sleep(REVIEW_DUMP_ATTACHMENT_DELAY_SECONDS)
+        except (discord.HTTPException, OSError) as exc:
+            result["archive_path"] = None
+            result["error"] = str(exc)
+        return result
+
+    async def _review_dump_collect_case(
+        self,
+        review_message: discord.Message,
+        replies_by_reference: dict[int, list[discord.Message]],
+        root_dir: Path,
+    ) -> dict[str, typing.Any]:
+        embed = review_message.embeds[0]
+        fields = self._review_dump_field_map(embed)
+        attachment_dir = root_dir / "cases" / str(review_message.id) / "attachments"
+        attachment_dir.mkdir(parents=True, exist_ok=True)
+        attachments: list[dict[str, typing.Any]] = []
+        for index, attachment in enumerate(review_message.attachments, 1):
+            attachments.append(
+                await self._review_dump_download_attachment(attachment, attachment_dir, "review", index)
+            )
+        addendums: list[dict[str, typing.Any]] = []
+        for addendum in sorted(replies_by_reference.get(review_message.id, []), key=lambda item: item.created_at):
+            addendum_record = self._review_dump_message_record(addendum, review_message.id)
+            addendum_attachments: list[dict[str, typing.Any]] = []
+            for index, attachment in enumerate(addendum.attachments, 1):
+                addendum_attachments.append(
+                    await self._review_dump_download_attachment(
+                        attachment,
+                        attachment_dir,
+                        f"addendum-{addendum.id}",
+                        index,
+                    )
+                )
+            addendum_record["attachments"] = addendum_attachments
+            addendums.append(addendum_record)
+            attachments.extend(addendum_attachments)
+        return {
+            "review_message_id": str(review_message.id),
+            "review_jump_url": review_message.jump_url,
+            "review_created_at": review_message.created_at.isoformat(),
+            "target_user_id": self._review_dump_extract_user_id(embed, fields),
+            "completed_action": fields.get("action taken"),
+            "reviewed_by": fields.get("reviewed by"),
+            "channels": fields.get("channels") or fields.get("channel"),
+            "channel_ids": self._review_dump_clean_mentions(fields.get("channels") or fields.get("channel")),
+            "trigger_reasons": fields.get("trigger reasons"),
+            "message_content": embed.description,
+            "embed_fields": fields,
+            "review_message": self._review_dump_message_record(review_message),
+            "attachments": attachments,
+            "addendums": addendums,
+        }
+
+    @staticmethod
+    def _review_dump_zip_chunks(root_dir: Path, zip_dir: Path, max_bytes: int) -> list[Path]:
+        files = [path for path in root_dir.rglob("*") if path.is_file()]
+        chunks: list[list[Path]] = [[]]
+        chunk_sizes = [0]
+        for path in sorted(files):
+            size = path.stat().st_size
+            if chunks[-1] and chunk_sizes[-1] + size > max_bytes:
+                chunks.append([])
+                chunk_sizes.append(0)
+            chunks[-1].append(path)
+            chunk_sizes[-1] += size
+        width = max(3, int(math.log10(max(len(chunks), 1))) + 1)
+        archives: list[Path] = []
+        for index, chunk in enumerate(chunks, 1):
+            archive = zip_dir / f"honeypot-review-dump-{index:0{width}d}.zip"
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+                for path in chunk:
+                    zip_file.write(path, path.relative_to(root_dir))
+            archives.append(archive)
+        return archives
+
+    async def _review_dump_update_progress(
+        self,
+        progress_message: discord.Message,
+        *,
+        scanned: int,
+        dumped: int,
+        current_date: datetime | None,
+        started_at: datetime,
+        finished: bool = False,
+    ) -> None:
+        elapsed = datetime.now(timezone.utc) - started_at
+        current = current_date.strftime("%Y-%m-%d %H:%M UTC") if current_date else "unknown"
+        status = "Finished" if finished else "Running"
+        content = (
+            f"**Honeypot review dump:** {status}\n"
+            f"Current date: `{current}`\n"
+            f"Messages scanned: `{scanned}`\n"
+            f"Banned reviews dumped: `{dumped}`\n"
+            f"Elapsed: `{str(elapsed).split('.')[0]}`"
+        )
+        try:
+            await progress_message.edit(content=content)
+        except discord.HTTPException:
+            log.debug("Failed to update review dump progress message %s", progress_message.id)
+
     # ─── Commands ─────────────────────────────────────────────────────────
 
     @commands.guild_only()
@@ -3047,6 +3242,109 @@ class Honeypot(Cog):
     @commands.group()
     async def honeypot(self, ctx: commands.Context) -> None:
         """Configure the honeypot system."""
+
+    @honeypot.command(name="reviewdump")
+    async def review_dump(self, ctx: commands.Context) -> None:
+        """Dump completed banned review cases from this channel."""
+        if self._review_dump_lock.locked():
+            await ctx.send(_("A review dump is already running."))
+            return
+
+        async with self._review_dump_lock:
+            started_at = datetime.now(timezone.utc)
+            after = REVIEW_DUMP_START
+            progress_message = await ctx.send(
+                _(
+                    "**Honeypot review dump:** Running\n"
+                    "Current date: `starting`\n"
+                    "Messages scanned: `0`\n"
+                    "Banned reviews dumped: `0`\n"
+                    "Elapsed: `0:00:00`"
+                )
+            )
+            temp_root = Path(tempfile.mkdtemp(prefix="honeypot-review-dump-"))
+            data_root = temp_root / "data"
+            zip_root = temp_root / "zips"
+            data_root.mkdir(parents=True, exist_ok=True)
+            zip_root.mkdir(parents=True, exist_ok=True)
+            scanned = 0
+            dumped = 0
+            current_date: datetime | None = None
+            last_progress = datetime.now(timezone.utc)
+            replies_by_reference: dict[int, list[discord.Message]] = defaultdict(list)
+            banned_reviews: list[discord.Message] = []
+            cases: list[dict[str, typing.Any]] = []
+
+            try:
+                async for message in ctx.channel.history(limit=None, after=after, oldest_first=False):
+                    scanned += 1
+                    current_date = message.created_at
+                    reference = getattr(message, "reference", None)
+                    if reference is not None and reference.message_id is not None:
+                        replies_by_reference[reference.message_id].append(message)
+                    if self._review_dump_is_banned_review(message):
+                        banned_reviews.append(message)
+                    now = datetime.now(timezone.utc)
+                    if scanned == 1 or scanned % 250 == 0 or (now - last_progress).total_seconds() >= 30:
+                        await self._review_dump_update_progress(
+                            progress_message,
+                            scanned=scanned,
+                            dumped=dumped,
+                            current_date=current_date,
+                            started_at=started_at,
+                        )
+                        last_progress = now
+                        await asyncio.sleep(0.25)
+
+                for review_message in sorted(banned_reviews, key=lambda item: item.created_at):
+                    cases.append(await self._review_dump_collect_case(review_message, replies_by_reference, data_root))
+                    dumped += 1
+                    now = datetime.now(timezone.utc)
+                    if dumped == 1 or dumped % 10 == 0 or (now - last_progress).total_seconds() >= 30:
+                        await self._review_dump_update_progress(
+                            progress_message,
+                            scanned=scanned,
+                            dumped=dumped,
+                            current_date=review_message.created_at,
+                            started_at=started_at,
+                        )
+                        last_progress = now
+
+                manifest = {
+                    "guild_id": str(ctx.guild.id),
+                    "channel_id": str(ctx.channel.id),
+                    "channel_name": getattr(ctx.channel, "name", None),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "scan_after": after.isoformat(),
+                    "messages_scanned": scanned,
+                    "banned_reviews_dumped": dumped,
+                    "cases": cases,
+                }
+                (data_root / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                with (data_root / "reviews.jsonl").open("w", encoding="utf-8") as handle:
+                    for case in cases:
+                        handle.write(json.dumps(case, ensure_ascii=False) + "\n")
+
+                archives = self._review_dump_zip_chunks(data_root, zip_root, REVIEW_DUMP_MAX_ZIP_BYTES)
+                await self._review_dump_update_progress(
+                    progress_message,
+                    scanned=scanned,
+                    dumped=dumped,
+                    current_date=current_date,
+                    started_at=started_at,
+                    finished=True,
+                )
+
+                if not archives:
+                    await ctx.send(_("No dump files were created."))
+                    return
+                for archive in archives:
+                    await ctx.send(file=discord.File(archive))
+            finally:
+                shutil.rmtree(temp_root, ignore_errors=True)
 
     # ─── core sub-group ───────────────────────────────────────────────
 
