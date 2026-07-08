@@ -440,6 +440,7 @@ class ReviewView(discord.ui.View):
             if action == "kick":
                 if member is None:
                     return (_("User is no longer in the server."), None)
+                self.cog._activate_forward_purge(guild.id, self.target_id)
                 await member.kick(reason=reason)
                 await self._create_modlog_case(guild, member, action, reason, interaction.user)
                 await self.cog._increment_stat(guild, "kicked")
@@ -447,6 +448,7 @@ class ReviewView(discord.ui.View):
                 return (None, _("Kicked"))
             elif action == "ban":
                 target = member if member is not None else await self.cog._get_user_or_object(self.target_id)
+                self.cog._activate_forward_purge(guild.id, target.id)
                 await guild.ban(
                     target,
                     reason=reason,
@@ -458,6 +460,7 @@ class ReviewView(discord.ui.View):
                 await self.cog._purge_after_review_action(guild, target.id)
                 return (None, _("Banned"))
         except discord.HTTPException:
+            self.cog._deactivate_forward_purge(guild.id, self.target_id)
             await self.cog._increment_stat(guild, "failed_actions")
             return (_("Action failed. Check my permissions and role position."), None)
         return (None, None)
@@ -640,8 +643,6 @@ class Honeypot(Cog):
             mute_role=None,
             ban_delete_message_days=3,
             whitelisted_roles=[],
-            purge_enabled=True,
-            purge_minutes=5,
             firstpost_collect_enabled=False,
             firstpost_enabled=False,
             firstpost_action="review",
@@ -2145,14 +2146,17 @@ class Honeypot(Cog):
             return (None, missing_permission)
         try:
             if action == "kick":
+                self._activate_forward_purge(message.guild.id, message.author.id)
                 try:
                     await message.author.kick(reason=reason)
                 except discord.NotFound:
                     if self._automated_kick_fail_warning_enabled(config):
+                        self._deactivate_forward_purge(message.guild.id, message.author.id)
                         return await self._create_kick_fail_warning(message.guild, message.author.id)
                     raise
                 await self._increment_stat(message.guild, "kicked")
             elif action == "ban":
+                self._activate_forward_purge(message.guild.id, message.author.id)
                 await message.author.ban(
                     reason=reason,
                     delete_message_seconds=self._ban_delete_message_seconds(config),
@@ -2162,6 +2166,7 @@ class Honeypot(Cog):
                 )
                 await self._increment_stat(message.guild, "banned")
         except discord.HTTPException as e:
+            self._deactivate_forward_purge(message.guild.id, message.author.id)
             await self._increment_stat(message.guild, "failed_actions")
             return (None, _("**Action failed:**\n") + box(str(e), lang="py"))
         try:
@@ -2528,14 +2533,12 @@ class Honeypot(Cog):
                 inline=True,
             )
 
-        # Purge - always runs before any action/review
-        purged = 0
-        if config["purge_enabled"]:
-            purged = await self._cached_purge_user_messages(
-                message.guild,
-                message.author.id,
-                exclude_message_id=message.id if message_deleted else None,
-            )
+        # Cached purge is fixed-retention safety; it does not override ban delete days.
+        purged = await self._cached_purge_user_messages(
+            message.guild,
+            message.author.id,
+            exclude_message_id=message.id if message_deleted else None,
+        )
         if purged:
             await self._increment_stat(message.guild, "purged_messages", purged)
             await self._increment_stat(message.guild, "cached_purge_deletes", purged)
@@ -4129,35 +4132,6 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).ban_delete_message_days.set(days)
             await ctx.send(_("✅ Delete days set to {value}").format(value=days))
 
-    # ─── purge sub-group ──────────────────────────────────────────────
-
-    @honeypot.group()
-    async def purge(self, ctx: commands.Context) -> None:
-        """Auto-purge recent messages from caught users."""
-
-    @purge.command(name="toggle")
-    async def purge_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Delete recent cached messages from caught users."""
-        if value is None:
-            v = await self.config.guild(ctx.guild).purge_enabled()
-            await ctx.send(
-                _("Current: {value}. Choices: {options}").format(
-                    value=str(v).lower(),
-                    options=self._format_options(BOOL_OPTIONS),
-                )
-            )
-        else:
-            await self.config.guild(ctx.guild).purge_enabled.set(value)
-            await ctx.send(_("✅ Purge enabled set to {value}").format(value=value))
-
-    @purge.command()
-    async def minutes(self, ctx: commands.Context, value: int = None) -> None:
-        """Show fixed cached purge retention."""
-        if value is None:
-            await ctx.send(_("Cached purge retention: 2 minutes (fixed)."))
-        else:
-            await ctx.send(_("Cached purge retention is fixed at 2 minutes."))
-
     # ─── spam sub-group ────────────────────────────────────────────────
 
     @honeypot.group()
@@ -5025,12 +4999,11 @@ class Honeypot(Cog):
     @config_dump.command(name="purge")
     async def config_purge(self, ctx: commands.Context) -> None:
         """Show purge configuration."""
-        config = await self.config.guild(ctx.guild).all()
         await self._send_config_dump(
             ctx,
             _("Purge config"),
             [
-                (_("Enabled"), self._format_bool_setting(config.get("purge_enabled", False))),
+                (_("Mode"), _("Cached + forward purge (always on)")),
                 (_("Retention"), _("2 minutes (fixed)")),
             ],
         )
@@ -5360,38 +5333,37 @@ class Honeypot(Cog):
                     ),
                 )
             )
-        if config.get("purge_enabled") or ban_delete_message_days(config) > 0:
-            skipped_channels = []
-            purgeable_channels = [
-                channel
-                for channel in list(ctx.guild.channels) + list(ctx.guild.threads)
-                if is_purgeable_message_channel(channel)
-            ]
-            for channel in purgeable_channels:
-                perms = channel.permissions_for(me)
-                if not perms.view_channel:
-                    continue
-                if not perms.manage_messages:
-                    skipped_channels.append(channel.mention)
-            if skipped_channels:
-                shown_channels = ", ".join(skipped_channels[:8])
-                if len(skipped_channels) > 8:
-                    shown_channels += " ..."
-                checks.append(
-                    (
-                        "Cached purge can delete visible message channels",
-                        False,
-                        "\nManage - " + shown_channels,
-                    )
+        skipped_channels = []
+        purgeable_channels = [
+            channel
+            for channel in list(ctx.guild.channels) + list(ctx.guild.threads)
+            if is_purgeable_message_channel(channel)
+        ]
+        for channel in purgeable_channels:
+            perms = channel.permissions_for(me)
+            if not perms.view_channel:
+                continue
+            if not perms.manage_messages:
+                skipped_channels.append(channel.mention)
+        if skipped_channels:
+            shown_channels = ", ".join(skipped_channels[:8])
+            if len(skipped_channels) > 8:
+                shown_channels += " ..."
+            checks.append(
+                (
+                    "Cached purge can delete visible message channels",
+                    False,
+                    "\nManage - " + shown_channels,
                 )
-            else:
-                checks.append(
-                    (
-                        "Cached purge can delete visible message channels",
-                        True,
-                        "Grant Manage Messages in visible channels where cached purge should delete messages.",
-                    )
+            )
+        else:
+            checks.append(
+                (
+                    "Cached purge can delete visible message channels",
+                    True,
+                    "Grant Manage Messages in visible channels where cached purge should delete messages.",
                 )
+            )
         if logs_channel is not None:
             perms = logs_channel.permissions_for(me)
             checks.append(("Can send logs", perms.send_messages, "Grant Send Messages."))
