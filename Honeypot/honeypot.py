@@ -40,14 +40,6 @@ PURGE_PERMISSION_REQUIREMENTS = (
     ("Read Message History", "read_message_history"),
     ("Manage Messages", "manage_messages"),
 )
-DEFAULT_FAKE_MESSAGES = [
-    "BAN CHANNEL - DO NOT WRITE HERE.",
-    "Do not type in this channel.",
-    "This channel is restricted.",
-    "Wrong channel. Do not post here.",
-    "Stop. This channel is monitored.",
-]
-
 DEFAULT_STATS = {
     "detections": 0,
     "suspicious": 0,
@@ -652,9 +644,6 @@ class Honeypot(Cog):
             spam_min_channels=2,
             imagescan_enabled=False,
             imagescan_channel=None,
-            fake_activity_enabled=False,
-            fake_activity_interval=10,
-            fake_activity_messages=[],
             review_enabled=False,
             review_channel=None,
             review_timeout_minutes=1440,
@@ -683,7 +672,6 @@ class Honeypot(Cog):
             baitrole_action="ban",
         )
 
-        self._last_fake_message: dict[int, datetime] = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
         self._active_views: dict[int, ReviewView] = {}
         self._views_lock: asyncio.Lock = asyncio.Lock()
         self._restore_task: asyncio.Task | None = None
@@ -1428,7 +1416,6 @@ class Honeypot(Cog):
         await super().cog_load()
         await self._init_firstpost_seen_store()
         await self._init_imagescan_store()
-        self.fake_activity_loop.start()
         self.review_timeout_loop.start()
         self.joinwatch_auto_role_loop.start()
         self.purge_cache_cleanup_loop.start()
@@ -1436,7 +1423,6 @@ class Honeypot(Cog):
         self._restore_task = asyncio.create_task(self._restore_pending_reviews())
 
     async def cog_unload(self) -> None:
-        self.fake_activity_loop.cancel()
         self.review_timeout_loop.cancel()
         self.joinwatch_auto_role_loop.cancel()
         self.purge_cache_cleanup_loop.cancel()
@@ -1459,42 +1445,6 @@ class Honeypot(Cog):
     @tasks.loop(minutes=1)
     async def purge_cache_cleanup_loop(self) -> None:
         self._prune_purge_cache()
-
-    # ─── Fake Activity Loop ───────────────────────────────────────────────
-
-    @tasks.loop(minutes=1)
-    async def fake_activity_loop(self) -> None:
-        now = datetime.now(timezone.utc)
-        for guild in self.bot.guilds:
-            try:
-                config = await self.config.guild(guild).all()
-                if not config["enabled"] or not config["fake_activity_enabled"]:
-                    continue
-                honeypot_channels = [
-                    channel
-                    for channel_id in self._honeypot_channel_ids_from_config(config)
-                    if (channel := self._get_text_channel_or_thread(guild, channel_id)) is not None
-                ]
-                if not honeypot_channels:
-                    continue
-                interval = config["fake_activity_interval"]
-                last = self._last_fake_message[guild.id]
-                if (now - last).total_seconds() < interval * 60:
-                    continue
-                custom_msgs: list[str] = config.get("fake_activity_messages", [])
-                pool = custom_msgs if custom_msgs else DEFAULT_FAKE_MESSAGES
-                msg = random.choice(pool)
-                honeypot_channel = random.choice(honeypot_channels)
-                await honeypot_channel.send(msg)
-                self._last_fake_message[guild.id] = now
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Error in fake_activity_loop for guild %s", guild.id)
-
-    @fake_activity_loop.before_loop
-    async def before_fake_activity(self) -> None:
-        await self.bot.wait_until_red_ready()
 
     @tasks.loop(minutes=5)
     async def review_timeout_loop(self) -> None:
@@ -3798,7 +3748,15 @@ class Honeypot(Cog):
     async def honeypot(self, ctx: commands.Context) -> None:
         """Configure the honeypot system."""
 
-    @honeypot.command(name="reviewdump")
+    @honeypot.group(name="debug")
+    async def debug(self, ctx: commands.Context) -> None:
+        """Developer and data export tools."""
+
+    @debug.group(name="imagescan")
+    async def debug_imagescan(self, ctx: commands.Context) -> None:
+        """Developer tools for image scan data."""
+
+    @debug.command(name="reviewdump")
     async def review_dump(self, ctx: commands.Context) -> None:
         """Dump completed banned review cases from this channel."""
         if self._review_dump_lock.locked():
@@ -3901,15 +3859,15 @@ class Honeypot(Cog):
             finally:
                 shutil.rmtree(temp_root, ignore_errors=True)
 
-    # ─── core sub-group ───────────────────────────────────────────────
+    # ─── honeypot sub-group ───────────────────────────────────────────
 
-    @honeypot.group()
-    async def core(self, ctx: commands.Context) -> None:
-        """Core settings: enabled, action, fallback, dry run."""
+    @honeypot.group(name="honeypot")
+    async def honeypot_settings(self, ctx: commands.Context) -> None:
+        """Configure honeypot detection itself."""
 
-    @core.command(name="toggle")
-    async def core_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Enable or disable the cog."""
+    @honeypot_settings.command(name="toggle")
+    async def honeypot_toggle(self, ctx: commands.Context, value: bool = None) -> None:
+        """Enable or disable honeypot detection."""
         if value is None:
             v = await self.config.guild(ctx.guild).enabled()
             await ctx.send(
@@ -3922,7 +3880,7 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).enabled.set(value)
             await ctx.send(_("✅ Enabled set to {value}").format(value=value))
 
-    @core.command()
+    @honeypot_settings.command()
     async def action(self, ctx: commands.Context, value: str = None) -> None:
         """Main action for suspicious users: kick, ban, review, or none."""
         if value is None:
@@ -3939,7 +3897,7 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).action.set(value)
             await ctx.send(_("✅ Action set to {value}").format(value=value))
 
-    @core.command(name="fallback_action")
+    @honeypot_settings.command(name="fallback_action")
     async def fallback_action(self, ctx: commands.Context, value: str = None) -> None:
         """Fallback: review, kick, ban, or none."""
         if value is None:
@@ -3956,7 +3914,7 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).fallback_action.set(value)
             await ctx.send(_("✅ Fallback action set to {value}").format(value=value))
 
-    @core.command(name="dry_run")
+    @honeypot_settings.command(name="dry_run")
     async def dry_run(self, ctx: commands.Context, value: bool = None) -> None:
         """Log actions without actually punishing users."""
         if value is None:
@@ -3971,7 +3929,7 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).dry_run.set(value)
             await ctx.send(_("✅ Dry run set to {value}").format(value=value))
 
-    @core.command(name="whitelist_mode")
+    @honeypot_settings.command(name="whitelist_mode")
     async def whitelist_mode(self, ctx: commands.Context, value: str = None) -> None:
         """How whitelisted roles behave: bypass, review, fallback, or none."""
         if value is None:
@@ -3988,7 +3946,7 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).whitelist_mode.set(value)
             await ctx.send(_("✅ Whitelist mode set to {value}").format(value=value))
 
-    @core.command(name="automated_kick_fail_warn")
+    @honeypot_settings.command(name="automated_kick_fail_warn")
     async def automated_kick_fail_warn(self, ctx: commands.Context, value: bool = None) -> None:
         """Warn when the target has already left before the kick is applied."""
         if value is None:
@@ -4273,7 +4231,7 @@ class Honeypot(Cog):
         ]
         await ctx.send(_("**Image scan status:**\n") + box("\n".join(lines)))
 
-    @imagescan.command(name="dump")
+    @debug_imagescan.command(name="dump")
     async def imagescan_dump(self, ctx: commands.Context) -> None:
         """Export image scan events and copied files."""
         temp_root: Path | None = None
@@ -4358,78 +4316,6 @@ class Honeypot(Cog):
             f"Seen authors: {seen_count}",
         ]
         await ctx.send(_("**Firstpost status:**\n") + box("\n".join(lines)))
-
-    # ─── fakeactivity sub-group ───────────────────────────────────────
-
-    @honeypot.group()
-    async def fakeactivity(self, ctx: commands.Context) -> None:
-        """Fake activity to lure scammers."""
-
-    @fakeactivity.command(name="toggle")
-    async def fakeactivity_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Simulate activity in the honeypot channel to attract scammers."""
-        if value is None:
-            v = await self.config.guild(ctx.guild).fake_activity_enabled()
-            await ctx.send(
-                _("Current: {value}. Choices: {options}").format(
-                    value=str(v).lower(),
-                    options=self._format_options(BOOL_OPTIONS),
-                )
-            )
-        else:
-            await self.config.guild(ctx.guild).fake_activity_enabled.set(value)
-            await ctx.send(_("✅ Fake activity enabled set to {value}").format(value=value))
-
-    @fakeactivity.command()
-    async def interval(self, ctx: commands.Context, value: int = None) -> None:
-        """Minutes between fake messages (1-120)."""
-        if value is None:
-            v = await self.config.guild(ctx.guild).fake_activity_interval()
-            await ctx.send(_("Fake activity interval: {value} min").format(value=v))
-        elif value < 1 or value > 120:
-            await ctx.send(_("Interval must be between 1 and 120."))
-        else:
-            await self.config.guild(ctx.guild).fake_activity_interval.set(value)
-            await ctx.send(_("✅ Interval set to {value} minutes").format(value=value))
-
-    @fakeactivity.command(name="add")
-    async def fakeactivity_add(self, ctx: commands.Context, *, message: str) -> None:
-        """Add a custom fake activity message."""
-        message = message.strip()
-        if not message:
-            raise commands.UserFeedbackCheckFailure(_("Fake activity message cannot be empty."))
-        if len(message) > 2000:
-            raise commands.UserFeedbackCheckFailure(_("Fake activity message must be 2000 characters or fewer."))
-        async with self.config.guild(ctx.guild).fake_activity_messages() as msgs:
-            msgs.append(message)
-        await ctx.send(_("✅ Message added. ({num} total)").format(num=len(msgs)))
-
-    @fakeactivity.command(name="remove")
-    async def fakeactivity_remove(self, ctx: commands.Context, index: int) -> None:
-        """Remove a fake message by index (see list)."""
-        async with self.config.guild(ctx.guild).fake_activity_messages() as msgs:
-            if index < 1 or index > len(msgs):
-                raise commands.UserFeedbackCheckFailure(
-                    _("Invalid index. Use `{prefix}honeypot fakeactivity list` to see indices.").format(prefix=ctx.clean_prefix),
-                )
-            removed = msgs.pop(index - 1)
-        await ctx.send(_("✅ Removed #{index}: {msg}").format(index=index, msg=removed))
-
-    @fakeactivity.command(name="list")
-    async def fakeactivity_list(self, ctx: commands.Context) -> None:
-        """List custom fake activity messages."""
-        msgs = await self.config.guild(ctx.guild).fake_activity_messages()
-        if not msgs:
-            await ctx.send(_("No custom messages. Defaults will be used."))
-            return
-        lines = "\n".join(f"`{i}.` {m}" for i, m in enumerate(msgs, 1))
-        await ctx.send(_("**Fake activity messages:**\n{lines}").format(lines=lines))
-
-    @fakeactivity.command(name="reset")
-    async def fakeactivity_reset(self, ctx: commands.Context) -> None:
-        """Reset to defaults."""
-        await self.config.guild(ctx.guild).fake_activity_messages.set([])
-        await ctx.send(_("✅ Reset to defaults."))
 
     # ─── review sub-group ─────────────────────────────────────────────
 
@@ -4952,13 +4838,13 @@ class Honeypot(Cog):
     async def config_dump(self, ctx: commands.Context) -> None:
         """Show current Honeypot configuration by section."""
 
-    @config_dump.command(name="core")
-    async def config_core(self, ctx: commands.Context) -> None:
-        """Show core configuration."""
+    @config_dump.command(name="honeypot")
+    async def config_honeypot(self, ctx: commands.Context) -> None:
+        """Show honeypot detection configuration."""
         config = await self.config.guild(ctx.guild).all()
         await self._send_config_dump(
             ctx,
-            _("Core config"),
+            _("Honeypot config"),
             [
                 (_("Enabled"), self._format_bool_setting(config.get("enabled", False))),
                 (_("Action"), config.get("action") or _("not set")),
@@ -5034,21 +4920,6 @@ class Honeypot(Cog):
                 (_("Action"), config.get("spam_action", "review")),
                 (_("Window"), _("{seconds}s").format(seconds=config.get("spam_window_seconds", 10))),
                 (_("Channels"), config.get("spam_min_channels", 2)),
-            ],
-        )
-
-    @config_dump.command(name="fakeactivity")
-    async def config_fakeactivity(self, ctx: commands.Context) -> None:
-        """Show fake activity configuration."""
-        config = await self.config.guild(ctx.guild).all()
-        messages = config.get("fake_activity_messages") or []
-        await self._send_config_dump(
-            ctx,
-            _("Fake activity config"),
-            [
-                (_("Enabled"), self._format_bool_setting(config.get("fake_activity_enabled", False))),
-                (_("Interval"), _("{minutes} minutes").format(minutes=config.get("fake_activity_interval"))),
-                (_("Custom messages"), len(messages)),
             ],
         )
 
@@ -5160,7 +5031,7 @@ class Honeypot(Cog):
             ctx,
             _("Honeypot config summary"),
             [
-                (_("Core"), self._format_bool_setting(config.get("enabled", False))),
+                (_("Honeypot"), self._format_bool_setting(config.get("enabled", False))),
                 (_("Honeypot channels"), self._format_honeypot_channel_list(ctx.guild, self._honeypot_channel_ids_from_config(config))),
                 (_("Logs channel"), self._format_channel_setting(ctx.guild, config.get("logs_channel"))),
                 (_("Review"), self._format_bool_setting(config.get("review_enabled", False))),
@@ -5284,8 +5155,8 @@ class Honeypot(Cog):
         ]
         logs_channel = self._get_text_channel_or_thread(ctx.guild, config.get("logs_channel"))
         review_channel = self._get_text_channel_or_thread(ctx.guild, config.get("review_channel"))
-        checks.append(("Honeypot enabled", bool(config.get("enabled")), "Run `honeypot core toggle true`."))
-        checks.append(("Action configured", config.get("action") in ("kick", "ban", "review", "none"), "Run `honeypot core action`."))
+        checks.append(("Honeypot enabled", bool(config.get("enabled")), "Run `honeypot honeypot toggle true`."))
+        checks.append(("Action configured", config.get("action") in ("kick", "ban", "review", "none"), "Run `honeypot honeypot action`."))
         checks.append(("Firstpost action configured", config.get("firstpost_action", "review") in CORE_ACTION_OPTIONS, "Run `honeypot firstpost action`."))
         checks.append(("Spam action configured", config.get("spam_action", "review") in CORE_ACTION_OPTIONS, "Run `honeypot spam action`."))
         checks.append(("Honeypot channel exists", bool(honeypot_channels), "Run `honeypot channel add`."))
