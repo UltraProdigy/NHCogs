@@ -33,8 +33,6 @@ try:
 except ImportError:  # pragma: no cover - optional metadata enrichment.
     Image = None
 
-MAX_BAN_DELETE_MESSAGE_DAYS = 7
-SECONDS_PER_DAY = 24 * 60 * 60
 PURGE_PERMISSION_REQUIREMENTS = (
     ("View Channel", "view_channel"),
     ("Read Message History", "read_message_history"),
@@ -99,17 +97,6 @@ WHITELIST_MODE_OPTIONS = ("bypass", "review", "fallback", "none")
 JOINWATCH_AUTO_ROLE_ACTION_OPTIONS = ("none", "kick", "ban")
 BAIT_ACTION_OPTIONS = ("kick", "ban")
 BOOL_OPTIONS = ("false", "true")
-
-
-def ban_delete_message_days(config: dict) -> int:
-    days = int(config.get("ban_delete_message_days", 0) or 0)
-    if days <= 0:
-        return 0
-    return min(days, MAX_BAN_DELETE_MESSAGE_DAYS)
-
-
-def ban_delete_message_seconds(config: dict) -> int:
-    return ban_delete_message_days(config) * SECONDS_PER_DAY
 
 
 def missing_purge_permissions(permissions: object) -> list[str]:
@@ -446,7 +433,7 @@ class ReviewView(discord.ui.View):
                     reason=reason,
                     delete_message_seconds=self.cog._ban_delete_message_seconds(config),
                 )
-                self.cog._schedule_post_ban_sweep_if_enabled(guild, target.id, config)
+                self.cog._schedule_post_ban_sweep(guild, target.id)
                 await self._create_modlog_case(guild, target, action, reason, interaction.user)
                 await self.cog._increment_stat(guild, "banned")
                 await self.cog._purge_after_review_action(guild, target.id)
@@ -629,11 +616,9 @@ class Honeypot(Cog):
             fallback_action="review",
             dry_run=False,
             logs_channel=None,
-            ping_role=None,
             honeypot_channel=None,
             honeypot_channels=[],
             mute_role=None,
-            ban_delete_message_days=3,
             whitelisted_roles=[],
             firstpost_collect_enabled=False,
             firstpost_enabled=False,
@@ -1287,7 +1272,7 @@ class Honeypot(Cog):
 
     @staticmethod
     def _ban_delete_message_seconds(config: dict) -> int:
-        return ban_delete_message_seconds(config)
+        return 0
 
     def _missing_action_permission(self, guild: discord.Guild, action: str) -> str | None:
         me = guild.me
@@ -2046,12 +2031,8 @@ class Honeypot(Cog):
         await self._finish_firstpost_response(message, message_deleted=message_deleted)
         return True
 
-    def _schedule_post_ban_sweep_if_enabled(
-        self, guild: discord.Guild, user_id: int, config: dict
-    ) -> None:
+    def _schedule_post_ban_sweep(self, guild: discord.Guild, user_id: int) -> None:
         """After ban: wait, then delete this user's recent cached messages."""
-        if ban_delete_message_days(config) <= 0:
-            return
         task = self.bot.loop.create_task(
             self._post_ban_message_sweep(
                 guild.id, user_id
@@ -2111,9 +2092,7 @@ class Honeypot(Cog):
                     reason=reason,
                     delete_message_seconds=self._ban_delete_message_seconds(config),
                 )
-                self._schedule_post_ban_sweep_if_enabled(
-                    message.guild, message.author.id, config
-                )
+                self._schedule_post_ban_sweep(message.guild, message.author.id)
                 await self._increment_stat(message.guild, "banned")
         except discord.HTTPException as e:
             self._deactivate_forward_purge(message.guild.id, message.author.id)
@@ -2359,12 +2338,7 @@ class Honeypot(Cog):
             inline=False,
         )
         review_files = self._attachment_files(attachment_snapshots)
-        ping_content = None
-        if ping_role_id := config.get("ping_role"):
-            if ping_role := message.guild.get_role(ping_role_id):
-                ping_content = ping_role.mention
         review_send_kwargs = {
-            "content": ping_content,
             "embed": embed,
             "view": view,
         }
@@ -2562,13 +2536,6 @@ class Honeypot(Cog):
                 logs_channel,
                 embed,
                 attachment_snapshots,
-                content=(
-                    ping_role.mention
-                    if (ping_role_id := config["ping_role"]) is not None
-                    and (ping_role := message.guild.get_role(ping_role_id)) is not None
-                    else None
-                ),
-                allowed_mentions=discord.AllowedMentions(roles=True),
             )
             return
         should_review = force_review or (
@@ -2644,13 +2611,6 @@ class Honeypot(Cog):
             logs_channel,
             embed,
             attachment_snapshots,
-            content=(
-                ping_role.mention
-                if (ping_role_id := config["ping_role"]) is not None
-                and (ping_role := message.guild.get_role(ping_role_id)) is not None
-                else None
-            ),
-            allowed_mentions=discord.AllowedMentions(roles=True),
         )
 
     async def _execute_joinwatch_action(
@@ -2690,7 +2650,7 @@ class Honeypot(Cog):
                     reason=reason,
                     delete_message_seconds=self._ban_delete_message_seconds(config),
                 )
-                self._schedule_post_ban_sweep_if_enabled(guild, target.id, config)
+                self._schedule_post_ban_sweep(guild, target.id)
             await self._increment_stat(guild, "joinwatch_auto_role_punishments")
         except discord.HTTPException as exc:
             await self._increment_stat(guild, "failed_actions")
@@ -3132,9 +3092,7 @@ class Honeypot(Cog):
                         reason=reason,
                         delete_message_seconds=self._ban_delete_message_seconds(config),
                     )
-                    self._schedule_post_ban_sweep_if_enabled(
-                        after.guild, after.id, config
-                    )
+                    self._schedule_post_ban_sweep(after.guild, after.id)
                     await self._increment_stat(after.guild, "banned")
                 elif action == "kick":
                     await after.kick(reason=reason)
@@ -3746,19 +3704,19 @@ class Honeypot(Cog):
     @commands.permissions_check(lambda ctx: ctx.author.id == ctx.guild.owner_id or ctx.author.id in ctx.bot.owner_ids)
     @commands.group()
     async def honeypot(self, ctx: commands.Context) -> None:
-        """Configure the honeypot system."""
+        """Configure server safety and honeypot protections."""
 
     @honeypot.group(name="debug")
     async def debug(self, ctx: commands.Context) -> None:
-        """Developer and data export tools."""
+        """Maintenance, debug, and export tools."""
 
     @debug.group(name="imagescan")
     async def debug_imagescan(self, ctx: commands.Context) -> None:
-        """Developer tools for image scan data."""
+        """Maintenance tools for image scan training data."""
 
     @debug.command(name="reviewdump")
     async def review_dump(self, ctx: commands.Context) -> None:
-        """Dump completed banned review cases from this channel."""
+        """Export banned review cases from the current channel."""
         if self._review_dump_lock.locked():
             await ctx.send(_("A review dump is already running."))
             return
@@ -3863,11 +3821,11 @@ class Honeypot(Cog):
 
     @honeypot.group(name="honeypot")
     async def honeypot_settings(self, ctx: commands.Context) -> None:
-        """Configure honeypot detection itself."""
+        """Configure the main honeypot detection layer."""
 
     @honeypot_settings.command(name="toggle")
     async def honeypot_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Enable or disable honeypot detection."""
+        """Enable or disable the main honeypot layer."""
         if value is None:
             v = await self.config.guild(ctx.guild).enabled()
             await ctx.send(
@@ -3882,7 +3840,7 @@ class Honeypot(Cog):
 
     @honeypot_settings.command()
     async def action(self, ctx: commands.Context, value: str = None) -> None:
-        """Main action for suspicious users: kick, ban, review, or none."""
+        """Set the default action for honeypot detections."""
         if value is None:
             v = await self.config.guild(ctx.guild).action()
             await ctx.send(
@@ -3899,7 +3857,7 @@ class Honeypot(Cog):
 
     @honeypot_settings.command(name="fallback_action")
     async def fallback_action(self, ctx: commands.Context, value: str = None) -> None:
-        """Fallback: review, kick, ban, or none."""
+        """Set the action used when a detector falls back to honeypot handling."""
         if value is None:
             v = await self.config.guild(ctx.guild).fallback_action()
             await ctx.send(
@@ -3916,7 +3874,7 @@ class Honeypot(Cog):
 
     @honeypot_settings.command(name="dry_run")
     async def dry_run(self, ctx: commands.Context, value: bool = None) -> None:
-        """Log actions without actually punishing users."""
+        """Log what would happen without applying punishments."""
         if value is None:
             v = await self.config.guild(ctx.guild).dry_run()
             await ctx.send(
@@ -3931,7 +3889,7 @@ class Honeypot(Cog):
 
     @honeypot_settings.command(name="whitelist_mode")
     async def whitelist_mode(self, ctx: commands.Context, value: str = None) -> None:
-        """How whitelisted roles behave: bypass, review, fallback, or none."""
+        """Set how whitelisted roles are handled by honeypot detections."""
         if value is None:
             v = await self.config.guild(ctx.guild).whitelist_mode()
             await ctx.send(
@@ -3948,7 +3906,7 @@ class Honeypot(Cog):
 
     @honeypot_settings.command(name="automated_kick_fail_warn")
     async def automated_kick_fail_warn(self, ctx: commands.Context, value: bool = None) -> None:
-        """Warn when the target has already left before the kick is applied."""
+        """Warn when an automated kick cannot run because the user already left."""
         if value is None:
             v = await self.config.guild(ctx.guild).automated_kick_fail_warning()
             await ctx.send(
@@ -3965,12 +3923,12 @@ class Honeypot(Cog):
 
     @honeypot.group(name="channel")
     async def channels(self, ctx: commands.Context) -> None:
-        """Honeypot channel, logs channel, ping role."""
+        """Configure honeypot and log channels."""
 
     @commands.bot_has_guild_permissions(manage_channels=True)
     @channels.command()
     async def create(self, ctx: commands.Context) -> None:
-        """Create the honeypot channel."""
+        """Create and register a new honeypot channel."""
         me = ctx.guild.me
         if me is None:
             raise commands.UserFeedbackCheckFailure(_("I couldn't find my server member."))
@@ -3995,7 +3953,7 @@ class Honeypot(Cog):
 
     @channels.command(name="add")
     async def channel_add(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread) -> None:
-        """Add an existing honeypot channel."""
+        """Register an existing channel as a honeypot channel."""
         missing = self._missing_channel_permissions(
             ctx.guild,
             target,
@@ -4013,7 +3971,7 @@ class Honeypot(Cog):
 
     @channels.command(name="remove")
     async def channel_remove(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread) -> None:
-        """Remove a honeypot channel."""
+        """Unregister a honeypot channel."""
         removed = False
         async with self.config.guild(ctx.guild).honeypot_channels() as channel_ids:
             while target.id in channel_ids:
@@ -4028,7 +3986,7 @@ class Honeypot(Cog):
 
     @channels.command(name="list")
     async def channel_list(self, ctx: commands.Context) -> None:
-        """List honeypot channels."""
+        """List registered honeypot channels."""
         config = await self.config.guild(ctx.guild).all()
         channel_ids = self._honeypot_channel_ids_from_config(config)
         await ctx.send(
@@ -4039,7 +3997,7 @@ class Honeypot(Cog):
 
     @channels.command()
     async def logs(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread = None) -> None:
-        """Set the logs channel."""
+        """Set the channel used for honeypot logs."""
         if target is None:
             v = await self.config.guild(ctx.guild).logs_channel()
             await ctx.send(_("Logs channel: {channel}").format(channel=ctx.guild.get_channel(v) if v else _("not set")))
@@ -4050,26 +4008,15 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).logs_channel.set(target.id)
             await ctx.send(_("✅ Logs channel set to {channel.mention}").format(channel=target))
 
-    @channels.command(name="ping_role")
-    async def channel_ping_role(self, ctx: commands.Context, role: discord.Role = None) -> None:
-        """Role to ping on detection."""
-        if role is None:
-            v = await self.config.guild(ctx.guild).ping_role()
-            role = ctx.guild.get_role(v) if v else None
-            await ctx.send(_("Ping role: {role}").format(role=role.mention if role else _("not set")))
-        else:
-            await self.config.guild(ctx.guild).ping_role.set(role.id)
-            await ctx.send(_("✅ Ping role set to {role.mention}").format(role=role))
-
     # ─── punishment sub-group ─────────────────────────────────────────
 
     @honeypot.group()
     async def punishment(self, ctx: commands.Context) -> None:
-        """Mute role, delete days on ban."""
+        """Configure roles used while a case is awaiting review."""
 
     @punishment.command(name="mute_role")
     async def punishment_mute_role(self, ctx: commands.Context, role: discord.Role = None) -> None:
-        """Temporary mute role for users awaiting review."""
+        """Set the temporary mute role for pending reviews."""
         if role is None:
             v = await self.config.guild(ctx.guild).mute_role()
             r = ctx.guild.get_role(v) if v else None
@@ -4078,27 +4025,15 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).mute_role.set(role.id)
             await ctx.send(_("✅ Mute role set to {role.mention}").format(role=role))
 
-    @punishment.command(name="delete_days")
-    async def punishment_delete_days(self, ctx: commands.Context, days: int = None) -> None:
-        """Days of messages to delete on ban (0-7)."""
-        if days is None:
-            v = await self.config.guild(ctx.guild).ban_delete_message_days()
-            await ctx.send(_("Delete days: {value}").format(value=v))
-        elif days < 0 or days > 7:
-            await ctx.send(_("Days must be between 0 and 7."))
-        else:
-            await self.config.guild(ctx.guild).ban_delete_message_days.set(days)
-            await ctx.send(_("✅ Delete days set to {value}").format(value=days))
-
     # ─── spam sub-group ────────────────────────────────────────────────
 
     @honeypot.group()
     async def spam(self, ctx: commands.Context) -> None:
-        """Detect repeated messages across channels."""
+        """Configure duplicate-message spam detection."""
 
     @spam.command(name="toggle")
     async def spam_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Enable or disable repeated message detection."""
+        """Enable or disable duplicate-message spam detection."""
         if value is None:
             v = await self.config.guild(ctx.guild).spam_enabled()
             await ctx.send(
@@ -4113,7 +4048,7 @@ class Honeypot(Cog):
 
     @spam.command(name="action")
     async def spam_action(self, ctx: commands.Context, value: str = None) -> None:
-        """Action for repeated message detections."""
+        """Set the action for duplicate-message spam detections."""
         if value is None:
             v = await self.config.guild(ctx.guild).spam_action()
             await ctx.send(
@@ -4130,7 +4065,7 @@ class Honeypot(Cog):
 
     @spam.command(name="window")
     async def spam_window(self, ctx: commands.Context, seconds: int = None) -> None:
-        """Seconds in the repeated message window."""
+        """Set the time window for duplicate-message detection."""
         if seconds is None:
             v = await self.config.guild(ctx.guild).spam_window_seconds()
             await ctx.send(_("Spam window: {seconds}s").format(seconds=v))
@@ -4147,7 +4082,7 @@ class Honeypot(Cog):
 
     @spam.command(name="channels")
     async def spam_channels(self, ctx: commands.Context, count: int = None) -> None:
-        """Different channels required for duplicate spam detection."""
+        """Set how many channels must contain the same message."""
         if count is None:
             v = await self.config.guild(ctx.guild).spam_min_channels()
             await ctx.send(_("Spam channel threshold: {count}").format(count=v))
@@ -4162,27 +4097,15 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).spam_min_channels.set(count)
             await ctx.send(_("✅ Spam channel threshold set to {count}").format(count=count))
 
-    @spam.command(name="status")
-    async def spam_status(self, ctx: commands.Context) -> None:
-        """Show spam detection status."""
-        config = await self.config.guild(ctx.guild).all()
-        lines = [
-            f"Enabled: {self._format_bool_setting(config.get('spam_enabled', False))}",
-            f"Action: {config.get('spam_action', 'review')}",
-            f"Window: {config.get('spam_window_seconds', 10)}s",
-            f"Channels: {config.get('spam_min_channels', 2)}",
-        ]
-        await ctx.send(_("**Spam status:**\n") + box("\n".join(lines)))
-
     # ─── imagescan sub-group ───────────────────────────────────────────
 
     @honeypot.group(name="imagescan")
     async def imagescan(self, ctx: commands.Context) -> None:
-        """Collect image shadow-review training data."""
+        """Configure image shadow reviews for training data."""
 
     @imagescan.command(name="toggle")
     async def imagescan_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Enable or disable image scan shadow reviews."""
+        """Enable or disable image shadow reviews."""
         if value is None:
             v = await self.config.guild(ctx.guild).imagescan_enabled()
             await ctx.send(
@@ -4205,7 +4128,7 @@ class Honeypot(Cog):
         ctx: commands.Context,
         channel: discord.TextChannel | discord.Thread = None,
     ) -> None:
-        """Set the image scan shadow review channel."""
+        """Set the channel for image shadow reviews."""
         if channel is None:
             channel_id = await self.config.guild(ctx.guild).imagescan_channel()
             current = self._get_text_channel_or_thread(ctx.guild, channel_id)
@@ -4216,7 +4139,7 @@ class Honeypot(Cog):
 
     @imagescan.command(name="status")
     async def imagescan_status(self, ctx: commands.Context) -> None:
-        """Show image scan status."""
+        """Show image shadow-review settings and counts."""
         config = await self.config.guild(ctx.guild).all()
         channel = self._get_text_channel_or_thread(ctx.guild, config.get("imagescan_channel"))
         counts = await self._imagescan_counts(ctx.guild.id)
@@ -4233,7 +4156,7 @@ class Honeypot(Cog):
 
     @debug_imagescan.command(name="dump")
     async def imagescan_dump(self, ctx: commands.Context) -> None:
-        """Export image scan events and copied files."""
+        """Export image shadow-review events and copied files."""
         temp_root: Path | None = None
         try:
             temp_root, archives = await self._imagescan_create_dump_archives(ctx.guild.id)
@@ -4251,11 +4174,11 @@ class Honeypot(Cog):
 
     @honeypot.group()
     async def firstpost(self, ctx: commands.Context) -> None:
-        """Detect suspicious first observed messages."""
+        """Configure first-message detection."""
 
     @firstpost.command(name="toggle")
     async def firstpost_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Enable or disable firstpost detection."""
+        """Enable or disable first-message enforcement."""
         if value is None:
             v = await self.config.guild(ctx.guild).firstpost_enabled()
             await ctx.send(
@@ -4270,9 +4193,9 @@ class Honeypot(Cog):
                 await self.config.guild(ctx.guild).firstpost_collect_enabled.set(False)
             await ctx.send(_("✅ Firstpost enabled set to {value}").format(value=value))
 
-    @firstpost.command(name="collect")
+    @firstpost.command(name="warmup")
     async def firstpost_collect(self, ctx: commands.Context, value: bool = None) -> None:
-        """Collect first observed senders without taking action."""
+        """Record first-message senders without taking action."""
         if value is None:
             v = await self.config.guild(ctx.guild).firstpost_collect_enabled()
             await ctx.send(
@@ -4285,11 +4208,11 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).firstpost_collect_enabled.set(value)
             if value:
                 await self.config.guild(ctx.guild).firstpost_enabled.set(False)
-            await ctx.send(_("✅ Firstpost collect set to {value}").format(value=value))
+            await ctx.send(_("✅ Firstpost warmup set to {value}").format(value=value))
 
     @firstpost.command(name="action")
     async def firstpost_action(self, ctx: commands.Context, value: str = None) -> None:
-        """Action for suspicious first observed messages."""
+        """Set the action for suspicious first messages."""
         if value is None:
             v = await self.config.guild(ctx.guild).firstpost_action()
             await ctx.send(
@@ -4304,28 +4227,15 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).firstpost_action.set(value)
             await ctx.send(_("✅ Firstpost action set to {value}").format(value=value))
 
-    @firstpost.command(name="status")
-    async def firstpost_status(self, ctx: commands.Context) -> None:
-        """Show firstpost status."""
-        config = await self.config.guild(ctx.guild).all()
-        seen_count = await self._count_firstpost_seen_authors(ctx.guild.id)
-        lines = [
-            f"Enabled: {self._format_bool_setting(config.get('firstpost_enabled', False))}",
-            f"Collect: {self._format_bool_setting(config.get('firstpost_collect_enabled', False))}",
-            f"Action: {config.get('firstpost_action', 'review')}",
-            f"Seen authors: {seen_count}",
-        ]
-        await ctx.send(_("**Firstpost status:**\n") + box("\n".join(lines)))
-
     # ─── review sub-group ─────────────────────────────────────────────
 
     @honeypot.group()
     async def review(self, ctx: commands.Context) -> None:
-        """Moderator review for non-obvious cases."""
+        """Configure moderator review for suspicious cases."""
 
     @review.command(name="toggle")
     async def review_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Send suspicious messages to moderator review instead of acting immediately."""
+        """Enable or disable moderator review routing."""
         if value is None:
             v = await self.config.guild(ctx.guild).review_enabled()
             await ctx.send(
@@ -4340,7 +4250,7 @@ class Honeypot(Cog):
 
     @review.command(name="channel")
     async def review_channel(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread = None) -> None:
-        """Channel for review requests."""
+        """Set the channel for moderator review requests."""
         if target is None:
             v = await self.config.guild(ctx.guild).review_channel()
             await ctx.send(_("Review channel: {channel}").format(channel=ctx.guild.get_channel(v) if v else _("not set")))
@@ -4353,7 +4263,7 @@ class Honeypot(Cog):
 
     @review.command()
     async def timeout(self, ctx: commands.Context, minutes: int = None) -> None:
-        """Minutes before review expires and mute is removed (1-10080)."""
+        """Set how long pending reviews stay active."""
         if minutes is None:
             v = await self.config.guild(ctx.guild).review_timeout_minutes()
             await ctx.send(_("Review timeout: {value} minutes").format(value=v))
@@ -4365,7 +4275,7 @@ class Honeypot(Cog):
 
     @review.command(name="kick_fail_warn")
     async def review_kick_fail_warn(self, ctx: commands.Context, value: str = None) -> None:
-        """How to handle a review kick when the target has already left: false, true, or manual."""
+        """Set how review kicks report users who already left."""
         if value is None:
             v = await self.config.guild(ctx.guild).review_kick_fail_warning()
             await ctx.send(
@@ -4384,13 +4294,13 @@ class Honeypot(Cog):
 
     # ─── roles sub-group (was whitelistedroles) ───────────────────────
 
-    @honeypot.group()
+    @honeypot_settings.group()
     async def roles(self, ctx: commands.Context) -> None:
-        """Manage whitelisted roles that bypass punishment."""
+        """Manage roles trusted by the main honeypot layer."""
 
     @roles.command(name="add")
     async def roles_add(self, ctx: commands.Context, role: discord.Role) -> None:
-        """Add a role to the whitelist."""
+        """Add a role to the honeypot whitelist."""
         async with self.config.guild(ctx.guild).whitelisted_roles() as roles:
             if role.id in roles:
                 raise commands.UserFeedbackCheckFailure(_("That role is already whitelisted."))
@@ -4399,7 +4309,7 @@ class Honeypot(Cog):
 
     @roles.command(name="remove")
     async def roles_remove(self, ctx: commands.Context, role: discord.Role) -> None:
-        """Remove a role from the whitelist."""
+        """Remove a role from the honeypot whitelist."""
         async with self.config.guild(ctx.guild).whitelisted_roles() as roles:
             if role.id not in roles:
                 raise commands.UserFeedbackCheckFailure(_("That role is not in the whitelist."))
@@ -4408,7 +4318,7 @@ class Honeypot(Cog):
 
     @roles.command(name="list")
     async def roles_list(self, ctx: commands.Context) -> None:
-        """List whitelisted roles."""
+        """List roles on the honeypot whitelist."""
         role_ids = await self.config.guild(ctx.guild).whitelisted_roles()
         if not role_ids:
             await ctx.send(_("No whitelisted roles."))
@@ -4421,13 +4331,13 @@ class Honeypot(Cog):
 
     # ─── keywords sub-group (was scamkeywords) ────────────────────────
 
-    @honeypot.group()
+    @honeypot_settings.group()
     async def keywords(self, ctx: commands.Context) -> None:
-        """Manage scam keywords for suspicious-message detection."""
+        """Manage text and attachment patterns used by honeypot detection."""
 
     @keywords.command(name="add")
     async def keywords_add(self, ctx: commands.Context, *, keyword: str) -> None:
-        """Add a scam keyword."""
+        """Add a honeypot keyword."""
         keyword = keyword.strip().lower()
         if not keyword:
             raise commands.UserFeedbackCheckFailure(_("Keyword cannot be empty."))
@@ -4439,7 +4349,7 @@ class Honeypot(Cog):
 
     @keywords.command(name="remove")
     async def keywords_remove(self, ctx: commands.Context, *, keyword: str) -> None:
-        """Remove a scam keyword."""
+        """Remove a honeypot keyword."""
         keyword = keyword.strip().lower()
         async with self.config.guild(ctx.guild).scam_keywords() as keywords:
             for existing in list(keywords):
@@ -4451,7 +4361,7 @@ class Honeypot(Cog):
 
     @keywords.command(name="list")
     async def keywords_list(self, ctx: commands.Context) -> None:
-        """List scam keywords."""
+        """List configured honeypot keywords."""
         keywords = await self.config.guild(ctx.guild).scam_keywords()
         if not keywords:
             await ctx.send(_("No keywords configured."))
@@ -4460,17 +4370,17 @@ class Honeypot(Cog):
 
     @keywords.command(name="reset")
     async def keywords_reset(self, ctx: commands.Context) -> None:
-        """Reset keywords to defaults."""
+        """Reset honeypot keywords to defaults."""
         await self.config.guild(ctx.guild).scam_keywords.set(SCAM_KEYWORDS.copy())
         await ctx.send(_("✅ Keywords reset to defaults."))
 
     @keywords.group(name="attachments")
     async def keyword_attachments(self, ctx: commands.Context) -> None:
-        """Manage suspicious attachment filename regexes."""
+        """Manage attachment filename patterns used by honeypot detection."""
 
     @keyword_attachments.command(name="add")
     async def keyword_attachments_add(self, ctx: commands.Context, *, pattern: str) -> None:
-        """Add an attachment filename-base regex. It triggers when 2+ files match."""
+        """Add an attachment filename pattern."""
         try:
             re.compile(pattern)
         except re.error as exc:
@@ -4483,7 +4393,7 @@ class Honeypot(Cog):
 
     @keyword_attachments.command(name="remove")
     async def keyword_attachments_remove(self, ctx: commands.Context, *, pattern: str) -> None:
-        """Remove an attachment filename-base regex."""
+        """Remove an attachment filename pattern."""
         async with self.config.guild(ctx.guild).attachment_patterns() as patterns:
             if pattern not in patterns:
                 raise commands.UserFeedbackCheckFailure(_("Pattern not found."))
@@ -4492,7 +4402,7 @@ class Honeypot(Cog):
 
     @keyword_attachments.command(name="list")
     async def keyword_attachments_list(self, ctx: commands.Context) -> None:
-        """List attachment filename-base regexes."""
+        """List configured attachment filename patterns."""
         patterns = await self.config.guild(ctx.guild).attachment_patterns()
         if not patterns:
             await ctx.send(_("No attachment patterns configured."))
@@ -4501,7 +4411,7 @@ class Honeypot(Cog):
 
     @keyword_attachments.command(name="reset")
     async def keyword_attachments_reset(self, ctx: commands.Context) -> None:
-        """Reset attachment filename-base regexes to defaults."""
+        """Reset attachment filename patterns to defaults."""
         await self.config.guild(ctx.guild).attachment_patterns.set(DEFAULT_ATTACHMENT_PATTERNS.copy())
         await ctx.send(_("✅ Attachment patterns reset to defaults."))
 
@@ -4509,11 +4419,11 @@ class Honeypot(Cog):
 
     @honeypot.group()
     async def joinwatch(self, ctx: commands.Context) -> None:
-        """Alert when accounts younger than N hours join."""
+        """Configure young-account join monitoring."""
 
     @joinwatch.command(name="toggle")
     async def joinwatch_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Enable or disable new account join alerts."""
+        """Enable or disable young-account join monitoring."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_enabled()
             await ctx.send(
@@ -4528,7 +4438,7 @@ class Honeypot(Cog):
 
     @joinwatch.command()
     async def channel(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread = None) -> None:
-        """Channel for new account join alerts."""
+        """Set the channel for young-account join alerts."""
         if target is None:
             v = await self.config.guild(ctx.guild).joinwatch_channel()
             await ctx.send(_("Joinwatch channel: {channel}").format(channel=ctx.guild.get_channel(v) if v else _("not set")))
@@ -4541,7 +4451,7 @@ class Honeypot(Cog):
 
     @joinwatch.group(name="alert")
     async def joinwatch_alert(self, ctx: commands.Context) -> None:
-        """Configure joinwatch alert messages."""
+        """Configure joinwatch alert delivery."""
 
     @joinwatch_alert.command(name="toggle")
     async def joinwatch_alert_toggle(self, ctx: commands.Context, value: bool = None) -> None:
@@ -4560,7 +4470,7 @@ class Honeypot(Cog):
 
     @joinwatch.command(name="max_age")
     async def max_age(self, ctx: commands.Context, hours: int = None) -> None:
-        """Max account age in hours to trigger alert (default 24)."""
+        """Set the maximum account age for joinwatch alerts."""
         if hours is None:
             v = await self.config.guild(ctx.guild).joinwatch_min_age_hours()
             await ctx.send(_("Joinwatch max age: {value} hours").format(value=v))
@@ -4572,11 +4482,11 @@ class Honeypot(Cog):
 
     @joinwatch.group(name="autorole")
     async def joinwatch_autorole(self, ctx: commands.Context) -> None:
-        """Automatically role young accounts and punish if the role remains."""
+        """Configure temporary roles for young accounts."""
 
     @joinwatch_autorole.command(name="toggle")
     async def joinwatch_autorole_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Enable or disable joinwatch auto-role."""
+        """Enable or disable joinwatch auto-role handling."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_enabled()
             await ctx.send(
@@ -4591,7 +4501,7 @@ class Honeypot(Cog):
 
     @joinwatch_autorole.command(name="role")
     async def joinwatch_autorole_role(self, ctx: commands.Context, role: discord.Role = None) -> None:
-        """Role to apply to young accounts."""
+        """Set the temporary role for young accounts."""
         if role is None:
             role_id = await self.config.guild(ctx.guild).joinwatch_auto_role_id()
             configured_role = ctx.guild.get_role(role_id) if role_id else None
@@ -4609,7 +4519,7 @@ class Honeypot(Cog):
 
     @joinwatch_autorole.command(name="timer")
     async def joinwatch_autorole_timer(self, ctx: commands.Context, minutes: int = None) -> None:
-        """Minutes before punishment if the auto-role is still present."""
+        """Set how long the temporary role may remain."""
         if minutes is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_timer_minutes()
             await ctx.send(_("Joinwatch auto-role timer: {value} minutes").format(value=v))
@@ -4628,7 +4538,7 @@ class Honeypot(Cog):
 
     @joinwatch_autorole.command(name="action")
     async def joinwatch_autorole_action(self, ctx: commands.Context, value: str = None) -> None:
-        """Action when the auto-role is not removed before the timer: none, kick, or ban."""
+        """Set the action when the temporary role is not removed in time."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_action()
             await ctx.send(
@@ -4645,7 +4555,7 @@ class Honeypot(Cog):
 
     @joinwatch_autorole.command(name="bantimers")
     async def joinwatch_autorole_bantimers(self, ctx: commands.Context) -> None:
-        """List active joinwatch auto-role punishment timers."""
+        """List active joinwatch auto-role timers."""
         config = await self.config.guild(ctx.guild).all()
         pending_roles = config.get("joinwatch_pending_roles", {})
         if not pending_roles:
@@ -4715,13 +4625,13 @@ class Honeypot(Cog):
 
     @joinwatch_autorole.group(name="randomize")
     async def joinwatch_autorole_randomize(self, ctx: commands.Context) -> None:
-        """Randomize when the joinwatch auto-role is applied."""
+        """Configure randomized auto-role delay."""
 
     @joinwatch_autorole_randomize.command(name="toggle")
     async def joinwatch_autorole_randomize_toggle(
         self, ctx: commands.Context, value: bool = None
     ) -> None:
-        """Enable or disable randomized delay before applying the auto-role."""
+        """Enable or disable randomized auto-role delay."""
         if value is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_enabled()
             await ctx.send(
@@ -4738,7 +4648,7 @@ class Honeypot(Cog):
     async def joinwatch_autorole_randomize_min_time(
         self, ctx: commands.Context, minutes: int = None
     ) -> None:
-        """Minimum minutes before applying the auto-role."""
+        """Set the minimum randomized auto-role delay."""
         if minutes is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_min_minutes()
             await ctx.send(_("Joinwatch auto-role randomized minimum: {value} minutes").format(value=v))
@@ -4765,7 +4675,7 @@ class Honeypot(Cog):
     async def joinwatch_autorole_randomize_max_time(
         self, ctx: commands.Context, minutes: int = None
     ) -> None:
-        """Maximum minutes before applying the auto-role."""
+        """Set the maximum randomized auto-role delay."""
         if minutes is None:
             v = await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_max_minutes()
             await ctx.send(_("Joinwatch auto-role randomized maximum: {value} minutes").format(value=v))
@@ -4783,15 +4693,15 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).joinwatch_auto_role_random_delay_max_minutes.set(minutes)
             await ctx.send(_("✅ Joinwatch randomized delay maximum set to {value} minutes").format(value=minutes))
 
-    # ─── bait sub-group ───────────────────────────────────────────────
+    # ─── bait role sub-group ──────────────────────────────────────────
 
-    @honeypot.group()
-    async def bait(self, ctx: commands.Context) -> None:
-        """Trap role: automatically punish users who take a specific role."""
+    @honeypot.group(name="bait_role")
+    async def bait_role(self, ctx: commands.Context) -> None:
+        """Configure the bait role trap."""
 
-    @bait.command(name="toggle")
+    @bait_role.command(name="toggle")
     async def bait_toggle(self, ctx: commands.Context, value: bool = None) -> None:
-        """Enable or disable the bait role trap."""
+        """Enable or disable bait role enforcement."""
         if value is None:
             v = await self.config.guild(ctx.guild).baitrole_enabled()
             await ctx.send(
@@ -4804,9 +4714,9 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).baitrole_enabled.set(value)
             await ctx.send(_("✅ Bait role trap set to {value}").format(value=value))
 
-    @bait.command()
+    @bait_role.command()
     async def role(self, ctx: commands.Context, role: discord.Role = None) -> None:
-        """Set the bait role - users who take it get punished."""
+        """Set the role that triggers bait role enforcement."""
         if role is None:
             v = await self.config.guild(ctx.guild).baitrole_id()
             r = ctx.guild.get_role(v) if v else None
@@ -4815,9 +4725,9 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).baitrole_id.set(role.id)
             await ctx.send(_("✅ Bait role set to {role.mention}").format(role=role))
 
-    @bait.command(name="action")
+    @bait_role.command(name="action")
     async def bait_action(self, ctx: commands.Context, value: str = None) -> None:
-        """Action to take: kick or ban."""
+        """Set the action for bait role enforcement."""
         if value is None:
             v = await self.config.guild(ctx.guild).baitrole_action()
             await ctx.send(
@@ -4836,11 +4746,11 @@ class Honeypot(Cog):
 
     @honeypot.group(name="config")
     async def config_dump(self, ctx: commands.Context) -> None:
-        """Show current Honeypot configuration by section."""
+        """Show current honeypot configuration by section."""
 
     @config_dump.command(name="honeypot")
     async def config_honeypot(self, ctx: commands.Context) -> None:
-        """Show honeypot detection configuration."""
+        """Show main honeypot detection settings."""
         config = await self.config.guild(ctx.guild).all()
         await self._send_config_dump(
             ctx,
@@ -4857,7 +4767,7 @@ class Honeypot(Cog):
 
     @config_dump.command(name="channel")
     async def config_channel(self, ctx: commands.Context) -> None:
-        """Show channel configuration."""
+        """Show honeypot and log channel settings."""
         config = await self.config.guild(ctx.guild).all()
         await self._send_config_dump(
             ctx,
@@ -4865,26 +4775,24 @@ class Honeypot(Cog):
             [
                 (_("Honeypot channels"), self._format_honeypot_channel_list(ctx.guild, self._honeypot_channel_ids_from_config(config))),
                 (_("Logs channel"), self._format_channel_setting(ctx.guild, config.get("logs_channel"))),
-                (_("Ping role"), self._format_role_setting(ctx.guild, config.get("ping_role"))),
             ],
         )
 
     @config_dump.command(name="punishment")
     async def config_punishment(self, ctx: commands.Context) -> None:
-        """Show punishment configuration."""
+        """Show review punishment settings."""
         config = await self.config.guild(ctx.guild).all()
         await self._send_config_dump(
             ctx,
             _("Punishment config"),
             [
                 (_("Mute role"), self._format_role_setting(ctx.guild, config.get("mute_role"))),
-                (_("Ban delete message days"), config.get("ban_delete_message_days")),
             ],
         )
 
     @config_dump.command(name="purge")
     async def config_purge(self, ctx: commands.Context) -> None:
-        """Show purge configuration."""
+        """Show message purge behavior."""
         await self._send_config_dump(
             ctx,
             _("Purge config"),
@@ -4896,21 +4804,37 @@ class Honeypot(Cog):
 
     @config_dump.command(name="firstpost")
     async def config_firstpost(self, ctx: commands.Context) -> None:
-        """Show firstpost configuration."""
+        """Show first-message detection settings."""
         config = await self.config.guild(ctx.guild).all()
+        seen_count = await self._count_firstpost_seen_authors(ctx.guild.id)
         await self._send_config_dump(
             ctx,
             _("Firstpost config"),
             [
                 (_("Enabled"), self._format_bool_setting(config.get("firstpost_enabled", False))),
-                (_("Collect"), self._format_bool_setting(config.get("firstpost_collect_enabled", False))),
+                (_("Warmup"), self._format_bool_setting(config.get("firstpost_collect_enabled", False))),
                 (_("Action"), config.get("firstpost_action", "review")),
+                (_("Seen authors"), seen_count),
+            ],
+        )
+
+    @config_dump.command(name="imagescan")
+    async def config_imagescan(self, ctx: commands.Context) -> None:
+        """Show image shadow-review settings."""
+        config = await self.config.guild(ctx.guild).all()
+        channel = self._get_text_channel_or_thread(ctx.guild, config.get("imagescan_channel"))
+        await self._send_config_dump(
+            ctx,
+            _("Image scan config"),
+            [
+                (_("Enabled"), self._format_bool_setting(config.get("imagescan_enabled", False))),
+                (_("Channel"), channel.mention if channel else _("not set")),
             ],
         )
 
     @config_dump.command(name="spam")
     async def config_spam(self, ctx: commands.Context) -> None:
-        """Show spam detection configuration."""
+        """Show duplicate-message spam settings."""
         config = await self.config.guild(ctx.guild).all()
         await self._send_config_dump(
             ctx,
@@ -4925,7 +4849,7 @@ class Honeypot(Cog):
 
     @config_dump.command(name="review")
     async def config_review(self, ctx: commands.Context) -> None:
-        """Show review configuration."""
+        """Show moderator review settings."""
         config = await self.config.guild(ctx.guild).all()
         await self._send_config_dump(
             ctx,
@@ -4941,7 +4865,7 @@ class Honeypot(Cog):
 
     @config_dump.command(name="roles")
     async def config_roles(self, ctx: commands.Context) -> None:
-        """Show whitelisted role configuration."""
+        """Show honeypot whitelist role settings."""
         config = await self.config.guild(ctx.guild).all()
         role_ids = config.get("whitelisted_roles", [])
         roles = [self._format_role_setting(ctx.guild, role_id) for role_id in role_ids]
@@ -4956,7 +4880,7 @@ class Honeypot(Cog):
 
     @config_dump.command(name="keywords")
     async def config_keywords(self, ctx: commands.Context) -> None:
-        """Show keyword configuration counts."""
+        """Show honeypot keyword and attachment pattern counts."""
         config = await self.config.guild(ctx.guild).all()
         keywords = config.get("scam_keywords") or []
         attachment_patterns = config.get("attachment_patterns") or []
@@ -4971,7 +4895,7 @@ class Honeypot(Cog):
 
     @config_dump.command(name="joinwatch")
     async def config_joinwatch(self, ctx: commands.Context) -> None:
-        """Show joinwatch configuration."""
+        """Show joinwatch settings."""
         config = await self.config.guild(ctx.guild).all()
         lines = [
             _("Joinwatch:"),
@@ -4992,9 +4916,9 @@ class Honeypot(Cog):
         ]
         await ctx.send(_("Joinwatch config:\n") + box("\n".join(lines)))
 
-    @config_dump.command(name="bait")
+    @config_dump.command(name="bait_role")
     async def config_bait(self, ctx: commands.Context) -> None:
-        """Show bait role configuration."""
+        """Show bait role trap settings."""
         config = await self.config.guild(ctx.guild).all()
         await self._send_config_dump(
             ctx,
@@ -5008,7 +4932,7 @@ class Honeypot(Cog):
 
     @config_dump.command(name="stats")
     async def config_stats(self, ctx: commands.Context) -> None:
-        """Show stored stats and pending review/timer counts."""
+        """Show stored stat and pending timer counts."""
         config = await self.config.guild(ctx.guild).all()
         stats = DEFAULT_STATS.copy()
         stats.update(config.get("stats", {}))
@@ -5025,7 +4949,7 @@ class Honeypot(Cog):
 
     @config_dump.command(name="all")
     async def config_all(self, ctx: commands.Context) -> None:
-        """Show a compact summary of all configuration sections."""
+        """Show a compact summary of all honeypot settings."""
         config = await self.config.guild(ctx.guild).all()
         await self._send_config_dump(
             ctx,
@@ -5036,6 +4960,7 @@ class Honeypot(Cog):
                 (_("Logs channel"), self._format_channel_setting(ctx.guild, config.get("logs_channel"))),
                 (_("Review"), self._format_bool_setting(config.get("review_enabled", False))),
                 (_("Spam"), self._format_bool_setting(config.get("spam_enabled", False))),
+                (_("Image scan"), self._format_bool_setting(config.get("imagescan_enabled", False))),
                 (_("Joinwatch"), self._format_bool_setting(config.get("joinwatch_enabled", False))),
                 (_("Joinwatch auto-role"), self._format_bool_setting(config.get("joinwatch_auto_role_enabled", False))),
                 (_("Bait role"), self._format_bool_setting(config.get("baitrole_enabled", False))),
@@ -5049,7 +4974,7 @@ class Honeypot(Cog):
 
     @honeypot.command(name="modstats")
     async def honeypot_mod_stats(self, ctx: commands.Context) -> None:
-        """Show detailed honeypot statistics for moderators."""
+        """Show detailed moderation statistics."""
         stats = DEFAULT_STATS.copy()
         stats.update(await self.config.guild(ctx.guild).stats())
         pending_reviews = await self.config.guild(ctx.guild).pending_reviews()
@@ -5119,7 +5044,7 @@ class Honeypot(Cog):
 
     @honeypot.command(name="stats")
     async def honeypot_stats(self, ctx: commands.Context) -> None:
-        """Show public-facing honeypot statistics."""
+        """Show public server safety statistics."""
         stats = DEFAULT_STATS.copy()
         stats.update(await self.config.guild(ctx.guild).stats())
         lines = [
@@ -5133,15 +5058,16 @@ class Honeypot(Cog):
         ]
         await ctx.send(_("**Server safety stats:**\n") + box("\n".join(lines)))
 
-    @honeypot.command(name="resetstats")
+    @debug.command(name="resetstats")
+    @commands.permissions_check(lambda ctx: ctx.author.id == ctx.guild.owner_id or ctx.author.id in ctx.bot.owner_ids)
     async def honeypot_reset_stats(self, ctx: commands.Context) -> None:
-        """Reset statistics."""
+        """Reset stored honeypot statistics."""
         await self.config.guild(ctx.guild).stats.set(DEFAULT_STATS.copy())
         await ctx.send(_("✅ Stats reset."))
 
     @honeypot.command(name="doctor")
     async def honeypot_doctor(self, ctx: commands.Context) -> None:
-        """Check configuration and permissions."""
+        """Check honeypot configuration and required permissions."""
         config = await self.config.guild(ctx.guild).all()
         checks: list[tuple[str, bool, str]] = []
         me = ctx.guild.me
