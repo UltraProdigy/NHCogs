@@ -77,9 +77,11 @@ DEFAULT_STATS = {
 JOINWATCH_RETRY_DELAY_MINUTES = 5
 JOINWATCH_MAX_RETRIES = 5
 POST_BAN_SWEEP_DELAY_SECONDS = 5
-MESSAGE_CACHE_RETENTION_SECONDS = 120
-FORWARD_PURGE_SECONDS = 60
-RECENT_USER_MESSAGES_PER_USER_LIMIT = 25
+PURGE_MIN_RETENTION_SECONDS = 60
+PURGE_BACKWARD_DEFAULT_SECONDS = 60
+PURGE_BACKWARD_MAX_SECONDS = 3600
+PURGE_FORWARD_DEFAULT_SECONDS = 10
+PURGE_FORWARD_MAX_SECONDS = 300
 SPAM_WINDOW_MIN_SECONDS = 3
 SPAM_WINDOW_MAX_SECONDS = 60
 SPAM_CHANNEL_MIN = 2
@@ -419,15 +421,15 @@ class ReviewView(discord.ui.View):
             if action == "kick":
                 if member is None:
                     return (_("User is no longer in the server."), None)
-                self.cog._activate_forward_purge(guild.id, self.target_id)
+                self.cog._activate_forward_purge(guild.id, self.target_id, config)
                 await member.kick(reason=reason)
                 await self._create_modlog_case(guild, member, action, reason, interaction.user)
                 await self.cog._increment_stat(guild, "kicked")
-                await self.cog._purge_after_review_action(guild, self.target_id)
+                await self.cog._purge_after_review_action(guild, self.target_id, config)
                 return (None, _("Kicked"))
             elif action == "ban":
                 target = member if member is not None else await self.cog._get_user_or_object(self.target_id)
-                self.cog._activate_forward_purge(guild.id, target.id)
+                self.cog._activate_forward_purge(guild.id, target.id, config)
                 await guild.ban(
                     target,
                     reason=reason,
@@ -436,7 +438,7 @@ class ReviewView(discord.ui.View):
                 self.cog._schedule_post_ban_sweep(guild, target.id)
                 await self._create_modlog_case(guild, target, action, reason, interaction.user)
                 await self.cog._increment_stat(guild, "banned")
-                await self.cog._purge_after_review_action(guild, target.id)
+                await self.cog._purge_after_review_action(guild, target.id, config)
                 return (None, _("Banned"))
         except discord.HTTPException:
             self.cog._deactivate_forward_purge(guild.id, self.target_id)
@@ -619,6 +621,8 @@ class Honeypot(Cog):
             honeypot_channel=None,
             honeypot_channels=[],
             mute_role=None,
+            purge_backward_seconds=PURGE_BACKWARD_DEFAULT_SECONDS,
+            purge_forward_seconds=PURGE_FORWARD_DEFAULT_SECONDS,
             whitelisted_roles=[],
             firstpost_collect_enabled=False,
             firstpost_enabled=False,
@@ -1429,7 +1433,8 @@ class Honeypot(Cog):
 
     @tasks.loop(minutes=1)
     async def purge_cache_cleanup_loop(self) -> None:
-        self._prune_purge_cache()
+        configs = {int(guild_id): config for guild_id, config in (await self.config.all_guilds()).items()}
+        self._prune_purge_cache(configs)
 
     @tasks.loop(minutes=5)
     async def review_timeout_loop(self) -> None:
@@ -1608,7 +1613,7 @@ class Honeypot(Cog):
             reasons.append(_("Matched attachment rules: {patterns}").format(patterns=", ".join(matched_patterns[:3])))
         return reasons
 
-    def _record_recent_user_message(self, message: discord.Message) -> None:
+    def _record_recent_user_message(self, message: discord.Message, config: dict) -> None:
         if message.guild is None:
             return
         refs = self._recent_user_messages[message.guild.id][message.author.id]
@@ -1620,25 +1625,50 @@ class Honeypot(Cog):
                 message_spam_fingerprint(message),
             )
         )
-        self._prune_recent_user_messages(message.guild.id, message.author.id)
+        self._prune_recent_user_messages(
+            message.guild.id,
+            message.author.id,
+            retention_seconds=self._purge_retention_seconds(config),
+        )
 
-    def _prune_recent_user_messages(self, guild_id: int, user_id: int) -> None:
+    @staticmethod
+    def _purge_backward_seconds(config: dict) -> int:
+        value = int(config.get("purge_backward_seconds", PURGE_BACKWARD_DEFAULT_SECONDS) or 0)
+        return max(PURGE_MIN_RETENTION_SECONDS, min(value, PURGE_BACKWARD_MAX_SECONDS))
+
+    @staticmethod
+    def _purge_forward_seconds(config: dict) -> int:
+        value = int(config.get("purge_forward_seconds", PURGE_FORWARD_DEFAULT_SECONDS) or 0)
+        return max(0, min(value, PURGE_FORWARD_MAX_SECONDS))
+
+    @staticmethod
+    def _purge_retention_seconds(config: dict | None = None) -> int:
+        if config is None:
+            return PURGE_MIN_RETENTION_SECONDS
+        return max(PURGE_MIN_RETENTION_SECONDS, Honeypot._purge_backward_seconds(config))
+
+    def _prune_recent_user_messages(
+        self, guild_id: int, user_id: int, *, retention_seconds: int = PURGE_MIN_RETENTION_SECONDS
+    ) -> None:
         refs = self._recent_user_messages.get(guild_id, {}).get(user_id)
         if not refs:
             return
-        cutoff = datetime.now(timezone.utc) - timedelta(seconds=MESSAGE_CACHE_RETENTION_SECONDS)
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=retention_seconds)
         while refs and refs[0].created_at < cutoff:
-            refs.popleft()
-        while len(refs) > RECENT_USER_MESSAGES_PER_USER_LIMIT:
             refs.popleft()
         if not refs:
             self._recent_user_messages[guild_id].pop(user_id, None)
 
-    def _prune_purge_cache(self) -> None:
+    def _prune_purge_cache(self, configs_by_guild_id: dict[int, dict] | None = None) -> None:
         now = datetime.now(timezone.utc)
         for guild_id, users in list(self._recent_user_messages.items()):
+            retention_seconds = self._purge_retention_seconds(
+                (configs_by_guild_id or {}).get(guild_id)
+            )
             for user_id in list(users):
-                self._prune_recent_user_messages(guild_id, user_id)
+                self._prune_recent_user_messages(
+                    guild_id, user_id, retention_seconds=retention_seconds
+                )
             if not users:
                 self._recent_user_messages.pop(guild_id, None)
         for guild_id, users in list(self._hot_purge_users.items()):
@@ -1648,9 +1678,15 @@ class Honeypot(Cog):
             if not users:
                 self._hot_purge_users.pop(guild_id, None)
 
-    def _activate_forward_purge(self, guild_id: int, user_id: int) -> None:
+    def _activate_forward_purge(
+        self, guild_id: int, user_id: int, config: dict
+    ) -> None:
+        forward_seconds = self._purge_forward_seconds(config)
+        if forward_seconds <= 0:
+            self._deactivate_forward_purge(guild_id, user_id)
+            return
         self._hot_purge_users[guild_id][user_id] = datetime.now(timezone.utc) + timedelta(
-            seconds=FORWARD_PURGE_SECONDS
+            seconds=forward_seconds
         )
 
     def _deactivate_forward_purge(self, guild_id: int, user_id: int) -> None:
@@ -1702,8 +1738,11 @@ class Honeypot(Cog):
         user_id: int,
         *,
         exclude_message_id: int | None = None,
+        retention_seconds: int = PURGE_MIN_RETENTION_SECONDS,
     ) -> int:
-        self._prune_recent_user_messages(guild.id, user_id)
+        self._prune_recent_user_messages(
+            guild.id, user_id, retention_seconds=retention_seconds
+        )
         refs = list(self._recent_user_messages.get(guild.id, {}).get(user_id, ()))
         total = 0
         for ref in refs:
@@ -1714,16 +1753,25 @@ class Honeypot(Cog):
         return total
 
     async def _cached_purge_user_messages(
-        self, guild: discord.Guild, user_id: int, *, exclude_message_id: int | None = None
+        self,
+        guild: discord.Guild,
+        user_id: int,
+        config: dict,
+        *,
+        exclude_message_id: int | None = None,
     ) -> int:
+        retention_seconds = self._purge_retention_seconds(config)
         deleted = await self._delete_recent_cached_user_messages(
-            guild, user_id, exclude_message_id=exclude_message_id
+            guild,
+            user_id,
+            exclude_message_id=exclude_message_id,
+            retention_seconds=retention_seconds,
         )
-        self._activate_forward_purge(guild.id, user_id)
+        self._activate_forward_purge(guild.id, user_id, config)
         return deleted
 
-    async def _purge_after_review_action(self, guild: discord.Guild, user_id: int) -> None:
-        deleted = await self._cached_purge_user_messages(guild, user_id)
+    async def _purge_after_review_action(self, guild: discord.Guild, user_id: int, config: dict) -> None:
+        deleted = await self._cached_purge_user_messages(guild, user_id, config)
         if deleted:
             await self._increment_stat(guild, "purged_messages", deleted)
             await self._increment_stat(guild, "cached_purge_deletes", deleted)
@@ -1778,11 +1826,12 @@ class Honeypot(Cog):
             return False
 
     async def _finish_firstpost_response(
-        self, message: discord.Message, *, message_deleted: bool
+        self, message: discord.Message, config: dict, *, message_deleted: bool
     ) -> None:
         purged = await self._cached_purge_user_messages(
             message.guild,
             message.author.id,
+            config,
             exclude_message_id=message.id if message_deleted else None,
         )
         if purged:
@@ -1826,11 +1875,12 @@ class Honeypot(Cog):
             return False
 
     async def _finish_spam_response(
-        self, message: discord.Message, *, message_deleted: bool
+        self, message: discord.Message, config: dict, *, message_deleted: bool
     ) -> None:
         purged = await self._cached_purge_user_messages(
             message.guild,
             message.author.id,
+            config,
             exclude_message_id=message.id if message_deleted else None,
         )
         if purged:
@@ -1907,7 +1957,7 @@ class Honeypot(Cog):
                 )
                 await self._send_log(logs_channel, embed, attachment_snapshots)
             message_deleted = await self._delete_spam_current_message(message)
-            await self._finish_spam_response(message, message_deleted=message_deleted)
+            await self._finish_spam_response(message, config, message_deleted=message_deleted)
             return True
 
         action_label, failed = await self._execute_action(
@@ -1928,7 +1978,7 @@ class Honeypot(Cog):
                 await self._increment_stat(message.guild, "spam_bans")
         await self._send_log(logs_channel, embed, attachment_snapshots)
         message_deleted = await self._delete_spam_current_message(message)
-        await self._finish_spam_response(message, message_deleted=message_deleted)
+        await self._finish_spam_response(message, config, message_deleted=message_deleted)
         return True
 
     async def _handle_firstpost_message(
@@ -2007,7 +2057,7 @@ class Honeypot(Cog):
                 )
                 await self._send_log(logs_channel, embed, attachment_snapshots)
             message_deleted = await self._delete_firstpost_current_message(message)
-            await self._finish_firstpost_response(message, message_deleted=message_deleted)
+            await self._finish_firstpost_response(message, config, message_deleted=message_deleted)
             return True
 
         action_label, failed = await self._execute_action(
@@ -2028,7 +2078,7 @@ class Honeypot(Cog):
                 await self._increment_stat(message.guild, "firstpost_bans")
         await self._send_log(logs_channel, embed, attachment_snapshots)
         message_deleted = await self._delete_firstpost_current_message(message)
-        await self._finish_firstpost_response(message, message_deleted=message_deleted)
+        await self._finish_firstpost_response(message, config, message_deleted=message_deleted)
         return True
 
     def _schedule_post_ban_sweep(self, guild: discord.Guild, user_id: int) -> None:
@@ -2048,7 +2098,8 @@ class Honeypot(Cog):
             guild = self.bot.get_guild(guild_id)
             if guild is None:
                 return
-            deleted = await self._cached_purge_user_messages(guild, user_id)
+            config = await self.config.guild(guild).all()
+            deleted = await self._cached_purge_user_messages(guild, user_id, config)
             if deleted:
                 await self._increment_stat(guild, "purged_messages", deleted)
                 await self._increment_stat(guild, "cached_purge_deletes", deleted)
@@ -2077,7 +2128,7 @@ class Honeypot(Cog):
             return (None, missing_permission)
         try:
             if action == "kick":
-                self._activate_forward_purge(message.guild.id, message.author.id)
+                self._activate_forward_purge(message.guild.id, message.author.id, config)
                 try:
                     await message.author.kick(reason=reason)
                 except discord.NotFound:
@@ -2087,7 +2138,7 @@ class Honeypot(Cog):
                     raise
                 await self._increment_stat(message.guild, "kicked")
             elif action == "ban":
-                self._activate_forward_purge(message.guild.id, message.author.id)
+                self._activate_forward_purge(message.guild.id, message.author.id, config)
                 await message.author.ban(
                     reason=reason,
                     delete_message_seconds=self._ban_delete_message_seconds(config),
@@ -2391,7 +2442,7 @@ class Honeypot(Cog):
         if await self._is_protected_member(message.author):
             return
         await self._handle_imagescan_message(message, config)
-        self._record_recent_user_message(message)
+        self._record_recent_user_message(message, config)
         if self._is_forward_purge_active(message.guild.id, message.author.id):
             if await self._delete_forward_purge_message(message):
                 await self._increment_stat(message.guild, "purged_messages")
@@ -2457,10 +2508,11 @@ class Honeypot(Cog):
                 inline=True,
             )
 
-        # Cached purge is fixed-retention safety; it does not override ban delete days.
+        # Cached purge uses the configured event-retention window.
         purged = await self._cached_purge_user_messages(
             message.guild,
             message.author.id,
+            config,
             exclude_message_id=message.id if message_deleted else None,
         )
         if purged:
@@ -4025,6 +4077,53 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).mute_role.set(role.id)
             await ctx.send(_("✅ Mute role set to {role.mention}").format(role=role))
 
+    # ─── purge sub-group ───────────────────────────────────────────────
+
+    @honeypot.group(name="purge")
+    async def purge(self, ctx: commands.Context) -> None:
+        """Configure event-registry message purge windows."""
+
+    @purge.command(name="backward")
+    async def purge_backward(self, ctx: commands.Context, seconds: int = None) -> None:
+        """Set how far back cached message purge can delete."""
+        if seconds is None:
+            config = await self.config.guild(ctx.guild).all()
+            await ctx.send(
+                _("Backward purge window: {seconds}s").format(
+                    seconds=self._purge_backward_seconds(config),
+                )
+            )
+        elif seconds < PURGE_MIN_RETENTION_SECONDS or seconds > PURGE_BACKWARD_MAX_SECONDS:
+            await ctx.send(
+                _("Backward purge must be between {minimum} and {maximum} seconds.").format(
+                    minimum=PURGE_MIN_RETENTION_SECONDS,
+                    maximum=PURGE_BACKWARD_MAX_SECONDS,
+                )
+            )
+        else:
+            await self.config.guild(ctx.guild).purge_backward_seconds.set(seconds)
+            await ctx.send(_("✅ Backward purge window set to {seconds}s").format(seconds=seconds))
+
+    @purge.command(name="forward")
+    async def purge_forward(self, ctx: commands.Context, seconds: int = None) -> None:
+        """Set how long future messages are purged after a trigger."""
+        if seconds is None:
+            config = await self.config.guild(ctx.guild).all()
+            await ctx.send(
+                _("Forward purge window: {seconds}s").format(
+                    seconds=self._purge_forward_seconds(config),
+                )
+            )
+        elif seconds < 0 or seconds > PURGE_FORWARD_MAX_SECONDS:
+            await ctx.send(
+                _("Forward purge must be between 0 and {maximum} seconds.").format(
+                    maximum=PURGE_FORWARD_MAX_SECONDS,
+                )
+            )
+        else:
+            await self.config.guild(ctx.guild).purge_forward_seconds.set(seconds)
+            await ctx.send(_("✅ Forward purge window set to {seconds}s").format(seconds=seconds))
+
     # ─── spam sub-group ────────────────────────────────────────────────
 
     @honeypot.group()
@@ -4793,12 +4892,15 @@ class Honeypot(Cog):
     @config_dump.command(name="purge")
     async def config_purge(self, ctx: commands.Context) -> None:
         """Show message purge behavior."""
+        config = await self.config.guild(ctx.guild).all()
         await self._send_config_dump(
             ctx,
             _("Purge config"),
             [
-                (_("Mode"), _("Cached + forward purge (always on)")),
-                (_("Retention"), _("2 minutes (fixed)")),
+                (_("Mode"), _("Event registry purge")),
+                (_("Backward window"), _("{seconds}s").format(seconds=self._purge_backward_seconds(config))),
+                (_("Forward window"), _("{seconds}s").format(seconds=self._purge_forward_seconds(config))),
+                (_("Minimum retention"), _("{seconds}s").format(seconds=PURGE_MIN_RETENTION_SECONDS)),
             ],
         )
 
