@@ -335,20 +335,6 @@ class ReviewView(discord.ui.View):
             await self.cog._delete_pending_review(interaction.guild, self.active_key)
         self.stop()
 
-    async def _send_kick_fail_warning_prompt(self, interaction: discord.Interaction) -> None:
-        embed = discord.Embed(
-            title=_("Target left the server"),
-            description=_("The user left before the kick could be applied. Apply a warning instead?"),
-            color=discord.Color.orange(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name=_("User ID:"), value=f"`{self.target_id}`", inline=False)
-        await interaction.followup.send(
-            embed=embed,
-            view=KickFailWarnView(self),
-            ephemeral=True,
-        )
-
     async def _action_perform(self, interaction: discord.Interaction, action: str) -> tuple[str | None, str | None]:
         """Returns (result_message, action_label) or (None, None) to abort."""
         if not self._check_perms(interaction):
@@ -359,20 +345,7 @@ class ReviewView(discord.ui.View):
         config = await self.cog.config.guild(guild).all()
         member = guild.get_member(self.target_id)
         if member is None and action == "kick":
-            if config.get("dry_run"):
-                await self.cog._increment_stat(guild, "dry_run_actions")
-                return (None, self.cog._dry_run_label(action))
-            warning_mode = self.cog._review_kick_fail_warning_mode(config)
-            if warning_mode == "manual":
-                await self._send_kick_fail_warning_prompt(interaction)
-                return (None, None)
-            if warning_mode == "true":
-                label, failed = await self.cog._create_kick_fail_warning(
-                    guild,
-                    self.target_id,
-                    moderator=interaction.user,
-                )
-                return (failed, label)
+            return (_("User left the server before the kick could be applied. Review is still pending; use Ban or Ignore."), None)
         if member is None and action not in ("ban", "ignore"):
             return (_("User is no longer in the server."), None)
         if action == "ignore":
@@ -391,6 +364,7 @@ class ReviewView(discord.ui.View):
             return (None, _("Ignored (no action)"))
         reason = _("Honeypot review: {action}").format(action=action.title())
         if config.get("dry_run"):
+            self.cog._deactivate_forward_purge(guild.id, self.target_id)
             if member is not None and self.pending_mute_role_id is not None:
                 mute_role = guild.get_role(self.pending_mute_role_id)
                 if mute_role is not None and mute_role in member.roles:
@@ -405,6 +379,7 @@ class ReviewView(discord.ui.View):
             return (None, self.cog._dry_run_label(action))
         missing_permission = self.cog._missing_action_permission(guild, action)
         if missing_permission is not None:
+            self.cog._deactivate_forward_purge(guild.id, self.target_id)
             await self.cog._increment_stat(guild, "failed_actions")
             return (missing_permission, None)
         try:
@@ -1752,6 +1727,52 @@ class Honeypot(Cog):
                 total += 1
         return total
 
+    def _count_recent_cached_user_messages(
+        self,
+        guild: discord.Guild,
+        user_id: int,
+        config: dict,
+        *,
+        exclude_message_id: int | None = None,
+    ) -> int:
+        retention_seconds = self._purge_retention_seconds(config)
+        self._prune_recent_user_messages(
+            guild.id, user_id, retention_seconds=retention_seconds
+        )
+        refs = self._recent_user_messages.get(guild.id, {}).get(user_id, ())
+        return sum(
+            1
+            for ref in refs
+            if exclude_message_id is None or ref.message_id != exclude_message_id
+        )
+
+    def _dry_run_purge_label(
+        self,
+        guild: discord.Guild,
+        user_id: int,
+        config: dict,
+        *,
+        include_current_message: bool = False,
+        current_message_id: int | None = None,
+    ) -> str:
+        backward_seconds = self._purge_retention_seconds(config)
+        forward_seconds = self._purge_forward_seconds(config)
+        cached_count = self._count_recent_cached_user_messages(
+            guild,
+            user_id,
+            config,
+            exclude_message_id=current_message_id if include_current_message else None,
+        )
+        if include_current_message:
+            cached_count += 1
+        return _(
+            "Dry run: I would purge {count} cached message(s) from the last {backward}s and forward-purge new messages for {forward}s."
+        ).format(
+            count=cached_count,
+            backward=backward_seconds,
+            forward=forward_seconds,
+        )
+
     async def _cached_purge_user_messages(
         self,
         guild: discord.Guild,
@@ -1828,6 +1849,8 @@ class Honeypot(Cog):
     async def _finish_firstpost_response(
         self, message: discord.Message, config: dict, *, message_deleted: bool
     ) -> None:
+        if config.get("dry_run"):
+            return
         purged = await self._cached_purge_user_messages(
             message.guild,
             message.author.id,
@@ -1877,6 +1900,8 @@ class Honeypot(Cog):
     async def _finish_spam_response(
         self, message: discord.Message, config: dict, *, message_deleted: bool
     ) -> None:
+        if config.get("dry_run"):
+            return
         purged = await self._cached_purge_user_messages(
             message.guild,
             message.author.id,
@@ -1937,6 +1962,18 @@ class Honeypot(Cog):
 
         message_deleted = False
         if action == "review":
+            if config.get("dry_run"):
+                embed.add_field(
+                    name=_("Purge:"),
+                    value=self._dry_run_purge_label(
+                        message.guild,
+                        message.author.id,
+                        config,
+                        include_current_message=True,
+                        current_message_id=message.id,
+                    ),
+                    inline=False,
+                )
             if review_channel is not None:
                 await self._send_review(
                     message,
@@ -1956,7 +1993,8 @@ class Honeypot(Cog):
                     inline=False,
                 )
                 await self._send_log(logs_channel, embed, attachment_snapshots)
-            message_deleted = await self._delete_spam_current_message(message)
+            if not config.get("dry_run"):
+                message_deleted = await self._delete_spam_current_message(message)
             await self._finish_spam_response(message, config, message_deleted=message_deleted)
             return True
 
@@ -1976,8 +2014,21 @@ class Honeypot(Cog):
                 await self._increment_stat(message.guild, "spam_kicks")
             elif action == "ban":
                 await self._increment_stat(message.guild, "spam_bans")
+        if config.get("dry_run"):
+            embed.add_field(
+                name=_("Purge:"),
+                value=self._dry_run_purge_label(
+                    message.guild,
+                    message.author.id,
+                    config,
+                    include_current_message=True,
+                    current_message_id=message.id,
+                ),
+                inline=False,
+            )
+        else:
+            message_deleted = await self._delete_spam_current_message(message)
         await self._send_log(logs_channel, embed, attachment_snapshots)
-        message_deleted = await self._delete_spam_current_message(message)
         await self._finish_spam_response(message, config, message_deleted=message_deleted)
         return True
 
@@ -2037,6 +2088,18 @@ class Honeypot(Cog):
 
         message_deleted = False
         if action == "review":
+            if config.get("dry_run"):
+                embed.add_field(
+                    name=_("Purge:"),
+                    value=self._dry_run_purge_label(
+                        message.guild,
+                        message.author.id,
+                        config,
+                        include_current_message=True,
+                        current_message_id=message.id,
+                    ),
+                    inline=False,
+                )
             if review_channel is not None:
                 await self._send_review(
                     message,
@@ -2056,7 +2119,8 @@ class Honeypot(Cog):
                     inline=False,
                 )
                 await self._send_log(logs_channel, embed, attachment_snapshots)
-            message_deleted = await self._delete_firstpost_current_message(message)
+            if not config.get("dry_run"):
+                message_deleted = await self._delete_firstpost_current_message(message)
             await self._finish_firstpost_response(message, config, message_deleted=message_deleted)
             return True
 
@@ -2076,8 +2140,21 @@ class Honeypot(Cog):
                 await self._increment_stat(message.guild, "firstpost_kicks")
             elif action == "ban":
                 await self._increment_stat(message.guild, "firstpost_bans")
+        if config.get("dry_run"):
+            embed.add_field(
+                name=_("Purge:"),
+                value=self._dry_run_purge_label(
+                    message.guild,
+                    message.author.id,
+                    config,
+                    include_current_message=True,
+                    current_message_id=message.id,
+                ),
+                inline=False,
+            )
+        else:
+            message_deleted = await self._delete_firstpost_current_message(message)
         await self._send_log(logs_channel, embed, attachment_snapshots)
-        message_deleted = await self._delete_firstpost_current_message(message)
         await self._finish_firstpost_response(message, config, message_deleted=message_deleted)
         return True
 
@@ -2458,12 +2535,15 @@ class Honeypot(Cog):
 
         attachment_snapshots = await self._snapshot_attachments(message)
 
-        try:
-            await message.delete()
-            message_deleted = True
-        except discord.HTTPException:
+        if config.get("dry_run"):
             message_deleted = False
-            log.debug("Failed to delete honeypot message from user %s", message.author.id)
+        else:
+            try:
+                await message.delete()
+                message_deleted = True
+            except discord.HTTPException:
+                message_deleted = False
+                log.debug("Failed to delete honeypot message from user %s", message.author.id)
         await self._increment_stat(message.guild, "detections")
 
         whitelisted_role_ids: list[int] = config.get("whitelisted_roles", [])
@@ -2508,21 +2588,34 @@ class Honeypot(Cog):
                 inline=True,
             )
 
-        # Cached purge uses the configured event-retention window.
-        purged = await self._cached_purge_user_messages(
-            message.guild,
-            message.author.id,
-            config,
-            exclude_message_id=message.id if message_deleted else None,
-        )
-        if purged:
-            await self._increment_stat(message.guild, "purged_messages", purged)
-            await self._increment_stat(message.guild, "cached_purge_deletes", purged)
+        if config.get("dry_run"):
             embed.add_field(
-                name=_("Purged messages:"),
-                value=str(purged),
-                inline=True,
+                name=_("Purge:"),
+                value=self._dry_run_purge_label(
+                    message.guild,
+                    message.author.id,
+                    config,
+                    include_current_message=True,
+                    current_message_id=message.id,
+                ),
+                inline=False,
             )
+        else:
+            # Cached purge uses the configured event-retention window.
+            purged = await self._cached_purge_user_messages(
+                message.guild,
+                message.author.id,
+                config,
+                exclude_message_id=message.id if message_deleted else None,
+            )
+            if purged:
+                await self._increment_stat(message.guild, "purged_messages", purged)
+                await self._increment_stat(message.guild, "cached_purge_deletes", purged)
+                embed.add_field(
+                    name=_("Purged messages:"),
+                    value=str(purged),
+                    inline=True,
+                )
 
         force_review = False
         force_fallback = False
