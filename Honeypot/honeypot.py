@@ -25,6 +25,13 @@ from redbot.core.data_manager import cog_data_path
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.chat_formatting import box, pagify
 
+from .image_detector import (
+    ImageSample,
+    image_hashes_from_bytes,
+    match_image,
+    rebuild_model_state,
+)
+
 _ = Translator("Honeypot", __file__)
 log = logging.getLogger("red.Honeypot")
 
@@ -91,6 +98,25 @@ REVIEW_DUMP_MAX_ZIP_BYTES = 95 * 1024 * 1024
 REVIEW_DUMP_ATTACHMENT_DELAY_SECONDS = 1
 IMAGE_SCAN_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 IMAGE_SCAN_COUNTS = (2, 4)
+IMAGE_SCAN_MAX_ATTACHMENTS = 4
+IMAGE_SCAN_DECISIONS = ("true_positive", "false_positive")
+IMAGE_SCAN_DETECTOR_ACTION_OPTIONS = ("none", "review", "kick", "ban")
+IMAGE_SCAN_PROFILE_COLUMNS = (
+    "messages_scanned",
+    "messages_with_images",
+    "images_considered",
+    "images_ignored_over_limit",
+    "exact_tp_hits",
+    "flagged_tp_hits",
+    "download_ms_total",
+    "download_ms_count",
+    "hash_ms_total",
+    "hash_ms_count",
+    "compare_ms_total",
+    "compare_ms_count",
+    "decision_ms_total",
+    "decision_ms_count",
+)
 REVIEW_KICK_FAIL_WARNING_MODES = ("false", "true", "manual")
 KICK_FAIL_WARNING_REASON = "Suspicious activity: target left before the kick could be applied."
 CORE_ACTION_OPTIONS = ("kick", "ban", "review", "none")
@@ -575,6 +601,107 @@ class ImageScanReviewView(discord.ui.View):
         await self._set_decision(interaction, "ignored", _("Ignored"))
 
 
+class ImageScanFeedbackView(discord.ui.View):
+    def __init__(
+        self,
+        cog: "Honeypot",
+        source_message: discord.Message,
+        attachment: discord.Attachment,
+        attachment_index: int,
+    ) -> None:
+        super().__init__(timeout=3600)
+        self.cog = cog
+        self.source_message = source_message
+        self.attachment = attachment
+        self.attachment_index = attachment_index
+
+    @staticmethod
+    def _check_perms(interaction: discord.Interaction) -> bool:
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        return bool(permissions and permissions.moderate_members)
+
+    def _disable_all(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+    async def _confirm_text(self, interaction: discord.Interaction, token: str) -> bool:
+        await interaction.followup.send(
+            _("Type `{token}` to confirm.").format(token=token),
+            ephemeral=True,
+        )
+
+        def check(message: discord.Message) -> bool:
+            return (
+                message.author.id == interaction.user.id
+                and message.channel.id == interaction.channel_id
+                and message.content.strip().upper() == token
+            )
+
+        try:
+            await self.cog.bot.wait_for("message", check=check, timeout=60)
+        except asyncio.TimeoutError:
+            await interaction.followup.send(_("Cancelled."), ephemeral=True)
+            return False
+        return True
+
+    async def _add_decision(
+        self,
+        interaction: discord.Interaction,
+        decision: str,
+        token: str,
+        label: str,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self._check_perms(interaction):
+            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
+            return
+        if not await self._confirm_text(interaction, token):
+            return
+        status, sample = await self.cog._imagescan_add_attachment_sample(
+            self.source_message.guild.id,
+            self.source_message,
+            self.attachment,
+            self.attachment_index,
+            decision,
+            interaction.user.id,
+        )
+        config = await self.cog.config.guild(self.source_message.guild).all()
+        state = await self.cog._imagescan_model_state(
+            self.source_message.guild.id,
+            int(config.get("imagescan_detector_threshold", 20)),
+        )
+        if status == "inserted" and state["valid"]:
+            self._disable_all()
+            if interaction.message is not None:
+                try:
+                    await interaction.message.edit(view=self)
+                except discord.HTTPException:
+                    pass
+            await interaction.followup.send(_("{label} saved.").format(label=label), ephemeral=True)
+            return
+        if status == "duplicate":
+            await interaction.followup.send(_("Already known."), ephemeral=True)
+            return
+        if status == "inserted" and sample is not None:
+            await self.cog._imagescan_deactivate_sample(
+                self.source_message.guild.id,
+                sample["sample_id"],
+            )
+            await self.cog._imagescan_model_state(
+                self.source_message.guild.id,
+                int(config.get("imagescan_detector_threshold", 20)),
+            )
+        await interaction.followup.send(_("Rejected: TP/FP overlap.\nModel unchanged."), ephemeral=True)
+
+    @discord.ui.button(label="Confirm TP", style=discord.ButtonStyle.danger)
+    async def confirm_tp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._add_decision(interaction, "true_positive", "TP", _("TP"))
+
+    @discord.ui.button(label="Confirm FP", style=discord.ButtonStyle.secondary)
+    async def confirm_fp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._add_decision(interaction, "false_positive", "FP", _("FP"))
+
+
 @cog_i18n(_)
 class Honeypot(Cog):
     """Create a trap channel and handle users who post in it."""
@@ -608,6 +735,9 @@ class Honeypot(Cog):
             spam_min_channels=2,
             imagescan_enabled=False,
             imagescan_channel=None,
+            imagescan_detector_enabled=False,
+            imagescan_detector_action="review",
+            imagescan_detector_threshold=20,
             review_enabled=False,
             review_channel=None,
             review_timeout_minutes=1440,
@@ -722,9 +852,405 @@ class Honeypot(Cog):
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS imagescan_samples (
+                    sample_id TEXT PRIMARY KEY,
+                    guild_id TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    phash TEXT NOT NULL,
+                    dhash TEXT NOT NULL,
+                    ahash TEXT NOT NULL,
+                    source_message_id TEXT,
+                    source_channel_id TEXT,
+                    source_jump_url TEXT,
+                    file_path TEXT,
+                    file_size_bytes INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    moderator_id TEXT,
+                    active INTEGER NOT NULL DEFAULT 1
+                )
+                """
+            )
+            conn.execute("DROP INDEX IF EXISTS imagescan_samples_sha_idx")
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS imagescan_samples_sha_idx
+                ON imagescan_samples (guild_id, sha256)
+                WHERE active = 1
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS imagescan_model_state (
+                    guild_id TEXT PRIMARY KEY,
+                    configured_threshold INTEGER NOT NULL DEFAULT 20,
+                    effective_threshold INTEGER NOT NULL DEFAULT 20,
+                    max_tp_nearest_score INTEGER,
+                    min_fp_to_tp_score INTEGER,
+                    gap INTEGER,
+                    sample_count_tp INTEGER NOT NULL DEFAULT 0,
+                    sample_count_fp INTEGER NOT NULL DEFAULT 0,
+                    stored_size_bytes INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS imagescan_profile (
+                    guild_id TEXT PRIMARY KEY,
+                    messages_scanned INTEGER NOT NULL DEFAULT 0,
+                    messages_with_images INTEGER NOT NULL DEFAULT 0,
+                    images_considered INTEGER NOT NULL DEFAULT 0,
+                    images_ignored_over_limit INTEGER NOT NULL DEFAULT 0,
+                    exact_tp_hits INTEGER NOT NULL DEFAULT 0,
+                    flagged_tp_hits INTEGER NOT NULL DEFAULT 0,
+                    download_ms_total INTEGER NOT NULL DEFAULT 0,
+                    download_ms_count INTEGER NOT NULL DEFAULT 0,
+                    hash_ms_total INTEGER NOT NULL DEFAULT 0,
+                    hash_ms_count INTEGER NOT NULL DEFAULT 0,
+                    compare_ms_total INTEGER NOT NULL DEFAULT 0,
+                    compare_ms_count INTEGER NOT NULL DEFAULT 0,
+                    decision_ms_total INTEGER NOT NULL DEFAULT 0,
+                    decision_ms_count INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
 
     async def _init_imagescan_store(self) -> None:
         await asyncio.to_thread(self._init_imagescan_store_sync)
+
+    @staticmethod
+    def _imagescan_sample_from_row(row: sqlite3.Row) -> ImageSample:
+        return ImageSample(
+            sample_id=str(row["sample_id"]),
+            decision=str(row["decision"]),
+            sha256=str(row["sha256"]),
+            phash=str(row["phash"]),
+            dhash=str(row["dhash"]),
+            ahash=str(row["ahash"]),
+        )
+
+    def _imagescan_load_samples_sync(self, guild_id: int) -> list[ImageSample]:
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT sample_id, decision, sha256, phash, dhash, ahash
+                FROM imagescan_samples
+                WHERE guild_id = ? AND active = 1
+                """,
+                (str(guild_id),),
+            ).fetchall()
+        return [self._imagescan_sample_from_row(row) for row in rows]
+
+    async def _imagescan_load_samples(self, guild_id: int) -> list[ImageSample]:
+        async with self._imagescan_db_lock:
+            return await asyncio.to_thread(self._imagescan_load_samples_sync, guild_id)
+
+    def _imagescan_model_state_sync(self, guild_id: int, configured_threshold: int) -> dict[str, typing.Any]:
+        samples = self._imagescan_load_samples_sync(guild_id)
+        state = rebuild_model_state(samples, configured_threshold)
+        state["stored_size_bytes"] = self._imagescan_stored_size_sync(guild_id)
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO imagescan_model_state (
+                    guild_id, configured_threshold, effective_threshold,
+                    max_tp_nearest_score, min_fp_to_tp_score, gap,
+                    sample_count_tp, sample_count_fp, stored_size_bytes
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    configured_threshold = excluded.configured_threshold,
+                    effective_threshold = excluded.effective_threshold,
+                    max_tp_nearest_score = excluded.max_tp_nearest_score,
+                    min_fp_to_tp_score = excluded.min_fp_to_tp_score,
+                    gap = excluded.gap,
+                    sample_count_tp = excluded.sample_count_tp,
+                    sample_count_fp = excluded.sample_count_fp,
+                    stored_size_bytes = excluded.stored_size_bytes
+                """,
+                (
+                    str(guild_id),
+                    int(state["configured_threshold"]),
+                    int(state["effective_threshold"]),
+                    state.get("max_tp_nearest_score"),
+                    state.get("min_fp_to_tp_score"),
+                    state.get("gap"),
+                    int(state["sample_count_tp"]),
+                    int(state["sample_count_fp"]),
+                    int(state["stored_size_bytes"]),
+                ),
+            )
+        return state
+
+    async def _imagescan_model_state(self, guild_id: int, configured_threshold: int) -> dict[str, typing.Any]:
+        async with self._imagescan_db_lock:
+            return await asyncio.to_thread(self._imagescan_model_state_sync, guild_id, configured_threshold)
+
+    def _imagescan_stored_size_sync(self, guild_id: int) -> int:
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(file_size_bytes), 0)
+                FROM imagescan_samples
+                WHERE guild_id = ? AND active = 1
+                """,
+                (str(guild_id),),
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def _imagescan_profile_sync(self, guild_id: int) -> dict[str, int]:
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                f"SELECT {', '.join(IMAGE_SCAN_PROFILE_COLUMNS)} FROM imagescan_profile WHERE guild_id = ?",
+                (str(guild_id),),
+            ).fetchone()
+        if row is None:
+            return {column: 0 for column in IMAGE_SCAN_PROFILE_COLUMNS}
+        return {column: int(row[column] or 0) for column in IMAGE_SCAN_PROFILE_COLUMNS}
+
+    async def _imagescan_profile(self, guild_id: int) -> dict[str, int]:
+        async with self._imagescan_db_lock:
+            return await asyncio.to_thread(self._imagescan_profile_sync, guild_id)
+
+    def _imagescan_increment_profile_sync(self, guild_id: int, increments: dict[str, int]) -> None:
+        if not increments:
+            return
+        filtered = {
+            key: int(value)
+            for key, value in increments.items()
+            if key in IMAGE_SCAN_PROFILE_COLUMNS and value
+        }
+        if not filtered:
+            return
+        columns = ["guild_id", *filtered.keys()]
+        placeholders = ", ".join("?" for _ in columns)
+        updates = ", ".join(f"{key} = {key} + excluded.{key}" for key in filtered)
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.execute(
+                f"""
+                INSERT INTO imagescan_profile ({", ".join(columns)})
+                VALUES ({placeholders})
+                ON CONFLICT(guild_id) DO UPDATE SET {updates}
+                """,
+                (str(guild_id), *filtered.values()),
+            )
+
+    async def _imagescan_increment_profile(self, guild_id: int, increments: dict[str, int]) -> None:
+        async with self._imagescan_db_lock:
+            await asyncio.to_thread(self._imagescan_increment_profile_sync, guild_id, increments)
+
+    def _imagescan_insert_sample_sync(self, sample: dict[str, typing.Any]) -> str:
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            existing = conn.execute(
+                """
+                SELECT decision
+                FROM imagescan_samples
+                WHERE guild_id = ? AND sha256 = ? AND active = 1
+                """,
+                (sample["guild_id"], sample["sha256"]),
+            ).fetchone()
+            if existing is not None:
+                return "duplicate" if existing["decision"] == sample["decision"] else "conflict"
+            conn.execute(
+                """
+                INSERT INTO imagescan_samples (
+                    sample_id, guild_id, decision, sha256, phash, dhash, ahash,
+                    source_message_id, source_channel_id, source_jump_url,
+                    file_path, file_size_bytes, created_at, moderator_id, active
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    sample["sample_id"],
+                    sample["guild_id"],
+                    sample["decision"],
+                    sample["sha256"],
+                    sample["phash"],
+                    sample["dhash"],
+                    sample["ahash"],
+                    sample.get("source_message_id"),
+                    sample.get("source_channel_id"),
+                    sample.get("source_jump_url"),
+                    sample.get("file_path"),
+                    int(sample.get("file_size_bytes") or 0),
+                    int(sample["created_at"]),
+                    sample.get("moderator_id"),
+                ),
+            )
+        return "inserted"
+
+    async def _imagescan_insert_sample(self, sample: dict[str, typing.Any]) -> str:
+        async with self._imagescan_db_lock:
+            return await asyncio.to_thread(self._imagescan_insert_sample_sync, sample)
+
+    def _imagescan_deactivate_sample_sync(self, guild_id: int, sample_id: str) -> None:
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.execute(
+                """
+                UPDATE imagescan_samples
+                SET active = 0
+                WHERE guild_id = ? AND sample_id = ?
+                """,
+                (str(guild_id), sample_id),
+            )
+
+    async def _imagescan_deactivate_sample(self, guild_id: int, sample_id: str) -> None:
+        async with self._imagescan_db_lock:
+            await asyncio.to_thread(self._imagescan_deactivate_sample_sync, guild_id, sample_id)
+
+    async def _imagescan_add_attachment_sample(
+        self,
+        guild_id: int,
+        message: discord.Message,
+        attachment: discord.Attachment,
+        index: int,
+        decision: str,
+        moderator_id: int | None,
+    ) -> tuple[str, dict[str, typing.Any] | None]:
+        try:
+            data = await attachment.read(use_cached=True)
+        except (discord.HTTPException, discord.Forbidden, discord.NotFound, TypeError) as exc:
+            log.debug("Failed to read imagescan sample attachment %s: %r", attachment.filename, exc)
+            return "error", None
+        hashes = await asyncio.to_thread(image_hashes_from_bytes, data)
+        sample_id = f"{message.id}-{index}-{hashes['sha256'][:12]}"
+        sample_dir = self._imagescan_files_path / str(guild_id) / "samples" / str(message.id)
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        filename = self._imagescan_safe_filename(attachment.filename, index)
+        path = sample_dir / f"{index:03d}-{hashes['sha256'][:12]}-{filename}"
+        try:
+            path.write_bytes(data)
+        except OSError as exc:
+            log.debug("Failed to write imagescan sample %s: %r", path, exc)
+            return "error", None
+        sample = {
+            "sample_id": sample_id,
+            "guild_id": str(guild_id),
+            "decision": decision,
+            "sha256": hashes["sha256"],
+            "phash": hashes["phash"],
+            "dhash": hashes["dhash"],
+            "ahash": hashes["ahash"],
+            "source_message_id": str(message.id),
+            "source_channel_id": str(message.channel.id),
+            "source_jump_url": message.jump_url,
+            "file_path": str(path),
+            "file_size_bytes": len(data),
+            "created_at": int(datetime.now(timezone.utc).timestamp()),
+            "moderator_id": str(moderator_id) if moderator_id is not None else None,
+        }
+        status = await self._imagescan_insert_sample(sample)
+        if status != "inserted":
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return status, sample
+
+    async def _imagescan_add_file_sample(
+        self,
+        guild_id: int,
+        source_path: Path,
+        decision: str,
+        moderator_id: int | None,
+    ) -> tuple[str, dict[str, typing.Any] | None]:
+        try:
+            data = await asyncio.to_thread(source_path.read_bytes)
+        except OSError as exc:
+            log.debug("Failed to read imagescan import file %s: %r", source_path, exc)
+            return "error", None
+        try:
+            hashes = await asyncio.to_thread(image_hashes_from_bytes, data)
+        except Exception:
+            log.debug("Failed to hash imagescan import file %s", source_path, exc_info=True)
+            return "error", None
+        sample_id = f"import-{hashes['sha256'][:24]}"
+        sample_dir = self._imagescan_files_path / str(guild_id) / "samples" / "imports"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        filename = self._imagescan_safe_filename(source_path.name, 1)
+        path = sample_dir / f"{hashes['sha256'][:12]}-{filename}"
+        try:
+            await asyncio.to_thread(path.write_bytes, data)
+        except OSError as exc:
+            log.debug("Failed to write imagescan import sample %s: %r", path, exc)
+            return "error", None
+        sample = {
+            "sample_id": sample_id,
+            "guild_id": str(guild_id),
+            "decision": decision,
+            "sha256": hashes["sha256"],
+            "phash": hashes["phash"],
+            "dhash": hashes["dhash"],
+            "ahash": hashes["ahash"],
+            "source_message_id": None,
+            "source_channel_id": None,
+            "source_jump_url": source_path.as_posix(),
+            "file_path": str(path),
+            "file_size_bytes": len(data),
+            "created_at": int(datetime.now(timezone.utc).timestamp()),
+            "moderator_id": str(moderator_id) if moderator_id is not None else None,
+        }
+        status = await self._imagescan_insert_sample(sample)
+        if status != "inserted":
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return status, sample
+
+    async def _imagescan_add_bytes_sample(
+        self,
+        guild_id: int,
+        data: bytes,
+        filename: str,
+        source: str,
+        decision: str,
+        moderator_id: int | None,
+    ) -> tuple[str, dict[str, typing.Any] | None]:
+        try:
+            hashes = await asyncio.to_thread(image_hashes_from_bytes, data)
+        except Exception:
+            log.debug("Failed to hash imagescan import item %s", filename, exc_info=True)
+            return "error", None
+        sample_id = f"upload-{hashes['sha256'][:24]}"
+        sample_dir = self._imagescan_files_path / str(guild_id) / "samples" / "uploads"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        safe_filename = self._imagescan_safe_filename(filename, 1)
+        path = sample_dir / f"{hashes['sha256'][:12]}-{safe_filename}"
+        try:
+            await asyncio.to_thread(path.write_bytes, data)
+        except OSError as exc:
+            log.debug("Failed to write imagescan upload sample %s: %r", path, exc)
+            return "error", None
+        sample = {
+            "sample_id": sample_id,
+            "guild_id": str(guild_id),
+            "decision": decision,
+            "sha256": hashes["sha256"],
+            "phash": hashes["phash"],
+            "dhash": hashes["dhash"],
+            "ahash": hashes["ahash"],
+            "source_message_id": None,
+            "source_channel_id": None,
+            "source_jump_url": source,
+            "file_path": str(path),
+            "file_size_bytes": len(data),
+            "created_at": int(datetime.now(timezone.utc).timestamp()),
+            "moderator_id": str(moderator_id) if moderator_id is not None else None,
+        }
+        status = await self._imagescan_insert_sample(sample)
+        if status != "inserted":
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return status, sample
 
     def _load_firstpost_seen_authors_sync(self, guild_id: int) -> set[int]:
         with sqlite3.connect(self._firstpost_db_path) as conn:
@@ -1912,6 +2438,172 @@ class Honeypot(Cog):
             await self._increment_stat(message.guild, "purged_messages", purged)
             await self._increment_stat(message.guild, "cached_purge_deletes", purged)
 
+    async def _handle_imagescan_detector_message(
+        self,
+        message: discord.Message,
+        config: dict,
+        logs_channel: discord.TextChannel | discord.Thread | None,
+    ) -> bool:
+        if not config.get("imagescan_detector_enabled", False):
+            return False
+        image_attachments = [
+            attachment
+            for attachment in message.attachments
+            if self._imagescan_is_image_attachment(attachment)
+        ]
+        if not image_attachments:
+            return False
+
+        started_at = datetime.now(timezone.utc)
+        considered = image_attachments[:IMAGE_SCAN_MAX_ATTACHMENTS]
+        ignored_over_limit = max(0, len(image_attachments) - len(considered))
+        profile: dict[str, int] = {
+            "messages_scanned": 1,
+            "messages_with_images": 1,
+            "images_considered": len(considered),
+            "images_ignored_over_limit": ignored_over_limit,
+        }
+        samples = await self._imagescan_load_samples(message.guild.id)
+        if not any(sample.decision == "true_positive" for sample in samples):
+            await self._imagescan_increment_profile(message.guild.id, profile)
+            return False
+        state = await self._imagescan_model_state(
+            message.guild.id,
+            int(config.get("imagescan_detector_threshold", 20)),
+        )
+        if not state["valid"]:
+            await self._imagescan_increment_profile(message.guild.id, profile)
+            return False
+
+        matches: list[tuple[discord.Attachment, dict[str, typing.Any], dict[str, str]]] = []
+        for attachment in considered:
+            download_started = datetime.now(timezone.utc)
+            try:
+                data = await attachment.read(use_cached=True)
+            except (discord.HTTPException, discord.Forbidden, discord.NotFound, TypeError):
+                continue
+            profile["download_ms_total"] = profile.get("download_ms_total", 0) + int(
+                (datetime.now(timezone.utc) - download_started).total_seconds() * 1000
+            )
+            profile["download_ms_count"] = profile.get("download_ms_count", 0) + 1
+
+            hash_started = datetime.now(timezone.utc)
+            try:
+                hashes = await asyncio.to_thread(image_hashes_from_bytes, data)
+            except Exception:
+                log.debug("Failed to hash imagescan attachment %s", attachment.filename, exc_info=True)
+                continue
+            profile["hash_ms_total"] = profile.get("hash_ms_total", 0) + int(
+                (datetime.now(timezone.utc) - hash_started).total_seconds() * 1000
+            )
+            profile["hash_ms_count"] = profile.get("hash_ms_count", 0) + 1
+
+            compare_started = datetime.now(timezone.utc)
+            result = match_image(hashes, samples, int(state["effective_threshold"]))
+            profile["compare_ms_total"] = profile.get("compare_ms_total", 0) + int(
+                (datetime.now(timezone.utc) - compare_started).total_seconds() * 1000
+            )
+            profile["compare_ms_count"] = profile.get("compare_ms_count", 0) + 1
+            if result["matched"]:
+                matches.append((attachment, result, hashes))
+                if result["exact_decision"] == "true_positive":
+                    profile["exact_tp_hits"] = profile.get("exact_tp_hits", 0) + 1
+                else:
+                    profile["flagged_tp_hits"] = profile.get("flagged_tp_hits", 0) + 1
+
+        profile["decision_ms_total"] = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+        profile["decision_ms_count"] = 1
+        await self._imagescan_increment_profile(message.guild.id, profile)
+        if not matches:
+            return False
+
+        attachment_snapshots = await self._snapshot_attachments(message)
+        best_attachment, best_match, _hashes = matches[0]
+        feedback_view = None
+        if best_match["exact_decision"] is None:
+            feedback_view = ImageScanFeedbackView(
+                self,
+                message,
+                best_attachment,
+                considered.index(best_attachment) + 1,
+            )
+        embed = discord.Embed(
+            title=_("Honeypot hit"),
+            description=f">>> {message.content}" if message.content else _("*(message with attachments only)*"),
+            color=discord.Color.red(),
+            timestamp=message.created_at,
+        )
+        embed.set_author(
+            name=f"{message.author.display_name} ({message.author.id})",
+            icon_url=message.author.display_avatar,
+        )
+        embed.set_thumbnail(url=message.author.display_avatar)
+        embed.add_field(name=_("Reason:"), value=_("Honeypot"), inline=False)
+        embed.add_field(name=_("Channel:"), value=getattr(message.channel, "mention", f"<#{message.channel.id}>"), inline=True)
+        embed.add_field(name=_("Message:"), value=message.jump_url, inline=False)
+        embed.add_field(
+            name=_("Image score:"),
+            value=_("{score} / threshold {threshold}").format(
+                score=best_match["score"],
+                threshold=best_match["threshold"],
+            ),
+            inline=True,
+        )
+        embed.add_field(name=_("Attachment:"), value=best_attachment.filename or _("unknown"), inline=True)
+        embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
+
+        action = config.get("imagescan_detector_action", "review")
+        if action not in IMAGE_SCAN_DETECTOR_ACTION_OPTIONS:
+            action = "review"
+        review_channel = self._get_text_channel_or_thread(message.guild, config.get("review_channel"))
+        message_deleted = False
+        if action == "review":
+            if review_channel is not None:
+                await self._send_review(
+                    message,
+                    config,
+                    embed,
+                    review_channel,
+                    logs_channel,
+                    attachment_snapshots,
+                )
+                if feedback_view is not None:
+                    try:
+                        await review_channel.send(
+                            _("Image detector feedback: {url}").format(url=message.jump_url),
+                            view=feedback_view,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except discord.HTTPException:
+                        log.debug("Failed to send imagescan feedback message for %s", message.id)
+            else:
+                embed.color = discord.Color.orange()
+                embed.add_field(name=_("Action:"), value=_("Review channel is not configured."), inline=False)
+                await self._send_log(logs_channel, embed, attachment_snapshots, view=feedback_view)
+            if not config.get("dry_run"):
+                message_deleted = await self._delete_spam_current_message(message)
+            await self._finish_spam_response(message, config, message_deleted=message_deleted)
+            return True
+        if action in ("kick", "ban"):
+            action_label, failed = await self._execute_action(
+                message,
+                config,
+                reason="Honeypot",
+                action=action,
+            )
+            embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
+            if failed:
+                embed.color = discord.Color.dark_red()
+            if not config.get("dry_run"):
+                message_deleted = await self._delete_spam_current_message(message)
+            await self._send_log(logs_channel, embed, attachment_snapshots, view=feedback_view)
+            await self._finish_spam_response(message, config, message_deleted=message_deleted)
+            return True
+
+        embed.add_field(name=_("Action:"), value=_("Detector matched; no punishment configured."), inline=False)
+        await self._send_log(logs_channel, embed, attachment_snapshots, view=feedback_view)
+        return True
+
     async def _handle_spam_message(
         self,
         message: discord.Message,
@@ -2487,12 +3179,15 @@ class Honeypot(Cog):
         attachment_snapshots: list[dict[str, typing.Any]],
         content: str | None = None,
         allowed_mentions: discord.AllowedMentions | None = None,
+        view: discord.ui.View | None = None,
     ) -> None:
         if channel is None:
             return
         send_kwargs: dict[str, typing.Any] = {"content": content, "embed": embed}
         if allowed_mentions is not None:
             send_kwargs["allowed_mentions"] = allowed_mentions
+        if view is not None:
+            send_kwargs["view"] = view
         files = self._attachment_files(attachment_snapshots)
         if files:
             send_kwargs["files"] = files
@@ -2518,7 +3213,8 @@ class Honeypot(Cog):
         logs_channel = self._get_text_channel_or_thread(message.guild, config.get("logs_channel"))
         if await self._is_protected_member(message.author):
             return
-        await self._handle_imagescan_message(message, config)
+        if await self._handle_imagescan_detector_message(message, config, logs_channel):
+            return
         self._record_recent_user_message(message, config)
         if self._is_forward_purge_active(message.guild.id, message.author.id):
             if await self._delete_forward_purge_message(message):
@@ -3390,7 +4086,7 @@ class Honeypot(Cog):
             "reviewed_by": fields.get("reviewed by"),
             "channels": fields.get("channels") or fields.get("channel"),
             "channel_ids": self._review_dump_clean_mentions(fields.get("channels") or fields.get("channel")),
-            "trigger_reasons": fields.get("trigger reasons"),
+            "trigger_reasons": fields.get("trigger reasons") or fields.get("reason"),
             "message_content": embed.description,
             "embed_fields": fields,
             "review_message": self._review_dump_message_record(review_message),
@@ -4293,9 +4989,77 @@ class Honeypot(Cog):
 
     @honeypot.group(name="imagescan")
     async def imagescan(self, ctx: commands.Context) -> None:
-        """Configure image shadow reviews for training data."""
+        """Configure adaptive scam-image detection."""
 
-    @imagescan.command(name="toggle")
+    @imagescan.command(name="add")
+    async def imagescan_add(self, ctx: commands.Context) -> None:
+        """Add scam images from the message this command replies to."""
+        reference = getattr(ctx.message, "reference", None)
+        if reference is None or reference.message_id is None:
+            await ctx.send(_("Please reply to an offending message."))
+            return
+        target = reference.resolved
+        if not isinstance(target, discord.Message):
+            try:
+                target = await ctx.channel.fetch_message(reference.message_id)
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                await ctx.send(_("I couldn't fetch the replied message."))
+                return
+        attachments = [
+            attachment
+            for attachment in target.attachments
+            if self._imagescan_is_image_attachment(attachment)
+        ][:IMAGE_SCAN_MAX_ATTACHMENTS]
+        if not attachments:
+            await ctx.send(_("No images found."))
+            return
+        inserted = duplicates = conflicts = errors = 0
+        inserted_sample_ids: list[str] = []
+        for index, attachment in enumerate(attachments, 1):
+            status, sample = await self._imagescan_add_attachment_sample(
+                ctx.guild.id,
+                target,
+                attachment,
+                index,
+                "true_positive",
+                ctx.author.id,
+            )
+            if status == "inserted":
+                inserted += 1
+                if sample is not None:
+                    inserted_sample_ids.append(sample["sample_id"])
+            elif status == "duplicate":
+                duplicates += 1
+            elif status == "conflict":
+                conflicts += 1
+            else:
+                errors += 1
+        config = await self.config.guild(ctx.guild).all()
+        state = await self._imagescan_model_state(
+            ctx.guild.id,
+            int(config.get("imagescan_detector_threshold", 20)),
+        )
+        if not state["valid"]:
+            for sample_id in inserted_sample_ids:
+                await self._imagescan_deactivate_sample(ctx.guild.id, sample_id)
+            await self._imagescan_model_state(
+                ctx.guild.id,
+                int(config.get("imagescan_detector_threshold", 20)),
+            )
+            await ctx.send(_("Rejected: TP/FP overlap.\nModel unchanged."))
+            return
+        parts = []
+        if inserted:
+            parts.append(_("{count} added").format(count=inserted))
+        if duplicates:
+            parts.append(_("{count} already known").format(count=duplicates))
+        if conflicts:
+            parts.append(_("{count} conflict").format(count=conflicts))
+        if errors:
+            parts.append(_("{count} failed").format(count=errors))
+        await ctx.send(_("Imagescan add: {result}.").format(result=", ".join(parts) or _("no changes")))
+
+    @debug_imagescan.command(name="legacy_toggle")
     async def imagescan_toggle(self, ctx: commands.Context, value: bool = None) -> None:
         """Enable or disable image shadow reviews."""
         if value is None:
@@ -4314,7 +5078,7 @@ class Honeypot(Cog):
             await self.config.guild(ctx.guild).imagescan_enabled.set(value)
             await ctx.send(_("✅ Image scan enabled set to {value}").format(value=value))
 
-    @imagescan.command(name="channel")
+    @debug_imagescan.command(name="legacy_channel")
     async def imagescan_channel(
         self,
         ctx: commands.Context,
@@ -4329,20 +5093,126 @@ class Honeypot(Cog):
         await self.config.guild(ctx.guild).imagescan_channel.set(channel.id)
         await ctx.send(_("✅ Image scan channel set to {channel}").format(channel=channel.mention))
 
+    @imagescan.group(name="detector")
+    async def imagescan_detector(self, ctx: commands.Context) -> None:
+        """Configure production image detector behavior."""
+
+    @imagescan_detector.command(name="toggle")
+    async def imagescan_detector_toggle(self, ctx: commands.Context, value: bool = None) -> None:
+        """Enable or disable production image detection."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).imagescan_detector_enabled()
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=str(v).lower(),
+                    options=self._format_options(BOOL_OPTIONS),
+                )
+            )
+            return
+        await self.config.guild(ctx.guild).imagescan_detector_enabled.set(value)
+        await ctx.send(_("Image detector enabled set to {value}").format(value=value))
+
+    @imagescan_detector.command(name="action")
+    async def imagescan_detector_action(self, ctx: commands.Context, value: str = None) -> None:
+        """Set image detector action."""
+        if value is None:
+            v = await self.config.guild(ctx.guild).imagescan_detector_action()
+            await ctx.send(
+                _("Current: {value}. Choices: {options}").format(
+                    value=v,
+                    options=self._format_options(IMAGE_SCAN_DETECTOR_ACTION_OPTIONS),
+                )
+            )
+            return
+        if value not in IMAGE_SCAN_DETECTOR_ACTION_OPTIONS:
+            await ctx.send(
+                _("Choose one of: {options}").format(
+                    options=self._format_options(IMAGE_SCAN_DETECTOR_ACTION_OPTIONS),
+                )
+            )
+            return
+        await self.config.guild(ctx.guild).imagescan_detector_action.set(value)
+        await ctx.send(_("Image detector action set to {value}").format(value=value))
+
+    @imagescan_detector.command(name="threshold")
+    async def imagescan_detector_threshold(self, ctx: commands.Context, value: int = None) -> None:
+        """Set maximum image hash distance."""
+        if value is None:
+            config = await self.config.guild(ctx.guild).all()
+            state = await self._imagescan_model_state(
+                ctx.guild.id,
+                int(config.get("imagescan_detector_threshold", 20)),
+            )
+            await ctx.send(
+                _("Threshold: {configured} effective {effective}").format(
+                    configured=state["configured_threshold"],
+                    effective=state["effective_threshold"],
+                )
+            )
+            return
+        if value < 0 or value > 100:
+            await ctx.send(_("Threshold must be between 0 and 100."))
+            return
+        await self.config.guild(ctx.guild).imagescan_detector_threshold.set(value)
+        await self._imagescan_model_state(ctx.guild.id, value)
+        await ctx.send(_("Image detector threshold set to {value}").format(value=value))
+
+    @imagescan.group(name="model")
+    async def imagescan_model(self, ctx: commands.Context) -> None:
+        """Maintain image detector model state."""
+
+    @imagescan_model.command(name="rebuild")
+    async def imagescan_model_rebuild(self, ctx: commands.Context) -> None:
+        """Recompute image detector threshold state."""
+        config = await self.config.guild(ctx.guild).all()
+        state = await self._imagescan_model_state(
+            ctx.guild.id,
+            int(config.get("imagescan_detector_threshold", 20)),
+        )
+        if not state["valid"]:
+            await ctx.send(_("Rejected: TP/FP overlap.\nModel unchanged."))
+            return
+        await ctx.send(
+            _("Model rebuilt. Effective threshold: {threshold}").format(
+                threshold=state["effective_threshold"],
+            )
+        )
+
     @imagescan.command(name="status")
     async def imagescan_status(self, ctx: commands.Context) -> None:
-        """Show image shadow-review settings and counts."""
+        """Show image detector settings, samples, and timing."""
         config = await self.config.guild(ctx.guild).all()
-        channel = self._get_text_channel_or_thread(ctx.guild, config.get("imagescan_channel"))
-        counts = await self._imagescan_counts(ctx.guild.id)
+        state = await self._imagescan_model_state(
+            ctx.guild.id,
+            int(config.get("imagescan_detector_threshold", 20)),
+        )
+        profile = await self._imagescan_profile(ctx.guild.id)
+        total_samples = int(state["sample_count_tp"]) + int(state["sample_count_fp"])
+
+        def avg(total_key: str, count_key: str) -> int:
+            count = profile.get(count_key, 0)
+            return int(profile.get(total_key, 0) / count) if count else 0
+
         lines = [
-            f"Enabled: {self._format_bool_setting(config.get('imagescan_enabled', False))}",
-            f"Channel: {channel.mention if channel else 'None'}",
-            f"Pending: {counts.get('pending', 0)}",
-            f"True positives: {counts.get('true_positive', 0)}",
-            f"False positives: {counts.get('false_positive', 0)}",
-            f"Ignored: {counts.get('ignored', 0)}",
-            f"Files: {self._imagescan_files_path}",
+            f"Enabled: {self._format_bool_setting(config.get('imagescan_detector_enabled', False))}",
+            f"Action: {config.get('imagescan_detector_action', 'review')}",
+            f"Threshold: {state['configured_threshold']} effective {state['effective_threshold']}",
+            f"Samples: {state['sample_count_tp']} TP, {state['sample_count_fp']} FP, {total_samples} total",
+            f"Stored files: {total_samples} / {self._format_bytes(int(state.get('stored_size_bytes') or 0))}",
+            (
+                "Scanned: "
+                f"{profile.get('messages_scanned', 0)} messages, "
+                f"{profile.get('images_considered', 0)} images considered, "
+                f"{profile.get('images_ignored_over_limit', 0)} images ignored over limit"
+            ),
+            f"Hits: {profile.get('exact_tp_hits', 0)} exact TP, {profile.get('flagged_tp_hits', 0)} flagged TP",
+            f"Decision latency: avg {avg('decision_ms_total', 'decision_ms_count')} ms",
+            (
+                "Download/hash/compare: avg "
+                f"{avg('download_ms_total', 'download_ms_count')} / "
+                f"{avg('hash_ms_total', 'hash_ms_count')} / "
+                f"{avg('compare_ms_total', 'compare_ms_count')} ms"
+            ),
         ]
         await ctx.send(_("**Image scan status:**\n") + box("\n".join(lines)))
 
@@ -4363,6 +5233,112 @@ class Honeypot(Cog):
                 shutil.rmtree(temp_root, ignore_errors=True)
 
     # ─── firstpost sub-group ────────────────────────────────────────────
+
+    @debug_imagescan.command(name="importtpzip")
+    async def imagescan_import_tp_zip(self, ctx: commands.Context) -> None:
+        """Import true-positive scam images from attached zip files."""
+        attachments = list(ctx.message.attachments)
+        reference = getattr(ctx.message, "reference", None)
+        if not attachments and reference is not None and reference.message_id is not None:
+            target = reference.resolved
+            if not isinstance(target, discord.Message):
+                try:
+                    target = await ctx.channel.fetch_message(reference.message_id)
+                except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                    target = None
+            if isinstance(target, discord.Message):
+                attachments = list(target.attachments)
+        zip_attachments = [
+            attachment
+            for attachment in attachments
+            if (attachment.filename or "").lower().endswith(".zip")
+        ]
+        if not zip_attachments:
+            await ctx.send(_("Attach a .zip file or reply to a message with a .zip file."))
+            return
+        progress = await ctx.send(_("Importing zip file(s)..."))
+        inserted = duplicates = conflicts = errors = skipped = 0
+        inserted_sample_ids: list[str] = []
+        processed = 0
+        for attachment in zip_attachments:
+            try:
+                archive_data = await attachment.read(use_cached=True)
+            except (discord.HTTPException, discord.Forbidden, discord.NotFound, TypeError):
+                errors += 1
+                continue
+            try:
+                archive = zipfile.ZipFile(io.BytesIO(archive_data))
+            except zipfile.BadZipFile:
+                errors += 1
+                continue
+            with archive:
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    filename = Path(info.filename).name
+                    if Path(filename).suffix.lower() not in IMAGE_ATTACHMENT_EXTENSIONS:
+                        skipped += 1
+                        continue
+                    try:
+                        data = archive.read(info)
+                    except (RuntimeError, OSError, zipfile.BadZipFile):
+                        errors += 1
+                        continue
+                    status, sample = await self._imagescan_add_bytes_sample(
+                        ctx.guild.id,
+                        data,
+                        filename,
+                        f"{attachment.url}#{info.filename}",
+                        "true_positive",
+                        ctx.author.id,
+                    )
+                    if status == "inserted":
+                        inserted += 1
+                        if sample is not None:
+                            inserted_sample_ids.append(sample["sample_id"])
+                    elif status == "duplicate":
+                        duplicates += 1
+                    elif status == "conflict":
+                        conflicts += 1
+                    else:
+                        errors += 1
+                    processed += 1
+                    if processed == 1 or processed % 25 == 0:
+                        try:
+                            await progress.edit(
+                                content=_("Imported {count} image(s)...").format(count=processed)
+                            )
+                        except discord.HTTPException:
+                            pass
+                        await asyncio.sleep(0)
+        config = await self.config.guild(ctx.guild).all()
+        state = await self._imagescan_model_state(
+            ctx.guild.id,
+            int(config.get("imagescan_detector_threshold", 20)),
+        )
+        if not state["valid"]:
+            for sample_id in inserted_sample_ids:
+                await self._imagescan_deactivate_sample(ctx.guild.id, sample_id)
+            await self._imagescan_model_state(
+                ctx.guild.id,
+                int(config.get("imagescan_detector_threshold", 20)),
+            )
+            await progress.edit(content=_("Rejected: TP/FP overlap.\nModel unchanged."))
+            return
+        await progress.edit(
+            content=_(
+                "Import finished: {inserted} added, {duplicates} already known, "
+                "{conflicts} conflicts, {errors} failed, {skipped} skipped. "
+                "Effective threshold: {threshold}"
+            ).format(
+                inserted=inserted,
+                duplicates=duplicates,
+                conflicts=conflicts,
+                errors=errors,
+                skipped=skipped,
+                threshold=state["effective_threshold"],
+            )
+        )
 
     @honeypot.group()
     async def firstpost(self, ctx: commands.Context) -> None:
@@ -5015,15 +5991,19 @@ class Honeypot(Cog):
 
     @config_dump.command(name="imagescan")
     async def config_imagescan(self, ctx: commands.Context) -> None:
-        """Show image shadow-review settings."""
+        """Show image detector settings."""
         config = await self.config.guild(ctx.guild).all()
-        channel = self._get_text_channel_or_thread(ctx.guild, config.get("imagescan_channel"))
+        state = await self._imagescan_model_state(
+            ctx.guild.id,
+            int(config.get("imagescan_detector_threshold", 20)),
+        )
         await self._send_config_dump(
             ctx,
             _("Image scan config"),
             [
-                (_("Enabled"), self._format_bool_setting(config.get("imagescan_enabled", False))),
-                (_("Channel"), channel.mention if channel else _("not set")),
+                (_("Enabled"), self._format_bool_setting(config.get("imagescan_detector_enabled", False))),
+                (_("Action"), config.get("imagescan_detector_action", "review")),
+                (_("Threshold"), f"{state['configured_threshold']} effective {state['effective_threshold']}"),
             ],
         )
 
@@ -5155,7 +6135,7 @@ class Honeypot(Cog):
                 (_("Logs channel"), self._format_channel_setting(ctx.guild, config.get("logs_channel"))),
                 (_("Review"), self._format_bool_setting(config.get("review_enabled", False))),
                 (_("Spam"), self._format_bool_setting(config.get("spam_enabled", False))),
-                (_("Image scan"), self._format_bool_setting(config.get("imagescan_enabled", False))),
+                (_("Image scan"), self._format_bool_setting(config.get("imagescan_detector_enabled", False))),
                 (_("Joinwatch"), self._format_bool_setting(config.get("joinwatch_enabled", False))),
                 (_("Joinwatch auto-role"), self._format_bool_setting(config.get("joinwatch_auto_role_enabled", False))),
                 (_("Bait role"), self._format_bool_setting(config.get("baitrole_enabled", False))),
