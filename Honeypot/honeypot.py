@@ -149,6 +149,35 @@ def is_image_attachment(attachment: discord.Attachment) -> bool:
     return any(filename.endswith(extension) for extension in IMAGE_ATTACHMENT_EXTENSIONS)
 
 
+def plan_imagescan_event_cache_cleanup(
+    files_root: Path,
+    guild_id: int,
+    *,
+    delete: bool = False,
+) -> dict[str, int]:
+    guild_root = files_root / str(guild_id)
+    plan = {
+        "event_dirs": 0,
+        "deleted_event_dirs": 0,
+        "files": 0,
+        "bytes": 0,
+    }
+    if not guild_root.exists():
+        return plan
+    for child in guild_root.iterdir():
+        if child.name == "samples" or not child.is_dir():
+            continue
+        files = [path for path in child.rglob("*") if path.is_file()]
+        plan["event_dirs"] += 1
+        plan["files"] += len(files)
+        plan["bytes"] += sum(path.stat().st_size for path in files)
+        if delete:
+            shutil.rmtree(child, ignore_errors=True)
+            if not child.exists():
+                plan["deleted_event_dirs"] += 1
+    return plan
+
+
 class MessageRef(typing.NamedTuple):
     channel_id: int
     message_id: int
@@ -4554,6 +4583,45 @@ class Honeypot(Cog):
     @debug.group(name="imagescan")
     async def debug_imagescan(self, ctx: commands.Context) -> None:
         """Maintenance tools for image scan training data."""
+
+    @debug_imagescan.command(name="cleanup_events")
+    async def imagescan_cleanup_events(self, ctx: commands.Context, confirm: str = None) -> None:
+        """Clean old image scan event files after dumping them."""
+        should_delete = (confirm or "").lower() == "confirm"
+        if confirm is not None and not should_delete:
+            await ctx.send(_("Use `confirm` to delete event files, or omit it for a dry run."))
+            return
+        plan = await asyncio.to_thread(
+            plan_imagescan_event_cache_cleanup,
+            self._imagescan_files_path,
+            ctx.guild.id,
+            delete=should_delete,
+        )
+        size_mb = plan["bytes"] / 1024 / 1024
+        if should_delete:
+            await ctx.send(
+                _(
+                    "Image scan event cleanup finished: deleted {deleted}/{event_dirs} event folder(s), "
+                    "{files} file(s), {size:.2f} MB. Samples were not touched."
+                ).format(
+                    deleted=plan["deleted_event_dirs"],
+                    event_dirs=plan["event_dirs"],
+                    files=plan["files"],
+                    size=size_mb,
+                )
+            )
+        else:
+            await ctx.send(
+                _(
+                    "Image scan event cleanup dry run: {event_dirs} event folder(s), "
+                    "{files} file(s), {size:.2f} MB. Run with `confirm` to delete. "
+                    "Samples will not be touched."
+                ).format(
+                    event_dirs=plan["event_dirs"],
+                    files=plan["files"],
+                    size=size_mb,
+                )
+            )
 
     @debug.command(name="reviewdump")
     async def review_dump(self, ctx: commands.Context) -> None:
