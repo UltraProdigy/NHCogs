@@ -11,14 +11,17 @@ from redbot.core import Config, commands
 from redbot.core.data_manager import cog_data_path
 
 from .activity_storage import (
+    ActivityLocation,
     ActivityConsistencyReport,
     ActivityDatabaseStats,
     ActivityStore,
     ChannelTimelineDay,
     ChannelUserCount,
     DailySummary,
+    DailyDominantLocation,
     TimelineDay,
     TopChannel,
+    UserChannelDistribution,
     UserStats,
 )
 from .sticky_roles import StickyRoleStore
@@ -461,7 +464,7 @@ class NHMisc(commands.Cog):
         await self.config.guild(ctx.guild).activity_history_retention_days.set(days)
         await ctx.send(f"Activity history retention set to {days}.")
 
-    @nhmisc.command(name="usermodstats")
+    @nhmisc.group(name="usermodstats", invoke_without_command=True)
     async def nhmisc_usermodstats(
         self, ctx: commands.Context, target: str, range_text: str
     ) -> None:
@@ -476,6 +479,60 @@ class NHMisc(commands.Cog):
 
         title = f"User activity: {self._format_user_reference(ctx.guild, user_id)}"
         await ctx.send(embed=self._build_user_stats_embed(title, stats, days))
+
+    @nhmisc_usermodstats.command(name="channel")
+    async def nhmisc_usermodstats_channel(
+        self,
+        ctx: commands.Context,
+        target: str,
+        channel_text: str,
+        range_text: str,
+    ) -> None:
+        """Show moderator-only message activity stats for a user in one channel."""
+        await self._require_activity_staff(ctx)
+        await self._close_stale_activity_days_for_guild(ctx.guild, send_reports=True)
+        user_id = self._parse_user_id(target)
+        days = self._parse_range_days(range_text)
+        days = await self._cap_detail_days(ctx.guild, days)
+        end_date = self._utc_today()
+        channel = self._resolve_text_channel_or_thread(ctx.guild, channel_text)
+        parent_channel_id = self._activity_parent_channel_id(channel)
+        thread_id = self._activity_thread_id(channel)
+        stats = await self._activity_store.get_user_channel_stats(
+            ctx.guild.id,
+            user_id,
+            parent_channel_id,
+            thread_id,
+            thread_id is None,
+            end_date,
+            days,
+        )
+
+        title = (
+            f"User channel activity: {self._format_user_reference(ctx.guild, user_id)} - "
+            f"{self._format_activity_location(ctx.guild, parent_channel_id, thread_id)}"
+        )
+        await ctx.send(embed=self._build_user_channel_stats_embed(title, stats, days))
+
+    @nhmisc_usermodstats.command(name="channels")
+    async def nhmisc_usermodstats_channels(
+        self, ctx: commands.Context, target: str, range_text: str
+    ) -> None:
+        """Show how a user's activity is distributed across channels."""
+        await self._require_activity_staff(ctx)
+        await self._close_stale_activity_days_for_guild(ctx.guild, send_reports=True)
+        user_id = self._parse_user_id(target)
+        days = self._parse_range_days(range_text)
+        days = await self._cap_detail_days(ctx.guild, days)
+        end_date = self._utc_today()
+        distribution = await self._activity_store.get_user_channel_distribution(
+            ctx.guild.id, user_id, end_date, days
+        )
+
+        title = f"User channel distribution: {self._format_user_reference(ctx.guild, user_id)}"
+        await ctx.send(
+            embed=self._build_user_channel_distribution_embed(ctx.guild, title, distribution, days)
+        )
 
     @nhmisc.command(name="chatchart")
     async def nhmisc_chatchart(self, ctx: commands.Context, days: int) -> None:
@@ -1222,6 +1279,21 @@ class NHMisc(commands.Cog):
             raise commands.UserFeedbackCheckFailure("Pass a user mention or raw Discord user ID.")
         return int(stripped)
 
+    def _resolve_text_channel_or_thread(
+        self, guild: discord.Guild, value: str
+    ) -> discord.TextChannel | discord.Thread:
+        stripped = value.strip()
+        if stripped.startswith("<#") and stripped.endswith(">"):
+            stripped = stripped[2:-1]
+        if not stripped.isdigit():
+            raise commands.UserFeedbackCheckFailure("Pass a channel/thread mention or raw channel ID.")
+
+        channel_id = int(stripped)
+        channel = guild.get_channel_or_thread(channel_id)
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return channel
+        raise commands.UserFeedbackCheckFailure("Channel or thread was not found in this server.")
+
     def _activity_parent_channel_id(self, channel: object) -> int:
         parent = getattr(channel, "parent", None)
         if isinstance(channel, discord.Thread) and parent is not None:
@@ -1235,6 +1307,13 @@ class NHMisc(commands.Cog):
 
     def _format_channel(self, channel_id: int) -> str:
         return f"<#{channel_id}>"
+
+    def _format_activity_location(
+        self, guild: discord.Guild, channel_id: int, thread_id: int | None
+    ) -> str:
+        if thread_id is None:
+            return self._format_channel(channel_id)
+        return f"{self._format_channel(channel_id)} / {self._format_channel(thread_id)}"
 
     def _format_user_reference(self, guild: discord.Guild, user_id: int) -> str:
         member = guild.get_member(user_id)
@@ -1260,6 +1339,31 @@ class NHMisc(commands.Cog):
             )
             for top in top_channels
         )
+
+    def _format_activity_locations(
+        self, guild: discord.Guild, locations: list[ActivityLocation], total_messages: int
+    ) -> str:
+        if not locations:
+            return "n/d"
+        lines: list[str] = []
+        listed_total = 0
+        for location in locations:
+            listed_total += location.message_count
+            percent = (
+                (location.message_count / total_messages) * 100.0
+                if total_messages
+                else 0.0
+            )
+            lines.append(
+                f"{location.rank}. "
+                f"{self._format_activity_location(guild, location.channel_id, location.thread_id)} - "
+                f"{self._format_int(location.message_count)} ({percent:.1f}%)"
+            )
+        other_count = total_messages - listed_total
+        if other_count > 0:
+            percent = (other_count / total_messages) * 100.0 if total_messages else 0.0
+            lines.append(f"Other - {self._format_int(other_count)} ({percent:.1f}%)")
+        return "\n".join(lines)
 
     def _build_daily_summary_embed(
         self, summary: DailySummary, title_prefix: str
@@ -1502,6 +1606,73 @@ class NHMisc(commands.Cog):
         )
         return embed
 
+    def _build_user_channel_stats_embed(
+        self, title: str, stats: UserStats, days: int
+    ) -> discord.Embed:
+        embed = discord.Embed(title=title, color=discord.Color.blue())
+        embed.add_field(name="Range", value=f"last {days} days", inline=True)
+        embed.add_field(name="Total messages", value=self._format_int(stats.total_messages), inline=True)
+        embed.add_field(name="Active days", value=self._format_int(stats.active_days), inline=True)
+        embed.add_field(
+            name="Average per active day",
+            value=f"{stats.average_per_active_day:.1f}",
+            inline=True,
+        )
+        embed.add_field(
+            name="Daily breakdown",
+            value=f"```text\n{self._format_daily_rows(stats.date_rows)}\n```",
+            inline=False,
+        )
+        return embed
+
+    def _build_user_channel_distribution_embed(
+        self,
+        guild: discord.Guild,
+        title: str,
+        distribution: UserChannelDistribution,
+        days: int,
+    ) -> discord.Embed:
+        embed = discord.Embed(title=title, color=discord.Color.blue())
+        embed.add_field(name="Range", value=f"last {days} days", inline=True)
+        embed.add_field(
+            name="Total messages",
+            value=self._format_int(distribution.total_messages),
+            inline=True,
+        )
+        embed.add_field(
+            name="Active days",
+            value=self._format_int(distribution.active_days),
+            inline=True,
+        )
+        embed.add_field(
+            name="Locations used",
+            value=self._format_int(distribution.locations_used),
+            inline=True,
+        )
+        top_location = distribution.top_locations[0] if distribution.top_locations else None
+        embed.add_field(
+            name="Top location",
+            value=(
+                self._format_activity_location(guild, top_location.channel_id, top_location.thread_id)
+                if top_location
+                else "n/d"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Top locations in range",
+            value=self._format_activity_locations(
+                guild, distribution.top_locations, distribution.total_messages
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Daily dominant location",
+            value=self._format_daily_dominant_location_rows(guild, distribution.date_rows),
+            inline=False,
+        )
+        return embed
+
     def _build_selfchart_embed(
         self, member: discord.Member | discord.User, stats: UserStats, days: int
     ) -> discord.Embed:
@@ -1534,6 +1705,39 @@ class NHMisc(commands.Cog):
             value = "n/d" if count is None else str(count)
             lines.append(f"{day.isoformat()} {value}")
         return "\n".join(lines)
+
+    def _format_daily_dominant_location_rows(
+        self, guild: discord.Guild, rows: list[DailyDominantLocation]
+    ) -> str:
+        lines: list[str] = []
+        for row in rows:
+            if row.total_messages is None:
+                lines.append(f"{row.date_utc.isoformat()}: n/d")
+            elif row.total_messages == 0:
+                lines.append(f"{row.date_utc.isoformat()}: 0")
+            elif row.channel_id is not None and row.location_messages is not None:
+                percent = (row.location_messages / row.total_messages) * 100.0
+                lines.append(
+                    f"{row.date_utc.isoformat()}: "
+                    f"{self._format_int(row.total_messages)} msgs, "
+                    f"{self._format_activity_location(guild, row.channel_id, row.thread_id)} "
+                    f"{self._format_int(row.location_messages)} ({percent:.1f}%)"
+                )
+            else:
+                lines.append(f"{row.date_utc.isoformat()}: {self._format_int(row.total_messages)} msgs")
+        return self._join_limited_lines(lines)
+
+    def _join_limited_lines(self, lines: list[str], limit: int = 1000) -> str:
+        output: list[str] = []
+        current_length = 0
+        for line in lines:
+            extra_length = len(line) + (1 if output else 0)
+            if current_length + extra_length > limit:
+                output.append("...")
+                break
+            output.append(line)
+            current_length += extra_length
+        return "\n".join(output) if output else "n/d"
 
     def _build_chatchart_file(
         self, guild: discord.Guild, counts: list[ChannelUserCount], days: int

@@ -59,6 +59,32 @@ class ChannelTimelineDay:
 
 
 @dataclass(frozen=True)
+class ActivityLocation:
+    channel_id: int
+    thread_id: int | None
+    message_count: int
+    rank: int
+
+
+@dataclass(frozen=True)
+class DailyDominantLocation:
+    date_utc: date
+    total_messages: int | None
+    channel_id: int | None
+    thread_id: int | None
+    location_messages: int | None
+
+
+@dataclass(frozen=True)
+class UserChannelDistribution:
+    date_rows: list[DailyDominantLocation]
+    total_messages: int
+    active_days: int
+    locations_used: int
+    top_locations: list[ActivityLocation]
+
+
+@dataclass(frozen=True)
 class ActivityConsistencyReport:
     user_day_mismatches: int
     channel_day_mismatches: int
@@ -166,6 +192,46 @@ class ActivityStore:
         async with self._lock:
             return await asyncio.to_thread(
                 self._get_user_stats_sync, guild_id, user_id, end_date_utc, days
+            )
+
+    async def get_user_channel_stats(
+        self,
+        guild_id: int,
+        user_id: int,
+        channel_id: int,
+        thread_id: int | None,
+        include_threads: bool,
+        end_date_utc: date,
+        days: int,
+    ) -> UserStats:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._get_user_channel_stats_sync,
+                guild_id,
+                user_id,
+                channel_id,
+                thread_id,
+                include_threads,
+                end_date_utc,
+                days,
+            )
+
+    async def get_user_channel_distribution(
+        self,
+        guild_id: int,
+        user_id: int,
+        end_date_utc: date,
+        days: int,
+        limit: int = 10,
+    ) -> UserChannelDistribution:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._get_user_channel_distribution_sync,
+                guild_id,
+                user_id,
+                end_date_utc,
+                days,
+                limit,
             )
 
     async def get_channel_user_counts(
@@ -790,6 +856,198 @@ class ActivityStore:
                 for index, (channel_id, count) in enumerate(top_rows)
             ],
         )
+
+    def _get_user_channel_stats_sync(
+        self,
+        guild_id: int,
+        user_id: int,
+        channel_id: int,
+        thread_id: int | None,
+        include_threads: bool,
+        end_date_utc: date,
+        days: int,
+    ) -> UserStats:
+        start_date = date.fromordinal(end_date_utc.toordinal() - days + 1)
+        start = start_date.isoformat()
+        end = end_date_utc.isoformat()
+        channel_filter, channel_params = self._user_channel_filter(
+            channel_id, thread_id, include_threads
+        )
+        with self._connection() as conn:
+            count_rows = conn.execute(
+                f"""
+                SELECT date_utc, SUM(message_count)
+                FROM activity_user_channel_day
+                WHERE guild_id = ? AND user_id = ? {channel_filter}
+                    AND date_utc BETWEEN ? AND ?
+                GROUP BY date_utc
+                """,
+                (guild_id, user_id, *channel_params, start, end),
+            ).fetchall()
+            counts = {date.fromisoformat(row[0]): int(row[1]) for row in count_rows}
+            available_days = self._load_available_detail_days(conn, guild_id, start_date, end_date_utc)
+            date_rows: list[tuple[date, int | None]] = []
+            for offset in range(days):
+                day = date.fromordinal(end_date_utc.toordinal() - offset)
+                if day in counts:
+                    value: int | None = counts[day]
+                elif day in available_days:
+                    value = 0
+                else:
+                    value = None
+                date_rows.append((day, value))
+
+        numeric_counts = [value for _, value in date_rows if value is not None]
+        total_messages = sum(numeric_counts)
+        active_days = sum(1 for value in numeric_counts if value > 0)
+        return UserStats(
+            date_rows=date_rows,
+            total_messages=total_messages,
+            active_days=active_days,
+            average_per_active_day=(
+                float(total_messages) / float(active_days) if active_days else 0.0
+            ),
+            top_channels=[],
+        )
+
+    def _get_user_channel_distribution_sync(
+        self,
+        guild_id: int,
+        user_id: int,
+        end_date_utc: date,
+        days: int,
+        limit: int,
+    ) -> UserChannelDistribution:
+        start_date = date.fromordinal(end_date_utc.toordinal() - days + 1)
+        start = start_date.isoformat()
+        end = end_date_utc.isoformat()
+        with self._connection() as conn:
+            location_rows = conn.execute(
+                """
+                SELECT channel_id, thread_id, SUM(message_count) AS total
+                FROM activity_user_channel_day
+                WHERE guild_id = ? AND user_id = ? AND date_utc BETWEEN ? AND ?
+                GROUP BY channel_id, thread_id
+                ORDER BY total DESC, channel_id ASC, thread_id ASC
+                """,
+                (guild_id, user_id, start, end),
+            ).fetchall()
+            daily_rows = conn.execute(
+                """
+                WITH daily_locations AS (
+                    SELECT
+                        date_utc,
+                        channel_id,
+                        thread_id,
+                        SUM(message_count) AS location_total
+                    FROM activity_user_channel_day
+                    WHERE guild_id = ? AND user_id = ? AND date_utc BETWEEN ? AND ?
+                    GROUP BY date_utc, channel_id, thread_id
+                ),
+                daily_totals AS (
+                    SELECT date_utc, SUM(location_total) AS day_total
+                    FROM daily_locations
+                    GROUP BY date_utc
+                ),
+                ranked AS (
+                    SELECT
+                        daily_locations.date_utc,
+                        daily_totals.day_total,
+                        daily_locations.channel_id,
+                        daily_locations.thread_id,
+                        daily_locations.location_total,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY daily_locations.date_utc
+                            ORDER BY daily_locations.location_total DESC,
+                                daily_locations.channel_id ASC,
+                                daily_locations.thread_id ASC
+                        ) AS rank
+                    FROM daily_locations
+                    JOIN daily_totals USING (date_utc)
+                )
+                SELECT date_utc, day_total, channel_id, thread_id, location_total
+                FROM ranked
+                WHERE rank = 1
+                """,
+                (guild_id, user_id, start, end),
+            ).fetchall()
+            available_days = self._load_available_detail_days(conn, guild_id, start_date, end_date_utc)
+
+        daily = {
+            date.fromisoformat(row[0]): (
+                int(row[1]),
+                int(row[2]),
+                self._external_thread_id(int(row[3])),
+                int(row[4]),
+            )
+            for row in daily_rows
+        }
+        date_rows: list[DailyDominantLocation] = []
+        for offset in range(days):
+            day = date.fromordinal(end_date_utc.toordinal() - offset)
+            if day in daily:
+                total, top_channel_id, top_thread_id, location_total = daily[day]
+                date_rows.append(
+                    DailyDominantLocation(
+                        date_utc=day,
+                        total_messages=total,
+                        channel_id=top_channel_id,
+                        thread_id=top_thread_id,
+                        location_messages=location_total,
+                    )
+                )
+            elif day in available_days:
+                date_rows.append(
+                    DailyDominantLocation(
+                        date_utc=day,
+                        total_messages=0,
+                        channel_id=None,
+                        thread_id=None,
+                        location_messages=None,
+                    )
+                )
+            else:
+                date_rows.append(
+                    DailyDominantLocation(
+                        date_utc=day,
+                        total_messages=None,
+                        channel_id=None,
+                        thread_id=None,
+                        location_messages=None,
+                    )
+                )
+
+        top_locations = [
+            ActivityLocation(
+                channel_id=int(channel_id),
+                thread_id=self._external_thread_id(int(thread_id)),
+                message_count=int(count),
+                rank=index + 1,
+            )
+            for index, (channel_id, thread_id, count) in enumerate(location_rows[:limit])
+        ]
+        numeric_counts = [row.total_messages for row in date_rows if row.total_messages is not None]
+        total_messages = sum(numeric_counts)
+        active_days = sum(1 for value in numeric_counts if value > 0)
+        return UserChannelDistribution(
+            date_rows=date_rows,
+            total_messages=total_messages,
+            active_days=active_days,
+            locations_used=len(location_rows),
+            top_locations=top_locations,
+        )
+
+    def _user_channel_filter(
+        self, channel_id: int, thread_id: int | None, include_threads: bool
+    ) -> tuple[str, tuple[int, ...]]:
+        if thread_id is not None:
+            return "AND channel_id = ? AND thread_id = ?", (channel_id, thread_id)
+        if include_threads:
+            return "AND channel_id = ?", (channel_id,)
+        return "AND channel_id = ? AND thread_id = ?", (channel_id, NO_THREAD_ID)
+
+    def _external_thread_id(self, thread_id: int) -> int | None:
+        return None if thread_id == NO_THREAD_ID else thread_id
 
     def _load_available_detail_days(
         self,

@@ -248,6 +248,23 @@ channels, and a daily breakdown. Missing retained data is shown as `n/d`; real z
 shown as `0`.
 
 ```ini
+[p]nhmisc usermodstats channel @User #channel 30
+```
+
+Shows the user's activity in one channel. When a parent text channel is provided, the
+command includes direct messages in that channel and messages in all threads under it.
+When a thread is provided, it only shows that thread. The output includes total messages,
+active days, average messages per active day, and a daily breakdown.
+
+```ini
+[p]nhmisc usermodstats channels @User 30
+```
+
+Shows how the user's activity is distributed across channels and threads. Threads are
+shown as separate locations. The output includes total messages, active days, locations
+used, top locations in the range, and the dominant location for each retained day.
+
+```ini
 [p]nhmisc chatchart 7
 ```
 
