@@ -5258,18 +5258,32 @@ class Honeypot(Cog):
             return
         progress = await ctx.send(_("Importing zip file(s)..."))
         inserted = duplicates = conflicts = errors = skipped = 0
+        error_notes: list[str] = []
         inserted_sample_ids: list[str] = []
         processed = 0
         for attachment in zip_attachments:
+            attachment_name = attachment.filename or "attachment.zip"
             try:
-                archive_data = await attachment.read(use_cached=True)
-            except (discord.HTTPException, discord.Forbidden, discord.NotFound, TypeError):
-                errors += 1
-                continue
+                archive_data = await attachment.read()
+            except (discord.HTTPException, discord.Forbidden, discord.NotFound, TypeError) as primary_exc:
+                try:
+                    archive_data = await attachment.read(use_cached=True)
+                except (discord.HTTPException, discord.Forbidden, discord.NotFound, TypeError) as cached_exc:
+                    errors += 1
+                    error_notes.append(
+                        _("{filename}: download failed ({error})").format(
+                            filename=attachment_name,
+                            error=type(cached_exc if cached_exc is not None else primary_exc).__name__,
+                        )
+                    )
+                    continue
             try:
                 archive = zipfile.ZipFile(io.BytesIO(archive_data))
             except zipfile.BadZipFile:
                 errors += 1
+                error_notes.append(
+                    _("{filename}: invalid zip file").format(filename=attachment_name)
+                )
                 continue
             with archive:
                 for info in archive.infolist():
@@ -5325,20 +5339,24 @@ class Honeypot(Cog):
             )
             await progress.edit(content=_("Rejected: TP/FP overlap.\nModel unchanged."))
             return
-        await progress.edit(
-            content=_(
-                "Import finished: {inserted} added, {duplicates} already known, "
-                "{conflicts} conflicts, {errors} failed, {skipped} skipped. "
-                "Effective threshold: {threshold}"
-            ).format(
-                inserted=inserted,
-                duplicates=duplicates,
-                conflicts=conflicts,
-                errors=errors,
-                skipped=skipped,
-                threshold=state["effective_threshold"],
-            )
+        final_message = _(
+            "Import finished: {inserted} added, {duplicates} already known, "
+            "{conflicts} conflicts, {errors} failed, {skipped} skipped. "
+            "Effective threshold: {threshold}"
+        ).format(
+            inserted=inserted,
+            duplicates=duplicates,
+            conflicts=conflicts,
+            errors=errors,
+            skipped=skipped,
+            threshold=state["effective_threshold"],
         )
+        if error_notes:
+            shown_errors = "\n".join(f"- {note}" for note in error_notes[:5])
+            if len(error_notes) > 5:
+                shown_errors += _("\n- and {count} more").format(count=len(error_notes) - 5)
+            final_message = f"{final_message}\n{_('Failed:')}\n{shown_errors}"
+        await progress.edit(content=final_message)
 
     @honeypot.group()
     async def firstpost(self, ctx: commands.Context) -> None:
