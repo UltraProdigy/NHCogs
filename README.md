@@ -219,7 +219,7 @@ existing summary rows.
 
 Checks today's open activity aggregates for internal consistency. This compares the
 canonical per-user/channel/thread rows with the faster per-user and per-channel cache
-rows. It does not read Honeypot data.
+rows.
 
 ```ini
 [p]nhmisc activity dbsize
@@ -310,7 +310,6 @@ aggregate counts and channel IDs, but not user IDs.
 The detailed activity row is keyed by UTC date, user ID, parent channel ID, thread ID,
 and message count. A user can have multiple rows for the same day when they post in
 multiple channels or threads. NHMisc does not store message content, message IDs, jump
-URLs, attachment URLs, embeds, or deleted/edited message state. Honeypot's short-lived
-moderation/deletion cache is separate and is not used for NHMisc statistics.
+URLs, attachment URLs, embeds, or deleted/edited message state.
 
 Sticky roles are stored in a local SQLite database as guild IDs, user IDs, and role IDs.
