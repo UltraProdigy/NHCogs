@@ -146,7 +146,7 @@ Daily summaries include:
 - number of active channels;
 - average messages per active user;
 - peak hour shown as a Discord-localized timestamp;
-- top 3 channels as Discord channel mentions.
+- top 5 channels as Discord channel mentions.
 
 ### Activity Commands
 
@@ -176,6 +176,15 @@ example:
 
 If a retained row does not exist for a day, the table shows `n/d`. If data exists and the
 value is zero, it shows `0`.
+
+```ini
+[p]nhmisc activity channelstats #channel 30
+```
+
+Shows day-by-day message activity for one channel. Current and detail-retained days use
+per-user/channel detail rows. Closed days use daily channel summaries retained by
+history retention. Days with no retained data show `n/d`; retained days with no messages
+show `0`.
 
 ```ini
 [p]nhmisc activity retention 31

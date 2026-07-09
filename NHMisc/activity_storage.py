@@ -52,6 +52,12 @@ class ChannelUserCount:
     message_count: int
 
 
+@dataclass(frozen=True)
+class ChannelTimelineDay:
+    date_utc: date
+    message_count: int | None
+
+
 class ActivityStore:
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -112,7 +118,7 @@ class ActivityStore:
             )
 
     async def get_timeline_top_channels(
-        self, guild_id: int, end_date_utc: date, days: int, limit: int = 3
+        self, guild_id: int, end_date_utc: date, days: int, limit: int = 5
     ) -> list[TopChannel]:
         async with self._lock:
             return await asyncio.to_thread(
@@ -145,6 +151,24 @@ class ActivityStore:
                 days,
             )
 
+    async def get_channel_timeline(
+        self,
+        guild_id: int,
+        channel_id: int,
+        thread_id: int | None,
+        end_date_utc: date,
+        days: int,
+    ) -> list[ChannelTimelineDay]:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._get_channel_timeline_sync,
+                guild_id,
+                channel_id,
+                thread_id,
+                end_date_utc,
+                days,
+            )
+
     async def count_detail_rows_older_than(self, guild_id: int, cutoff_date_utc: date) -> int:
         async with self._lock:
             return await asyncio.to_thread(
@@ -165,7 +189,7 @@ class ActivityStore:
 
     async def count_history_rows_older_than(
         self, guild_id: int, cutoff_date_utc: date
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         async with self._lock:
             return await asyncio.to_thread(
                 self._count_history_rows_older_than_sync, guild_id, cutoff_date_utc
@@ -173,13 +197,13 @@ class ActivityStore:
 
     async def prune_history_rows_older_than(
         self, guild_id: int, cutoff_date_utc: date
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         async with self._lock:
             return await asyncio.to_thread(
                 self._prune_history_rows_older_than_sync, guild_id, cutoff_date_utc
             )
 
-    async def delete_history_for_date(self, guild_id: int, date_utc: date) -> tuple[int, int]:
+    async def delete_history_for_date(self, guild_id: int, date_utc: date) -> tuple[int, int, int]:
         async with self._lock:
             return await asyncio.to_thread(
                 self._delete_history_for_date_sync, guild_id, date_utc
@@ -261,6 +285,15 @@ class ActivityStore:
                     PRIMARY KEY (guild_id, date_utc, rank)
                 );
 
+                CREATE TABLE IF NOT EXISTS activity_daily_channel_summary (
+                    guild_id INTEGER NOT NULL,
+                    date_utc TEXT NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    thread_id INTEGER NOT NULL,
+                    message_count INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, date_utc, channel_id, thread_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS activity_user_channel_day (
                     guild_id INTEGER NOT NULL,
                     date_utc TEXT NOT NULL,
@@ -279,6 +312,8 @@ class ActivityStore:
                     ON activity_daily_summary (guild_id, date_utc);
                 CREATE INDEX IF NOT EXISTS idx_activity_daily_top_channels_date
                     ON activity_daily_top_channels (guild_id, date_utc);
+                CREATE INDEX IF NOT EXISTS idx_activity_daily_channel_summary_lookup
+                    ON activity_daily_channel_summary (guild_id, channel_id, date_utc);
                 """
             )
 
@@ -443,7 +478,7 @@ class ActivityStore:
             WHERE guild_id = ? AND date_utc = ?
             GROUP BY channel_id
             ORDER BY total DESC, channel_id ASC
-            LIMIT 3
+            LIMIT 5
             """,
             (guild_id, date_key),
         ).fetchall()
@@ -520,6 +555,20 @@ class ActivityStore:
                 (guild_id, date_key, top.channel_id, top.message_count, top.rank)
                 for top in summary.top_channels
             ],
+        )
+        conn.execute(
+            "DELETE FROM activity_daily_channel_summary WHERE guild_id = ? AND date_utc = ?",
+            (guild_id, date_key),
+        )
+        conn.execute(
+            """
+            INSERT INTO activity_daily_channel_summary
+                (guild_id, date_utc, channel_id, thread_id, message_count)
+            SELECT guild_id, date_utc, channel_id, thread_id, message_count
+            FROM activity_channel_day
+            WHERE guild_id = ? AND date_utc = ?
+            """,
+            (guild_id, date_key),
         )
 
     def _delete_strict_daily_rows_with_conn(
@@ -611,7 +660,7 @@ class ActivityStore:
             rows = conn.execute(
                 """
                 SELECT channel_id, SUM(message_count) AS total
-                FROM activity_daily_top_channels
+                FROM activity_daily_channel_summary
                 WHERE guild_id = ? AND date_utc BETWEEN ? AND ?
                 GROUP BY channel_id
                 ORDER BY total DESC, channel_id ASC
@@ -619,6 +668,18 @@ class ActivityStore:
                 """,
                 (guild_id, start, end, limit),
             ).fetchall()
+            if not rows:
+                rows = conn.execute(
+                    """
+                    SELECT channel_id, SUM(message_count) AS total
+                    FROM activity_daily_top_channels
+                    WHERE guild_id = ? AND date_utc BETWEEN ? AND ?
+                    GROUP BY channel_id
+                    ORDER BY total DESC, channel_id ASC
+                    LIMIT ?
+                    """,
+                    (guild_id, start, end, limit),
+                ).fetchall()
         return [
             TopChannel(int(channel_id), int(count), index + 1)
             for index, (channel_id, count) in enumerate(rows)
@@ -738,6 +799,62 @@ class ActivityStore:
             ).fetchall()
         return [ChannelUserCount(int(user_id), int(count)) for user_id, count in rows]
 
+    def _get_channel_timeline_sync(
+        self,
+        guild_id: int,
+        channel_id: int,
+        thread_id: int | None,
+        end_date_utc: date,
+        days: int,
+    ) -> list[ChannelTimelineDay]:
+        start_date = date.fromordinal(end_date_utc.toordinal() - days + 1)
+        start = start_date.isoformat()
+        end = end_date_utc.isoformat()
+        params: tuple[object, ...]
+        thread_filter = ""
+        if thread_id is not None:
+            thread_filter = "AND thread_id = ?"
+            params = (guild_id, channel_id, thread_id, start, end)
+        else:
+            params = (guild_id, channel_id, start, end)
+
+        with self._connection() as conn:
+            summary_rows = conn.execute(
+                f"""
+                SELECT date_utc, SUM(message_count)
+                FROM activity_daily_channel_summary
+                WHERE guild_id = ? AND channel_id = ? {thread_filter} AND date_utc BETWEEN ? AND ?
+                GROUP BY date_utc
+                """,
+                params,
+            ).fetchall()
+            detail_rows = conn.execute(
+                f"""
+                SELECT date_utc, SUM(message_count)
+                FROM activity_user_channel_day
+                WHERE guild_id = ? AND channel_id = ? {thread_filter} AND date_utc BETWEEN ? AND ?
+                GROUP BY date_utc
+                """,
+                params,
+            ).fetchall()
+            available_days = self._load_available_detail_days(
+                conn, guild_id, start_date, end_date_utc
+            )
+
+        counts = {date.fromisoformat(row[0]): int(row[1]) for row in detail_rows}
+        counts.update({date.fromisoformat(row[0]): int(row[1]) for row in summary_rows})
+        date_rows: list[ChannelTimelineDay] = []
+        for offset in range(days):
+            day = date.fromordinal(end_date_utc.toordinal() - offset)
+            if day in counts:
+                value: int | None = counts[day]
+            elif day in available_days:
+                value = 0
+            else:
+                value = None
+            date_rows.append(ChannelTimelineDay(day, value))
+        return date_rows
+
     def _count_rows_older_than_sync(
         self, table: str, guild_id: int, cutoff_date_utc: date
     ) -> int:
@@ -760,7 +877,7 @@ class ActivityStore:
 
     def _count_history_rows_older_than_sync(
         self, guild_id: int, cutoff_date_utc: date
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         with self._connection() as conn:
             summary_count = conn.execute(
                 """
@@ -778,11 +895,19 @@ class ActivityStore:
                 """,
                 (guild_id, cutoff_date_utc.isoformat()),
             ).fetchone()[0]
-        return int(summary_count or 0), int(top_count or 0)
+            channel_count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM activity_daily_channel_summary
+                WHERE guild_id = ? AND date_utc < ?
+                """,
+                (guild_id, cutoff_date_utc.isoformat()),
+            ).fetchone()[0]
+        return int(summary_count or 0), int(top_count or 0), int(channel_count or 0)
 
     def _prune_history_rows_older_than_sync(
         self, guild_id: int, cutoff_date_utc: date
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         with self._connection() as conn:
             summary_cursor = conn.execute(
                 """
@@ -798,9 +923,20 @@ class ActivityStore:
                 """,
                 (guild_id, cutoff_date_utc.isoformat()),
             )
-        return int(summary_cursor.rowcount or 0), int(top_cursor.rowcount or 0)
+            channel_cursor = conn.execute(
+                """
+                DELETE FROM activity_daily_channel_summary
+                WHERE guild_id = ? AND date_utc < ?
+                """,
+                (guild_id, cutoff_date_utc.isoformat()),
+            )
+        return (
+            int(summary_cursor.rowcount or 0),
+            int(top_cursor.rowcount or 0),
+            int(channel_cursor.rowcount or 0),
+        )
 
-    def _delete_history_for_date_sync(self, guild_id: int, date_utc: date) -> tuple[int, int]:
+    def _delete_history_for_date_sync(self, guild_id: int, date_utc: date) -> tuple[int, int, int]:
         with self._connection() as conn:
             summary_cursor = conn.execute(
                 "DELETE FROM activity_daily_summary WHERE guild_id = ? AND date_utc = ?",
@@ -810,4 +946,12 @@ class ActivityStore:
                 "DELETE FROM activity_daily_top_channels WHERE guild_id = ? AND date_utc = ?",
                 (guild_id, date_utc.isoformat()),
             )
-        return int(summary_cursor.rowcount or 0), int(top_cursor.rowcount or 0)
+            channel_cursor = conn.execute(
+                "DELETE FROM activity_daily_channel_summary WHERE guild_id = ? AND date_utc = ?",
+                (guild_id, date_utc.isoformat()),
+            )
+        return (
+            int(summary_cursor.rowcount or 0),
+            int(top_cursor.rowcount or 0),
+            int(channel_cursor.rowcount or 0),
+        )

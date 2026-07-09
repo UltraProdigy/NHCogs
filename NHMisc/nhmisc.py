@@ -12,6 +12,7 @@ from redbot.core.data_manager import cog_data_path
 
 from .activity_storage import (
     ActivityStore,
+    ChannelTimelineDay,
     ChannelUserCount,
     DailySummary,
     TimelineDay,
@@ -345,6 +346,33 @@ class NHMisc(commands.Cog):
         )
         await ctx.send(embed=self._build_timeline_embed(timeline, top_channels, days))
 
+    @nhmisc_activity.command(name="channelstats")
+    async def nhmisc_activity_channelstats(
+        self, ctx: commands.Context, channel: discord.TextChannel, days: int
+    ) -> None:
+        """Show message activity for a channel day by day."""
+        await self._require_activity_staff(ctx)
+        await self._close_stale_activity_days_for_guild(ctx.guild, send_reports=True)
+        if days < 1:
+            raise commands.UserFeedbackCheckFailure("Days must be at least 1.")
+
+        config = await self.config.guild(ctx.guild).all()
+        history_retention = int(config["activity_history_retention_days"])
+        detail_retention = max(1, int(config["activity_detail_retention_days"]))
+        if history_retention == 0:
+            days = min(days, detail_retention)
+        elif history_retention > 0:
+            days = min(days, max(history_retention, detail_retention))
+
+        timeline = await self._activity_store.get_channel_timeline(
+            ctx.guild.id,
+            channel.id,
+            None,
+            self._utc_today(),
+            days,
+        )
+        await ctx.send(embed=self._build_channel_timeline_embed(channel, timeline, days))
+
     @nhmisc_activity.command(name="retention")
     async def nhmisc_activity_retention(self, ctx: commands.Context, days: int) -> None:
         """Set how many days of per-user/channel detail rows are retained."""
@@ -383,28 +411,34 @@ class NHMisc(commands.Cog):
             )
 
         cutoff = self._history_retention_cutoff(days)
-        summary_rows = top_rows = 0
+        summary_rows = top_rows = channel_rows = 0
         if cutoff is not None:
-            summary_rows, top_rows = await self._activity_store.count_history_rows_older_than(
-                ctx.guild.id, cutoff
-            )
-        if summary_rows or top_rows:
+            (
+                summary_rows,
+                top_rows,
+                channel_rows,
+            ) = await self._activity_store.count_history_rows_older_than(ctx.guild.id, cutoff)
+        if summary_rows or top_rows or channel_rows:
             confirmed = await self._confirm_retention_delete(
                 ctx,
                 (
                     f"Changing history retention to {days} will permanently delete "
-                    f"{summary_rows} daily summary rows and {top_rows} top-channel rows "
+                    f"{summary_rows} daily summary rows, {top_rows} top-channel rows, "
+                    f"and {channel_rows} channel summary rows "
                     f"older than {cutoff.isoformat()}.\n"
                     f"Reply with `{RETENTION_CONFIRMATION}` to continue."
                 ),
             )
             if not confirmed:
                 return
-            deleted_summary, deleted_top = await self._activity_store.prune_history_rows_older_than(
-                ctx.guild.id, cutoff
-            )
+            (
+                deleted_summary,
+                deleted_top,
+                deleted_channel,
+            ) = await self._activity_store.prune_history_rows_older_than(ctx.guild.id, cutoff)
             await ctx.send(
-                f"Deleted {deleted_summary} daily summary rows and {deleted_top} top-channel rows."
+                f"Deleted {deleted_summary} daily summary rows, {deleted_top} top-channel rows, "
+                f"and {deleted_channel} channel summary rows."
             )
 
         await self.config.guild(ctx.guild).activity_history_retention_days.set(days)
@@ -1330,6 +1364,44 @@ class NHMisc(commands.Cog):
             value=self._format_top_channels(top_channels),
             inline=False,
         )
+        return embed
+
+    def _build_channel_timeline_embed(
+        self, channel: discord.TextChannel, timeline: list[ChannelTimelineDay], days: int
+    ) -> discord.Embed:
+        lines = ["Date       Msgs"]
+        numeric_counts: list[int] = []
+        for day in timeline:
+            if day.message_count is None:
+                value = "n/d"
+            else:
+                numeric_counts.append(day.message_count)
+                value = str(day.message_count)
+            lines.append(f"{day.date_utc.isoformat()} {value}")
+
+        table = "\n".join(lines)
+        if len(table) > 3900:
+            visible_lines = lines[:120]
+            visible_lines.append("...")
+            table = "\n".join(visible_lines)
+
+        embed = discord.Embed(
+            title=f"Channel activity - {channel.name} - last {days} days",
+            color=discord.Color.blue(),
+            description=f"```text\n{table}\n```",
+        )
+        if numeric_counts:
+            total = sum(numeric_counts)
+            active_days = sum(1 for value in numeric_counts if value > 0)
+            embed.add_field(name="Total messages", value=self._format_int(total), inline=True)
+            embed.add_field(name="Active days", value=self._format_int(active_days), inline=True)
+            embed.add_field(
+                name="Average per active day",
+                value=f"{(total / active_days) if active_days else 0.0:.1f}",
+                inline=True,
+            )
+        else:
+            embed.add_field(name="Total messages", value="n/d", inline=True)
         return embed
 
     def _build_user_stats_embed(self, title: str, stats: UserStats, days: int) -> discord.Embed:
