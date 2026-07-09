@@ -1,6 +1,7 @@
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 from importlib import util
 from pathlib import Path
 
@@ -167,6 +168,84 @@ class ImageScanCleanupTests(unittest.TestCase):
         self.assertEqual(plan["deleted_event_dirs"], 1)
         self.assertFalse((guild_root / "111").exists())
         self.assertTrue((guild_root / "samples" / "uploads" / "tp.png").exists())
+
+    def test_hash_diff_is_compact(self) -> None:
+        self.assertEqual(honeypot.format_image_hash_diff(0, 20), "0/20")
+
+    def test_matched_attachment_summary_lists_all_matches(self) -> None:
+        matches = [
+            (SimpleNamespace(filename="one.png"), {"score": 0, "threshold": 20}, {}),
+            (SimpleNamespace(filename="two.jpg"), {"score": 3, "threshold": 20}, {}),
+        ]
+
+        self.assertEqual(
+            honeypot.format_imagescan_matched_attachments(matches),
+            "one.png\ntwo.jpg",
+        )
+
+    def test_sample_identifier_matches_sample_id_full_sha_or_unique_sha_prefix(self) -> None:
+        rows = [
+            {"sample_id": "upload-aaa", "sha256": "aaaabbbbccccdddd"},
+            {"sample_id": "upload-eee", "sha256": "eeeeffff00001111"},
+        ]
+
+        self.assertEqual(honeypot.match_imagescan_sample_identifier(rows, "upload-aaa"), rows[0])
+        self.assertEqual(honeypot.match_imagescan_sample_identifier(rows, "eeeeffff00001111"), rows[1])
+        self.assertEqual(honeypot.match_imagescan_sample_identifier(rows, "aaaabb"), rows[0])
+
+    def test_sample_identifier_returns_none_for_missing_or_ambiguous_prefix(self) -> None:
+        rows = [
+            {"sample_id": "upload-1", "sha256": "abcdef111111"},
+            {"sample_id": "upload-2", "sha256": "abcdef222222"},
+        ]
+
+        self.assertIsNone(honeypot.match_imagescan_sample_identifier(rows, "missing"))
+        self.assertIsNone(honeypot.match_imagescan_sample_identifier(rows, "abcdef"))
+
+    def test_image_detection_field_text_is_explicit(self) -> None:
+        self.assertEqual(honeypot.format_image_detection_status("no_images"), "No image attachments")
+        self.assertEqual(honeypot.format_image_detection_status("detected"), "Detected, already known")
+        self.assertEqual(honeypot.format_image_detection_status("queued"), "Not detected, feedback queued")
+        self.assertEqual(honeypot.format_image_detection_status("not_checked"), "Not checked")
+
+    def test_sample_file_path_must_stay_under_imagescan_root(self) -> None:
+        root = Path.cwd() / "imagescan_files"
+        self.assertTrue(honeypot.is_imagescan_sample_path_safe(root, root / "123" / "samples" / "x.png"))
+        self.assertFalse(honeypot.is_imagescan_sample_path_safe(root, root.parent / "other" / "x.png"))
+
+    def test_storage_summary_counts_active_files_and_pruned_samples(self) -> None:
+        rows = [
+            {"active": 1, "file_path": "a.png", "file_size_bytes": 10},
+            {"active": 1, "file_path": None, "file_size_bytes": 0},
+            {"active": 0, "file_path": "old.png", "file_size_bytes": 99},
+        ]
+
+        self.assertEqual(
+            honeypot.summarize_imagescan_sample_storage(rows),
+            {"active_with_file": 1, "active_without_file": 1, "file_bytes": 10},
+        )
+
+    def test_learning_status_detected_when_any_match_exists(self) -> None:
+        self.assertEqual(
+            honeypot.image_learning_status(has_images=True, has_known_match=True, can_queue=True),
+            "detected",
+        )
+
+    def test_learning_status_queued_when_images_are_unknown_and_feedback_possible(self) -> None:
+        self.assertEqual(
+            honeypot.image_learning_status(has_images=True, has_known_match=False, can_queue=True),
+            "queued",
+        )
+
+    def test_learning_status_no_images_and_not_checked(self) -> None:
+        self.assertEqual(
+            honeypot.image_learning_status(has_images=False, has_known_match=False, can_queue=True),
+            "no_images",
+        )
+        self.assertEqual(
+            honeypot.image_learning_status(has_images=True, has_known_match=False, can_queue=False),
+            "not_checked",
+        )
 
 
 if __name__ == "__main__":

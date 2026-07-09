@@ -178,6 +178,86 @@ def plan_imagescan_event_cache_cleanup(
     return plan
 
 
+def format_image_hash_diff(score: int, threshold: int) -> str:
+    return f"{score}/{threshold}"
+
+
+def format_imagescan_matched_attachments(
+    matches: list[tuple[discord.Attachment, dict[str, typing.Any], dict[str, str]]],
+) -> str:
+    names = [
+        getattr(attachment, "filename", None) or "unknown"
+        for attachment, _match, _hashes in matches
+    ]
+    return "\n".join(names)
+
+
+def match_imagescan_sample_identifier(
+    rows: list[dict[str, typing.Any]],
+    identifier: str,
+) -> dict[str, typing.Any] | None:
+    identifier = identifier.strip()
+    if not identifier:
+        return None
+    exact = [
+        row
+        for row in rows
+        if str(row.get("sample_id")) == identifier or str(row.get("sha256")) == identifier
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None
+    prefix = [row for row in rows if str(row.get("sha256", "")).startswith(identifier)]
+    return prefix[0] if len(prefix) == 1 else None
+
+
+def format_image_detection_status(status: str) -> str:
+    labels = {
+        "no_images": "No image attachments",
+        "detected": "Detected, already known",
+        "queued": "Not detected, feedback queued",
+        "not_checked": "Not checked",
+    }
+    return labels.get(status, "Not checked")
+
+
+def is_imagescan_sample_path_safe(files_root: Path, candidate: Path) -> bool:
+    try:
+        candidate.resolve().relative_to(files_root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def summarize_imagescan_sample_storage(rows: list[dict[str, typing.Any]]) -> dict[str, int]:
+    stats = {
+        "active_with_file": 0,
+        "active_without_file": 0,
+        "file_bytes": 0,
+    }
+    for row in rows:
+        if not int(row.get("active", 0)):
+            continue
+        file_path = row.get("file_path")
+        if file_path:
+            stats["active_with_file"] += 1
+            stats["file_bytes"] += int(row.get("file_size_bytes") or 0)
+        else:
+            stats["active_without_file"] += 1
+    return stats
+
+
+def image_learning_status(*, has_images: bool, has_known_match: bool, can_queue: bool) -> str:
+    if not has_images:
+        return "no_images"
+    if has_known_match:
+        return "detected"
+    if can_queue:
+        return "queued"
+    return "not_checked"
+
+
 class MessageRef(typing.NamedTuple):
     channel_id: int
     message_id: int
@@ -637,12 +717,14 @@ class ImageScanFeedbackView(discord.ui.View):
         source_message: discord.Message,
         attachment: discord.Attachment,
         attachment_index: int,
+        attachment_data: bytes | None = None,
     ) -> None:
         super().__init__(timeout=3600)
         self.cog = cog
         self.source_message = source_message
         self.attachment = attachment
         self.attachment_index = attachment_index
+        self.attachment_data = attachment_data
 
     @staticmethod
     def _check_perms(interaction: discord.Interaction) -> bool:
@@ -686,14 +768,24 @@ class ImageScanFeedbackView(discord.ui.View):
             return
         if not await self._confirm_text(interaction, token):
             return
-        status, sample = await self.cog._imagescan_add_attachment_sample(
-            self.source_message.guild.id,
-            self.source_message,
-            self.attachment,
-            self.attachment_index,
-            decision,
-            interaction.user.id,
-        )
+        if self.attachment_data is not None:
+            status, sample = await self.cog._imagescan_add_bytes_sample(
+                self.source_message.guild.id,
+                self.attachment_data,
+                self.attachment.filename or f"attachment-{self.attachment_index}",
+                self.source_message.jump_url,
+                decision,
+                interaction.user.id,
+            )
+        else:
+            status, sample = await self.cog._imagescan_add_attachment_sample(
+                self.source_message.guild.id,
+                self.source_message,
+                self.attachment,
+                self.attachment_index,
+                decision,
+                interaction.user.id,
+            )
         config = await self.cog.config.guild(self.source_message.guild).all()
         state = await self.cog._imagescan_model_state(
             self.source_message.guild.id,
@@ -706,7 +798,17 @@ class ImageScanFeedbackView(discord.ui.View):
                     await interaction.message.edit(view=self)
                 except discord.HTTPException:
                     pass
-            await interaction.followup.send(_("{label} saved.").format(label=label), ephemeral=True)
+            if sample is not None:
+                await interaction.followup.send(
+                    _("{label} saved. Sample: `{sample_id}` (`{sha}`).").format(
+                        label=label,
+                        sample_id=sample["sample_id"],
+                        sha=str(sample["sha256"])[:12],
+                    ),
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(_("{label} saved.").format(label=label), ephemeral=True)
             return
         if status == "duplicate":
             await interaction.followup.send(_("Already known."), ephemeral=True)
@@ -1117,6 +1219,71 @@ class Honeypot(Cog):
     async def _imagescan_insert_sample(self, sample: dict[str, typing.Any]) -> str:
         async with self._imagescan_db_lock:
             return await asyncio.to_thread(self._imagescan_insert_sample_sync, sample)
+
+    def _imagescan_sample_rows_sync(self, guild_id: int, include_inactive: bool = False) -> list[dict[str, typing.Any]]:
+        where = "guild_id = ?" if include_inactive else "guild_id = ? AND active = 1"
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT sample_id, guild_id, decision, sha256, phash, dhash, ahash,
+                       source_message_id, source_channel_id, source_jump_url,
+                       file_path, file_size_bytes, created_at, moderator_id, active
+                FROM imagescan_samples
+                WHERE {where}
+                ORDER BY created_at DESC
+                """,
+                (str(guild_id),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def _imagescan_sample_rows(self, guild_id: int, include_inactive: bool = False) -> list[dict[str, typing.Any]]:
+        async with self._imagescan_db_lock:
+            return await asyncio.to_thread(self._imagescan_sample_rows_sync, guild_id, include_inactive)
+
+    def _imagescan_update_sample_file_sync(
+        self,
+        guild_id: int,
+        sample_id: str,
+        file_path: str | None,
+        file_size: int,
+    ) -> None:
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.execute(
+                """
+                UPDATE imagescan_samples
+                SET file_path = ?, file_size_bytes = ?
+                WHERE guild_id = ? AND sample_id = ?
+                """,
+                (file_path, file_size, str(guild_id), sample_id),
+            )
+
+    async def _imagescan_update_sample_file(
+        self,
+        guild_id: int,
+        sample_id: str,
+        file_path: str | None,
+        file_size: int,
+    ) -> None:
+        async with self._imagescan_db_lock:
+            await asyncio.to_thread(
+                self._imagescan_update_sample_file_sync,
+                guild_id,
+                sample_id,
+                file_path,
+                file_size,
+            )
+
+    def _imagescan_delete_sample_sync(self, guild_id: int, sample_id: str) -> None:
+        with sqlite3.connect(self._imagescan_db_path) as conn:
+            conn.execute(
+                "DELETE FROM imagescan_samples WHERE guild_id = ? AND sample_id = ?",
+                (str(guild_id), sample_id),
+            )
+
+    async def _imagescan_delete_sample(self, guild_id: int, sample_id: str) -> None:
+        async with self._imagescan_db_lock:
+            await asyncio.to_thread(self._imagescan_delete_sample_sync, guild_id, sample_id)
 
     def _imagescan_deactivate_sample_sync(self, guild_id: int, sample_id: str) -> None:
         with sqlite3.connect(self._imagescan_db_path) as conn:
@@ -2464,8 +2631,105 @@ class Honeypot(Cog):
             exclude_message_id=message.id if message_deleted else None,
         )
         if purged:
-            await self._increment_stat(message.guild, "purged_messages", purged)
-            await self._increment_stat(message.guild, "cached_purge_deletes", purged)
+                await self._increment_stat(message.guild, "purged_messages", purged)
+                await self._increment_stat(message.guild, "cached_purge_deletes", purged)
+
+    async def _prepare_imagescan_learning_feedback(
+        self,
+        message: discord.Message,
+        config: dict,
+        embed: discord.Embed,
+        attachment_snapshots: list[dict[str, typing.Any]],
+    ) -> list[ImageScanFeedbackView]:
+        image_items = [
+            (index, attachment, attachment_snapshots[index])
+            for index, attachment in enumerate(message.attachments[: len(attachment_snapshots)])
+            if self._imagescan_is_image_attachment(attachment)
+        ]
+        if not image_items:
+            embed.add_field(
+                name=_("Image Detection:"),
+                value=_(format_image_detection_status("no_images")),
+                inline=False,
+            )
+            return []
+
+        considered = image_items[:IMAGE_SCAN_MAX_ATTACHMENTS]
+        samples = await self._imagescan_load_samples(message.guild.id)
+        if not any(sample.decision == "true_positive" for sample in samples):
+            embed.add_field(
+                name=_("Image Detection:"),
+                value=_(format_image_detection_status("not_checked")),
+                inline=False,
+            )
+            return []
+
+        state = await self._imagescan_model_state(
+            message.guild.id,
+            int(config.get("imagescan_detector_threshold", 20)),
+        )
+        if not state["valid"]:
+            embed.add_field(
+                name=_("Image Detection:"),
+                value=_(format_image_detection_status("not_checked")),
+                inline=False,
+            )
+            return []
+
+        unknown_feedback: list[tuple[discord.Attachment, int, bytes]] = []
+        has_known_match = False
+        for message_index, attachment, snapshot in considered:
+            data = snapshot.get("data")
+            if data is None:
+                continue
+            try:
+                hashes = await asyncio.to_thread(image_hashes_from_bytes, data)
+            except Exception:
+                log.debug("Failed to hash imagescan learning attachment %s", attachment.filename, exc_info=True)
+                continue
+            result = match_image(hashes, samples, int(state["effective_threshold"]))
+            if result["matched"] or result.get("exact_decision") is not None:
+                has_known_match = True
+                continue
+            if result.get("exact_decision") is None:
+                unknown_feedback.append((attachment, message_index + 1, data))
+
+        status = "queued" if unknown_feedback else image_learning_status(
+            has_images=True,
+            has_known_match=has_known_match,
+            can_queue=False,
+        )
+        embed.add_field(
+            name=_("Image Detection:"),
+            value=_(format_image_detection_status(status)),
+            inline=False,
+        )
+        if status != "queued":
+            return []
+        return [
+            ImageScanFeedbackView(self, message, attachment, index, data)
+            for attachment, index, data in unknown_feedback
+        ]
+
+    async def _send_imagescan_feedback_messages(
+        self,
+        channel: discord.TextChannel | discord.Thread | None,
+        message: discord.Message,
+        views: list[ImageScanFeedbackView],
+    ) -> None:
+        if channel is None or not views:
+            return
+        for view in views:
+            try:
+                await channel.send(
+                    _("Image detector feedback: {url}").format(url=message.jump_url),
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                log.debug("Failed to send imagescan feedback message for %s", message.id)
+                return
+            await asyncio.sleep(0)
 
     async def _handle_imagescan_detector_message(
         self,
@@ -2569,16 +2833,17 @@ class Honeypot(Cog):
         embed.set_thumbnail(url=message.author.display_avatar)
         embed.add_field(name=_("Reason:"), value=_("Honeypot"), inline=False)
         embed.add_field(name=_("Channel:"), value=getattr(message.channel, "mention", f"<#{message.channel.id}>"), inline=True)
-        embed.add_field(name=_("Message:"), value=message.jump_url, inline=False)
         embed.add_field(
-            name=_("Image score:"),
-            value=_("{score} / threshold {threshold}").format(
-                score=best_match["score"],
-                threshold=best_match["threshold"],
-            ),
+            name=_("Hash Diff:"),
+            value=format_image_hash_diff(best_match["score"], best_match["threshold"]),
             inline=True,
         )
-        embed.add_field(name=_("Attachment:"), value=best_attachment.filename or _("unknown"), inline=True)
+        attachment_field = _("Attachments:") if len(matches) != 1 else _("Attachment:")
+        embed.add_field(
+            name=attachment_field,
+            value=format_imagescan_matched_attachments(matches),
+            inline=True,
+        )
         embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
 
         action = config.get("imagescan_detector_action", "review")
@@ -2676,6 +2941,7 @@ class Honeypot(Cog):
             inline=False,
         )
         embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
+        feedback_views = await self._prepare_imagescan_learning_feedback(message, config, embed, attachment_snapshots)
 
         review_channel = None
         if config.get("review_channel") is not None:
@@ -2704,6 +2970,7 @@ class Honeypot(Cog):
                     logs_channel,
                     attachment_snapshots,
                 )
+                await self._send_imagescan_feedback_messages(review_channel, message, feedback_views)
                 await self._increment_stat(message.guild, "spam_reviews")
                 await self._increment_stat(message.guild, "spam_catches")
             else:
@@ -2714,6 +2981,7 @@ class Honeypot(Cog):
                     inline=False,
                 )
                 await self._send_log(logs_channel, embed, attachment_snapshots)
+                await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
             if not config.get("dry_run"):
                 message_deleted = await self._delete_spam_current_message(message)
             await self._finish_spam_response(message, config, message_deleted=message_deleted)
@@ -2750,6 +3018,7 @@ class Honeypot(Cog):
         else:
             message_deleted = await self._delete_spam_current_message(message)
         await self._send_log(logs_channel, embed, attachment_snapshots)
+        await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
         await self._finish_spam_response(message, config, message_deleted=message_deleted)
         return True
 
@@ -2802,6 +3071,7 @@ class Honeypot(Cog):
             inline=False,
         )
         embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
+        feedback_views = await self._prepare_imagescan_learning_feedback(message, config, embed, attachment_snapshots)
 
         review_channel = None
         if config.get("review_channel") is not None:
@@ -2830,6 +3100,7 @@ class Honeypot(Cog):
                     logs_channel,
                     attachment_snapshots,
                 )
+                await self._send_imagescan_feedback_messages(review_channel, message, feedback_views)
                 await self._increment_stat(message.guild, "firstpost_reviews")
                 await self._increment_stat(message.guild, "early_catches")
             else:
@@ -2840,6 +3111,7 @@ class Honeypot(Cog):
                     inline=False,
                 )
                 await self._send_log(logs_channel, embed, attachment_snapshots)
+                await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
             if not config.get("dry_run"):
                 message_deleted = await self._delete_firstpost_current_message(message)
             await self._finish_firstpost_response(message, config, message_deleted=message_deleted)
@@ -2876,6 +3148,7 @@ class Honeypot(Cog):
         else:
             message_deleted = await self._delete_firstpost_current_message(message)
         await self._send_log(logs_channel, embed, attachment_snapshots)
+        await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
         await self._finish_firstpost_response(message, config, message_deleted=message_deleted)
         return True
 
@@ -3242,8 +3515,6 @@ class Honeypot(Cog):
         logs_channel = self._get_text_channel_or_thread(message.guild, config.get("logs_channel"))
         if await self._is_protected_member(message.author):
             return
-        if await self._handle_imagescan_detector_message(message, config, logs_channel):
-            return
         self._record_recent_user_message(message, config)
         if self._is_forward_purge_active(message.guild.id, message.author.id):
             if await self._delete_forward_purge_message(message):
@@ -3255,6 +3526,8 @@ class Honeypot(Cog):
             if await self._handle_spam_message(message, config, logs_channel):
                 return
             if await self._handle_firstpost_message(message, config, logs_channel):
+                return
+            if await self._handle_imagescan_detector_message(message, config, logs_channel):
                 return
             return
 
@@ -3353,9 +3626,11 @@ class Honeypot(Cog):
                 inline=False,
             )
             if whitelist_mode == "bypass":
+                feedback_views = await self._prepare_imagescan_learning_feedback(message, config, embed, attachment_snapshots)
                 embed.color = discord.Color.orange()
                 embed.add_field(name=_("Action:"), value=_("No action taken."), inline=False)
                 await self._send_log(logs_channel, embed, attachment_snapshots)
+                await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
                 return
             if whitelist_mode == "review":
                 force_review = True
@@ -3384,6 +3659,7 @@ class Honeypot(Cog):
                 value="\n".join(f"- {reason}" for reason in suspicion_reasons),
                 inline=False,
             )
+        feedback_views = await self._prepare_imagescan_learning_feedback(message, config, embed, attachment_snapshots)
 
         review_channel = None
         if config.get("review_channel") is not None:
@@ -3407,6 +3683,7 @@ class Honeypot(Cog):
                 embed,
                 attachment_snapshots,
             )
+            await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
             return
         should_review = force_review or (
             action == "review"
@@ -3427,6 +3704,7 @@ class Honeypot(Cog):
                     inline=False,
                 )
             await self._send_review(message, config, embed, review_channel, logs_channel, attachment_snapshots)
+            await self._send_imagescan_feedback_messages(review_channel, message, feedback_views)
             return
 
         if force_review and review_channel is None:
@@ -3437,6 +3715,7 @@ class Honeypot(Cog):
                 inline=False,
             )
             await self._send_log(logs_channel, embed, attachment_snapshots)
+            await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
             return
 
         if suspicious and not force_fallback:
@@ -3482,6 +3761,7 @@ class Honeypot(Cog):
             embed,
             attachment_snapshots,
         )
+        await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
 
     async def _execute_joinwatch_action(
         self,
@@ -5127,6 +5407,77 @@ class Honeypot(Cog):
             parts.append(_("{count} failed").format(count=errors))
         await ctx.send(_("Imagescan add: {result}.").format(result=", ".join(parts) or _("no changes")))
 
+    @imagescan.command(name="dropfile")
+    async def imagescan_dropfile(self, ctx: commands.Context, identifier: str) -> None:
+        """Remove a stored image file while keeping its hashes active."""
+        rows = await self._imagescan_sample_rows(ctx.guild.id)
+        sample = match_imagescan_sample_identifier(rows, identifier)
+        if sample is None:
+            await ctx.send(_("No unique active image sample matched `{identifier}`.").format(identifier=identifier))
+            return
+        file_path = sample.get("file_path")
+        deleted = False
+        if file_path:
+            path = Path(str(file_path))
+            if not is_imagescan_sample_path_safe(self._imagescan_files_path, path):
+                await ctx.send(_("Refused to touch a file outside image scan storage."))
+                return
+            if path.exists():
+                try:
+                    path.unlink()
+                    deleted = True
+                except OSError:
+                    await ctx.send(_("Failed to delete sample file."))
+                    return
+        await self._imagescan_update_sample_file(ctx.guild.id, str(sample["sample_id"]), None, 0)
+        await ctx.send(
+            _("Sample file dropped: `{sample_id}` (`{sha}`). File deleted: {deleted}. Hash retained.").format(
+                sample_id=sample["sample_id"],
+                sha=str(sample["sha256"])[:12],
+                deleted=str(deleted).lower(),
+            )
+        )
+
+    @imagescan.command(name="remove")
+    async def imagescan_remove(self, ctx: commands.Context, identifier: str) -> None:
+        """Remove an image sample and its stored file from the active dataset."""
+        rows = await self._imagescan_sample_rows(ctx.guild.id)
+        sample = match_imagescan_sample_identifier(rows, identifier)
+        if sample is None:
+            await ctx.send(_("No unique active image sample matched `{identifier}`.").format(identifier=identifier))
+            return
+        file_path = sample.get("file_path")
+        deleted_file = False
+        if file_path:
+            path = Path(str(file_path))
+            if not is_imagescan_sample_path_safe(self._imagescan_files_path, path):
+                await ctx.send(_("Refused to touch a file outside image scan storage."))
+                return
+            if path.exists():
+                try:
+                    path.unlink()
+                    deleted_file = True
+                except OSError:
+                    await ctx.send(_("Failed to delete sample file."))
+                    return
+        await self._imagescan_delete_sample(ctx.guild.id, str(sample["sample_id"]))
+        config = await self.config.guild(ctx.guild).all()
+        state = await self._imagescan_model_state(
+            ctx.guild.id,
+            int(config.get("imagescan_detector_threshold", 20)),
+        )
+        await ctx.send(
+            _(
+                "Sample removed: `{sample_id}` (`{sha}`). File deleted: {deleted}. "
+                "Effective threshold: {threshold}"
+            ).format(
+                sample_id=sample["sample_id"],
+                sha=str(sample["sha256"])[:12],
+                deleted=str(deleted_file).lower(),
+                threshold=state["effective_threshold"],
+            )
+        )
+
     @debug_imagescan.command(name="legacy_toggle")
     async def imagescan_toggle(self, ctx: commands.Context, value: bool = None) -> None:
         """Enable or disable image shadow reviews."""
@@ -5225,11 +5576,7 @@ class Honeypot(Cog):
         await self._imagescan_model_state(ctx.guild.id, value)
         await ctx.send(_("Image detector threshold set to {value}").format(value=value))
 
-    @imagescan.group(name="model")
-    async def imagescan_model(self, ctx: commands.Context) -> None:
-        """Maintain image detector model state."""
-
-    @imagescan_model.command(name="rebuild")
+    @imagescan.command(name="rebuild")
     async def imagescan_model_rebuild(self, ctx: commands.Context) -> None:
         """Recompute image detector threshold state."""
         config = await self.config.guild(ctx.guild).all()
@@ -5256,6 +5603,8 @@ class Honeypot(Cog):
         )
         profile = await self._imagescan_profile(ctx.guild.id)
         total_samples = int(state["sample_count_tp"]) + int(state["sample_count_fp"])
+        sample_rows = await self._imagescan_sample_rows(ctx.guild.id)
+        storage = summarize_imagescan_sample_storage(sample_rows)
 
         def avg(total_key: str, count_key: str) -> int:
             count = profile.get(count_key, 0)
@@ -5266,7 +5615,12 @@ class Honeypot(Cog):
             f"Action: {config.get('imagescan_detector_action', 'review')}",
             f"Threshold: {state['configured_threshold']} effective {state['effective_threshold']}",
             f"Samples: {state['sample_count_tp']} TP, {state['sample_count_fp']} FP, {total_samples} total",
-            f"Stored files: {total_samples} / {self._format_bytes(int(state.get('stored_size_bytes') or 0))}",
+            (
+                "Sample files: "
+                f"{storage['active_with_file']} stored, "
+                f"{storage['active_without_file']} hash-only"
+            ),
+            f"Sample storage: {self._format_bytes(storage['file_bytes'])}",
             (
                 "Scanned: "
                 f"{profile.get('messages_scanned', 0)} messages, "
