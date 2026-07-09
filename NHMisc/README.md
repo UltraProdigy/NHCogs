@@ -211,6 +211,21 @@ Sets how long daily summary history is retained:
 Reducing history retention also asks for `I understand` when it would permanently delete
 existing summary rows.
 
+```ini
+[p]nhmisc activity verify
+```
+
+Checks today's open activity aggregates for internal consistency. This compares the
+canonical per-user/channel/thread rows with the faster per-user and per-channel cache
+rows. It does not read Honeypot data.
+
+```ini
+[p]nhmisc activity dbsize
+```
+
+Shows the activity SQLite file size in bytes and MiB, SQLite page usage, and row counts
+for the main activity tables.
+
 ### Moderator Tools
 
 ```ini
@@ -272,5 +287,11 @@ own activity.
 The cog stores Discord user IDs with passively collected message-count aggregates for
 configurable short-term activity detail retention. Closed daily summary history stores
 aggregate counts and channel IDs, but not user IDs.
+
+The detailed activity row is keyed by UTC date, user ID, parent channel ID, thread ID,
+and message count. A user can have multiple rows for the same day when they post in
+multiple channels or threads. NHMisc does not store message content, message IDs, jump
+URLs, attachment URLs, embeds, or deleted/edited message state. Honeypot's short-lived
+moderation/deletion cache is separate and is not used for NHMisc statistics.
 
 Sticky roles are stored in a local SQLite database as guild IDs, user IDs, and role IDs.

@@ -20,6 +20,6 @@
     10,
     0
   ],
-  "end_user_data_statement": "This cog stores Discord user IDs with passively collected message-count aggregates for configurable short-term activity detail retention. Closed daily summary history stores aggregate counts and channel IDs, but not user IDs."
+  "end_user_data_statement": "This cog stores Discord user IDs with passively collected message-count aggregates for configurable short-term activity detail retention. Closed daily summary history stores aggregate counts and channel IDs, but not user IDs. It does not store message content or message IDs."
 }
 

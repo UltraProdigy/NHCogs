@@ -58,6 +58,41 @@ class ChannelTimelineDay:
     message_count: int | None
 
 
+@dataclass(frozen=True)
+class ActivityConsistencyReport:
+    user_day_mismatches: int
+    channel_day_mismatches: int
+    canonical_rows: int
+    canonical_messages: int
+
+
+@dataclass(frozen=True)
+class ActivityDatabaseStats:
+    path: str
+    file_size_bytes: int
+    page_count: int
+    page_size: int
+    table_rows: tuple[tuple[str, int], ...]
+
+    @property
+    def sqlite_size_bytes(self) -> int:
+        return self.page_count * self.page_size
+
+
+CANONICAL_ACTIVITY_TABLE = "activity_user_channel_day"
+CACHE_ACTIVITY_TABLES = (
+    "activity_user_day",
+    "activity_channel_day",
+    "activity_hour_day",
+)
+HISTORY_ACTIVITY_TABLES = (
+    "activity_daily_summary",
+    "activity_daily_top_channels",
+    "activity_daily_channel_summary",
+)
+NO_THREAD_ID = 0
+
+
 class ActivityStore:
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -168,6 +203,20 @@ class ActivityStore:
                 end_date_utc,
                 days,
             )
+
+    async def verify_open_day_consistency(
+        self, guild_id: int, date_utc: date
+    ) -> ActivityConsistencyReport:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._verify_open_day_consistency_sync,
+                guild_id,
+                date_utc,
+            )
+
+    async def get_database_stats(self) -> ActivityDatabaseStats:
+        async with self._lock:
+            return await asyncio.to_thread(self._get_database_stats_sync)
 
     async def count_detail_rows_older_than(self, guild_id: int, cutoff_date_utc: date) -> int:
         async with self._lock:
@@ -328,7 +377,7 @@ class ActivityStore:
         now_utc: datetime,
     ) -> None:
         date_key = date_utc.isoformat()
-        stored_thread_id = thread_id or 0
+        stored_thread_id = thread_id or NO_THREAD_ID
         now_key = now_utc.isoformat()
         with self._connection() as conn:
             conn.execute(
@@ -575,7 +624,7 @@ class ActivityStore:
         self, conn: sqlite3.Connection, guild_id: int, date_utc: date
     ) -> None:
         date_key = date_utc.isoformat()
-        for table in ("activity_user_day", "activity_channel_day", "activity_hour_day"):
+        for table in CACHE_ACTIVITY_TABLES:
             conn.execute(
                 f"DELETE FROM {table} WHERE guild_id = ? AND date_utc = ?",
                 (guild_id, date_key),
@@ -854,6 +903,101 @@ class ActivityStore:
                 value = None
             date_rows.append(ChannelTimelineDay(day, value))
         return date_rows
+
+    def _verify_open_day_consistency_sync(
+        self, guild_id: int, date_utc: date
+    ) -> ActivityConsistencyReport:
+        date_key = date_utc.isoformat()
+        with self._connection() as conn:
+            user_mismatches = conn.execute(
+                """
+                WITH canonical AS (
+                    SELECT user_id, SUM(message_count) AS total
+                    FROM activity_user_channel_day
+                    WHERE guild_id = ? AND date_utc = ?
+                    GROUP BY user_id
+                ),
+                cache AS (
+                    SELECT user_id, message_count AS total
+                    FROM activity_user_day
+                    WHERE guild_id = ? AND date_utc = ?
+                ),
+                all_users AS (
+                    SELECT user_id FROM canonical
+                    UNION
+                    SELECT user_id FROM cache
+                )
+                SELECT COUNT(*)
+                FROM all_users
+                LEFT JOIN canonical USING (user_id)
+                LEFT JOIN cache USING (user_id)
+                WHERE COALESCE(canonical.total, 0) != COALESCE(cache.total, 0)
+                """,
+                (guild_id, date_key, guild_id, date_key),
+            ).fetchone()[0]
+            channel_mismatches = conn.execute(
+                """
+                WITH canonical AS (
+                    SELECT channel_id, thread_id, SUM(message_count) AS total
+                    FROM activity_user_channel_day
+                    WHERE guild_id = ? AND date_utc = ?
+                    GROUP BY channel_id, thread_id
+                ),
+                cache AS (
+                    SELECT channel_id, thread_id, message_count AS total
+                    FROM activity_channel_day
+                    WHERE guild_id = ? AND date_utc = ?
+                ),
+                all_channels AS (
+                    SELECT channel_id, thread_id FROM canonical
+                    UNION
+                    SELECT channel_id, thread_id FROM cache
+                )
+                SELECT COUNT(*)
+                FROM all_channels
+                LEFT JOIN canonical USING (channel_id, thread_id)
+                LEFT JOIN cache USING (channel_id, thread_id)
+                WHERE COALESCE(canonical.total, 0) != COALESCE(cache.total, 0)
+                """,
+                (guild_id, date_key, guild_id, date_key),
+            ).fetchone()[0]
+            canonical = conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(message_count), 0)
+                FROM activity_user_channel_day
+                WHERE guild_id = ? AND date_utc = ?
+                """,
+                (guild_id, date_key),
+            ).fetchone()
+        return ActivityConsistencyReport(
+            user_day_mismatches=int(user_mismatches or 0),
+            channel_day_mismatches=int(channel_mismatches or 0),
+            canonical_rows=int(canonical[0] or 0),
+            canonical_messages=int(canonical[1] or 0),
+        )
+
+    def _get_database_stats_sync(self) -> ActivityDatabaseStats:
+        tables = (
+            "activity_open_day",
+            *CACHE_ACTIVITY_TABLES,
+            CANONICAL_ACTIVITY_TABLE,
+            *HISTORY_ACTIVITY_TABLES,
+        )
+        file_size = self._path.stat().st_size if self._path.exists() else 0
+        with self._connection() as conn:
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0] or 0)
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0] or 0)
+            rows: list[tuple[str, int]] = []
+            for table in tables:
+                count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                rows.append((table, int(count or 0)))
+        return ActivityDatabaseStats(
+            path=str(self._path),
+            file_size_bytes=int(file_size),
+            page_count=page_count,
+            page_size=page_size,
+            table_rows=tuple(rows),
+        )
 
     def _count_rows_older_than_sync(
         self, table: str, guild_id: int, cutoff_date_utc: date

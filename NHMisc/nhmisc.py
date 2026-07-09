@@ -11,6 +11,8 @@ from redbot.core import Config, commands
 from redbot.core.data_manager import cog_data_path
 
 from .activity_storage import (
+    ActivityConsistencyReport,
+    ActivityDatabaseStats,
     ActivityStore,
     ChannelTimelineDay,
     ChannelUserCount,
@@ -372,6 +374,21 @@ class NHMisc(commands.Cog):
             days,
         )
         await ctx.send(embed=self._build_channel_timeline_embed(channel, timeline, days))
+
+    @nhmisc_activity.command(name="verify")
+    async def nhmisc_activity_verify(self, ctx: commands.Context) -> None:
+        """Verify today's aggregate activity cache consistency."""
+        await self._require_activity_staff(ctx)
+        today = self._utc_today()
+        report = await self._activity_store.verify_open_day_consistency(ctx.guild.id, today)
+        await ctx.send(embed=self._build_activity_consistency_embed(report, today))
+
+    @nhmisc_activity.command(name="dbsize")
+    async def nhmisc_activity_dbsize(self, ctx: commands.Context) -> None:
+        """Show activity SQLite database size and row counts."""
+        await self._require_activity_staff(ctx)
+        stats = await self._activity_store.get_database_stats()
+        await ctx.send(embed=self._build_activity_database_stats_embed(stats))
 
     @nhmisc_activity.command(name="retention")
     async def nhmisc_activity_retention(self, ctx: commands.Context, days: int) -> None:
@@ -1402,6 +1419,65 @@ class NHMisc(commands.Cog):
             )
         else:
             embed.add_field(name="Total messages", value="n/d", inline=True)
+        return embed
+
+    def _build_activity_consistency_embed(
+        self, report: ActivityConsistencyReport, day: date
+    ) -> discord.Embed:
+        ok = report.user_day_mismatches == 0 and report.channel_day_mismatches == 0
+        embed = discord.Embed(
+            title=f"Activity consistency - {day.isoformat()} UTC",
+            color=discord.Color.green() if ok else discord.Color.red(),
+        )
+        embed.add_field(
+            name="Canonical rows",
+            value=self._format_int(report.canonical_rows),
+            inline=True,
+        )
+        embed.add_field(
+            name="Canonical messages",
+            value=self._format_int(report.canonical_messages),
+            inline=True,
+        )
+        embed.add_field(
+            name="User cache mismatches",
+            value=self._format_int(report.user_day_mismatches),
+            inline=True,
+        )
+        embed.add_field(
+            name="Channel cache mismatches",
+            value=self._format_int(report.channel_day_mismatches),
+            inline=True,
+        )
+        embed.add_field(name="Status", value="OK" if ok else "Mismatch detected", inline=False)
+        return embed
+
+    def _build_activity_database_stats_embed(
+        self, stats: ActivityDatabaseStats
+    ) -> discord.Embed:
+        file_mib = stats.file_size_bytes / 1024 / 1024
+        sqlite_mib = stats.sqlite_size_bytes / 1024 / 1024
+        lines = [f"{name} {self._format_int(count)}" for name, count in stats.table_rows]
+        table = "\n".join(lines)
+        if len(table) > 1000:
+            table = "\n".join(lines[:18] + ["..."])
+
+        embed = discord.Embed(title="Activity database size", color=discord.Color.blue())
+        embed.add_field(
+            name="File size",
+            value=f"{self._format_int(stats.file_size_bytes)} bytes ({file_mib:.2f} MiB)",
+            inline=False,
+        )
+        embed.add_field(
+            name="SQLite pages",
+            value=(
+                f"{self._format_int(stats.page_count)} pages x "
+                f"{self._format_int(stats.page_size)} bytes = {sqlite_mib:.2f} MiB"
+            ),
+            inline=False,
+        )
+        embed.add_field(name="Rows", value=f"```text\n{table}\n```", inline=False)
+        embed.set_footer(text=stats.path)
         return embed
 
     def _build_user_stats_embed(self, title: str, stats: UserStats, days: int) -> discord.Embed:
