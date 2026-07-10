@@ -811,6 +811,12 @@ class ImageScanFeedbackView(discord.ui.View):
                 await interaction.followup.send(_("{label} saved.").format(label=label), ephemeral=True)
             return
         if status == "duplicate":
+            self._disable_all()
+            if interaction.message is not None:
+                try:
+                    await interaction.message.edit(view=self)
+                except discord.HTTPException:
+                    pass
             await interaction.followup.send(_("Already known."), ephemeral=True)
             return
         if status == "inserted" and sample is not None:
@@ -831,6 +837,20 @@ class ImageScanFeedbackView(discord.ui.View):
     @discord.ui.button(label="Confirm FP", style=discord.ButtonStyle.secondary)
     async def confirm_fp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._add_decision(interaction, "false_positive", "FP", _("FP"))
+
+    @discord.ui.button(label="Ignore", style=discord.ButtonStyle.success)
+    async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self._check_perms(interaction):
+            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
+            return
+        self._disable_all()
+        if interaction.message is not None:
+            try:
+                await interaction.message.edit(content=_("✅ **Image feedback ignored**"), view=self)
+            except discord.HTTPException:
+                pass
+        await interaction.followup.send(_("Ignored."), ephemeral=True)
 
 
 @cog_i18n(_)
