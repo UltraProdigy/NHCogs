@@ -29,9 +29,11 @@ def _install_redbot_stubs() -> None:
     discord.Role = object
     discord.Object = object
     discord.Interaction = object
-    discord.ButtonStyle = types.SimpleNamespace(danger=1, secondary=2, success=3)
+    discord.ButtonStyle = types.SimpleNamespace(danger=1, secondary=2, success=3, primary=4)
+    discord.SelectOption = object
     discord.ui = types.SimpleNamespace(
         View=object,
+        Select=object,
         button=lambda *args, **kwargs: (lambda fn: fn),
     )
     discord.ext = types.ModuleType("discord.ext")

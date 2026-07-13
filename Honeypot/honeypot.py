@@ -99,6 +99,8 @@ REVIEW_DUMP_ATTACHMENT_DELAY_SECONDS = 1
 IMAGE_SCAN_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 IMAGE_SCAN_COUNTS = (2, 4)
 IMAGE_SCAN_MAX_ATTACHMENTS = 4
+IMAGE_SCAN_FEEDBACK_TIMEOUT_SECONDS = 24 * 60 * 60
+IMAGE_SCAN_FEEDBACK_BULK_LABELS = ("All TP", "All FP", "Ignore all", "Individual")
 IMAGE_SCAN_DECISIONS = ("true_positive", "false_positive")
 IMAGE_SCAN_DETECTOR_ACTION_OPTIONS = ("none", "review", "kick", "ban")
 IMAGE_SCAN_PROFILE_COLUMNS = (
@@ -139,6 +141,11 @@ def missing_purge_permissions(permissions: object) -> list[str]:
 
 def is_purgeable_message_channel(channel: object) -> bool:
     return callable(getattr(channel, "purge", None))
+
+
+def joinwatch_channel_id(config: dict) -> int | None:
+    channel_id = config.get("joinwatch_channel")
+    return channel_id if isinstance(channel_id, int) else None
 
 
 def is_image_attachment(attachment: discord.Attachment) -> bool:
@@ -710,21 +717,62 @@ class ImageScanReviewView(discord.ui.View):
         await self._set_decision(interaction, "ignored", _("Ignored"))
 
 
+class ImageScanFeedbackSelect(discord.ui.Select):
+    def __init__(self, panel: "ImageScanFeedbackView") -> None:
+        self.panel = panel
+        options = [
+            discord.SelectOption(
+                label=panel.item_label(index),
+                value=str(index),
+                default=index == panel.selected_index,
+            )
+            for index, item in enumerate(panel.items)
+            if item["decision"] is None
+        ]
+        super().__init__(placeholder=_("Select an image"), options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.panel.selected_index = int(self.values[0])
+        self.panel._show_individual_controls()
+        await interaction.response.edit_message(
+            content=self.panel.status_content(),
+            view=self.panel,
+        )
+
+
 class ImageScanFeedbackView(discord.ui.View):
     def __init__(
         self,
         cog: "Honeypot",
         source_message: discord.Message,
-        attachment: discord.Attachment,
-        attachment_index: int,
-        attachment_data: bytes | None = None,
+        items: list[tuple[discord.Attachment, int, bytes]],
     ) -> None:
-        super().__init__(timeout=3600)
+        super().__init__(timeout=IMAGE_SCAN_FEEDBACK_TIMEOUT_SECONDS)
         self.cog = cog
         self.source_message = source_message
-        self.attachment = attachment
-        self.attachment_index = attachment_index
-        self.attachment_data = attachment_data
+        self.items = [
+            {"attachment": attachment, "index": index, "data": data, "decision": None}
+            for attachment, index, data in items
+        ]
+        self.selected_index = 0
+        self.clear_items()
+        self.add_item(self.all_tp)
+        self.add_item(self.all_fp)
+        self.add_item(self.ignore_all)
+        self.add_item(self.individual)
+
+    def item_label(self, index: int) -> str:
+        item = self.items[index]
+        filename = item["attachment"].filename or f"attachment-{item['index']}"
+        return f"{item['index']}. {filename}"[:100]
+
+    def status_content(self) -> str:
+        labels = {"true_positive": "✅ TP", "false_positive": "✅ FP", "ignored": "➖ Ignored", None: "⏳ Pending"}
+        lines = [_("**Image detector feedback**")]
+        for index, item in enumerate(self.items):
+            marker = "➡️ " if item["decision"] is None and index == self.selected_index else ""
+            lines.append(f"{marker}{self.item_label(index)} — {labels[item['decision']]}")
+        return "\n".join(lines)
 
     @staticmethod
     def _check_perms(interaction: discord.Interaction) -> bool:
@@ -755,70 +803,32 @@ class ImageScanFeedbackView(discord.ui.View):
             return False
         return True
 
-    async def _add_decision(
+    async def _save_item_decision(
         self,
         interaction: discord.Interaction,
+        item_index: int,
         decision: str,
-        token: str,
-        label: str,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        if not self._check_perms(interaction):
-            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
-            return
-        if not await self._confirm_text(interaction, token):
-            return
-        if self.attachment_data is not None:
-            status, sample = await self.cog._imagescan_add_bytes_sample(
-                self.source_message.guild.id,
-                self.attachment_data,
-                self.attachment.filename or f"attachment-{self.attachment_index}",
-                self.source_message.jump_url,
-                decision,
-                interaction.user.id,
-            )
-        else:
-            status, sample = await self.cog._imagescan_add_attachment_sample(
-                self.source_message.guild.id,
-                self.source_message,
-                self.attachment,
-                self.attachment_index,
-                decision,
-                interaction.user.id,
-            )
+    ) -> tuple[str, dict[str, typing.Any] | None]:
+        item = self.items[item_index]
+        status, sample = await self.cog._imagescan_add_bytes_sample(
+            self.source_message.guild.id,
+            item["data"],
+            item["attachment"].filename or f"attachment-{item['index']}",
+            self.source_message.jump_url,
+            decision,
+            interaction.user.id,
+        )
         config = await self.cog.config.guild(self.source_message.guild).all()
         state = await self.cog._imagescan_model_state(
             self.source_message.guild.id,
             int(config.get("imagescan_detector_threshold", 20)),
         )
         if status == "inserted" and state["valid"]:
-            self._disable_all()
-            if interaction.message is not None:
-                try:
-                    await interaction.message.edit(view=self)
-                except discord.HTTPException:
-                    pass
-            if sample is not None:
-                await interaction.followup.send(
-                    _("{label} saved. Sample: `{sample_id}` (`{sha}`).").format(
-                        label=label,
-                        sample_id=sample["sample_id"],
-                        sha=str(sample["sha256"])[:12],
-                    ),
-                    ephemeral=True,
-                )
-            else:
-                await interaction.followup.send(_("{label} saved.").format(label=label), ephemeral=True)
-            return
+            item["decision"] = decision
+            return status, sample
         if status == "duplicate":
-            self._disable_all()
-            if interaction.message is not None:
-                try:
-                    await interaction.message.edit(view=self)
-                except discord.HTTPException:
-                    pass
-            await interaction.followup.send(_("Already known."), ephemeral=True)
-            return
+            item["decision"] = decision
+            return status, sample
         if status == "inserted" and sample is not None:
             await self.cog._imagescan_deactivate_sample(
                 self.source_message.guild.id,
@@ -828,29 +838,114 @@ class ImageScanFeedbackView(discord.ui.View):
                 self.source_message.guild.id,
                 int(config.get("imagescan_detector_threshold", 20)),
             )
-        await interaction.followup.send(_("Rejected: TP/FP overlap.\nModel unchanged."), ephemeral=True)
+        return "conflict", sample
 
-    @discord.ui.button(label="Confirm TP", style=discord.ButtonStyle.danger)
-    async def confirm_tp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self._add_decision(interaction, "true_positive", "TP", _("TP"))
+    def _next_pending_index(self) -> int | None:
+        return next((index for index, item in enumerate(self.items) if item["decision"] is None), None)
 
-    @discord.ui.button(label="Confirm FP", style=discord.ButtonStyle.secondary)
-    async def confirm_fp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self._add_decision(interaction, "false_positive", "FP", _("FP"))
+    def _show_individual_controls(self) -> None:
+        self.clear_items()
+        pending = self._next_pending_index()
+        if pending is None:
+            return
+        if self.items[self.selected_index]["decision"] is not None:
+            self.selected_index = pending
+        self.add_item(ImageScanFeedbackSelect(self))
+        self.add_item(self.confirm_tp)
+        self.add_item(self.confirm_fp)
+        self.add_item(self.ignore_image)
 
-    @discord.ui.button(label="Ignore", style=discord.ButtonStyle.success)
-    async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def _finish_interaction(self, interaction: discord.Interaction, note: str) -> None:
+        pending = self._next_pending_index()
+        if pending is None:
+            self.clear_items()
+        else:
+            self.selected_index = pending
+            self._show_individual_controls()
+        if interaction.message is not None:
+            await interaction.message.edit(content=self.status_content(), view=self)
+        await interaction.followup.send(note, ephemeral=True)
+
+    async def _apply_bulk(self, interaction: discord.Interaction, decision: str, token: str) -> None:
         await interaction.response.defer(ephemeral=True)
         if not self._check_perms(interaction):
             await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
             return
+        if not await self._confirm_text(interaction, token):
+            return
+        saved = conflicts = 0
+        for index, item in enumerate(self.items):
+            if item["decision"] is not None:
+                continue
+            status, _sample = await self._save_item_decision(interaction, index, decision)
+            if status in ("inserted", "duplicate"):
+                saved += 1
+            else:
+                conflicts += 1
         self._disable_all()
         if interaction.message is not None:
-            try:
-                await interaction.message.edit(content=_("✅ **Image feedback ignored**"), view=self)
-            except discord.HTTPException:
-                pass
-        await interaction.followup.send(_("Ignored."), ephemeral=True)
+            await interaction.message.edit(content=self.status_content(), view=self)
+        await interaction.followup.send(
+            _("Saved: {saved}. Conflicts: {conflicts}.").format(saved=saved, conflicts=conflicts),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="All TP", style=discord.ButtonStyle.danger)
+    async def all_tp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._apply_bulk(interaction, "true_positive", "ALL TP")
+
+    @discord.ui.button(label="All FP", style=discord.ButtonStyle.secondary)
+    async def all_fp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._apply_bulk(interaction, "false_positive", "ALL FP")
+
+    @discord.ui.button(label="Ignore all", style=discord.ButtonStyle.success)
+    async def ignore_all(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self._check_perms(interaction):
+            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
+            return
+        for item in self.items:
+            if item["decision"] is None:
+                item["decision"] = "ignored"
+        self._disable_all()
+        if interaction.message is not None:
+            await interaction.message.edit(content=self.status_content(), view=self)
+        await interaction.followup.send(_("All images ignored."), ephemeral=True)
+
+    @discord.ui.button(label="Individual", style=discord.ButtonStyle.primary)
+    async def individual(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self._check_perms(interaction):
+            await interaction.response.send_message(_("You need `Moderate Members` permission."), ephemeral=True)
+            return
+        self._show_individual_controls()
+        await interaction.response.edit_message(content=self.status_content(), view=self)
+
+    @discord.ui.button(label="Confirm TP", style=discord.ButtonStyle.danger)
+    async def confirm_tp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self._check_perms(interaction):
+            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
+            return
+        status, _sample = await self._save_item_decision(interaction, self.selected_index, "true_positive")
+        await self._finish_interaction(interaction, _("TP saved.") if status != "conflict" else _("Rejected: TP/FP overlap."))
+
+    @discord.ui.button(label="Confirm FP", style=discord.ButtonStyle.secondary)
+    async def confirm_fp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self._check_perms(interaction):
+            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
+            return
+        status, _sample = await self._save_item_decision(interaction, self.selected_index, "false_positive")
+        await self._finish_interaction(interaction, _("FP saved.") if status != "conflict" else _("Rejected: TP/FP overlap."))
+
+    @discord.ui.button(label="Ignore image", style=discord.ButtonStyle.success)
+    async def ignore_image(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self._check_perms(interaction):
+            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
+            return
+        self.items[self.selected_index]["decision"] = "ignored"
+        await self._finish_interaction(interaction, _("Image ignored."))
 
 
 @cog_i18n(_)
@@ -919,6 +1014,7 @@ class Honeypot(Cog):
 
         self._active_views: dict[int, ReviewView] = {}
         self._views_lock: asyncio.Lock = asyncio.Lock()
+        self._review_creation_locks: dict[tuple[int, int], asyncio.Lock] = {}
         self._restore_task: asyncio.Task | None = None
         self._post_ban_sweep_tasks: set[asyncio.Task] = set()
         self._recent_user_messages: dict[int, dict[int, deque[MessageRef]]] = defaultdict(
@@ -2660,7 +2756,7 @@ class Honeypot(Cog):
         config: dict,
         embed: discord.Embed,
         attachment_snapshots: list[dict[str, typing.Any]],
-    ) -> list[ImageScanFeedbackView]:
+    ) -> ImageScanFeedbackView | None:
         image_items = [
             (index, attachment, attachment_snapshots[index])
             for index, attachment in enumerate(message.attachments[: len(attachment_snapshots)])
@@ -2672,7 +2768,7 @@ class Honeypot(Cog):
                 value=_(format_image_detection_status("no_images")),
                 inline=False,
             )
-            return []
+            return None
 
         considered = image_items[:IMAGE_SCAN_MAX_ATTACHMENTS]
         samples = await self._imagescan_load_samples(message.guild.id)
@@ -2682,7 +2778,7 @@ class Honeypot(Cog):
                 value=_(format_image_detection_status("not_checked")),
                 inline=False,
             )
-            return []
+            return None
 
         state = await self._imagescan_model_state(
             message.guild.id,
@@ -2694,7 +2790,7 @@ class Honeypot(Cog):
                 value=_(format_image_detection_status("not_checked")),
                 inline=False,
             )
-            return []
+            return None
 
         unknown_feedback: list[tuple[discord.Attachment, int, bytes]] = []
         has_known_match = False
@@ -2725,31 +2821,25 @@ class Honeypot(Cog):
             inline=False,
         )
         if status != "queued":
-            return []
-        return [
-            ImageScanFeedbackView(self, message, attachment, index, data)
-            for attachment, index, data in unknown_feedback
-        ]
+            return None
+        return ImageScanFeedbackView(self, message, unknown_feedback)
 
     async def _send_imagescan_feedback_messages(
         self,
         channel: discord.TextChannel | discord.Thread | None,
         message: discord.Message,
-        views: list[ImageScanFeedbackView],
+        view: ImageScanFeedbackView | None,
     ) -> None:
-        if channel is None or not views:
+        if channel is None or view is None:
             return
-        for view in views:
-            try:
-                await channel.send(
-                    _("Image detector feedback: {url}").format(url=message.jump_url),
-                    view=view,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except discord.HTTPException:
-                log.debug("Failed to send imagescan feedback message for %s", message.id)
-                return
-            await asyncio.sleep(0)
+        try:
+            await channel.send(
+                view.status_content(),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            log.debug("Failed to send imagescan feedback message for %s", message.id)
 
     async def _handle_imagescan_detector_message(
         self,
@@ -2873,7 +2963,7 @@ class Honeypot(Cog):
         message_deleted = False
         if action == "review":
             if review_channel is not None:
-                await self._send_review(
+                merged = await self._send_review(
                     message,
                     config,
                     embed,
@@ -2881,7 +2971,7 @@ class Honeypot(Cog):
                     logs_channel,
                     attachment_snapshots,
                 )
-                if feedback_view is not None:
+                if not merged and feedback_view is not None:
                     try:
                         await review_channel.send(
                             _("Image detector feedback: {url}").format(url=message.jump_url),
@@ -2982,7 +3072,7 @@ class Honeypot(Cog):
                     inline=False,
                 )
             if review_channel is not None:
-                await self._send_review(
+                merged = await self._send_review(
                     message,
                     config,
                     embed,
@@ -2990,7 +3080,8 @@ class Honeypot(Cog):
                     logs_channel,
                     attachment_snapshots,
                 )
-                await self._send_imagescan_feedback_messages(review_channel, message, feedback_views)
+                if not merged:
+                    await self._send_imagescan_feedback_messages(review_channel, message, feedback_views)
                 await self._increment_stat(message.guild, "spam_reviews")
                 await self._increment_stat(message.guild, "spam_catches")
             else:
@@ -3112,7 +3203,7 @@ class Honeypot(Cog):
                     inline=False,
                 )
             if review_channel is not None:
-                await self._send_review(
+                merged = await self._send_review(
                     message,
                     config,
                     embed,
@@ -3120,7 +3211,8 @@ class Honeypot(Cog):
                     logs_channel,
                     attachment_snapshots,
                 )
-                await self._send_imagescan_feedback_messages(review_channel, message, feedback_views)
+                if not merged:
+                    await self._send_imagescan_feedback_messages(review_channel, message, feedback_views)
                 await self._increment_stat(message.guild, "firstpost_reviews")
                 await self._increment_stat(message.guild, "early_catches")
             else:
@@ -3330,47 +3422,6 @@ class Honeypot(Cog):
                 pending_review["message_fingerprint"] = view.message_fingerprint
                 pending_review["channel_ids"] = view.channel_ids
 
-    async def _send_review_addendum(
-        self,
-        review_message: discord.Message,
-        message: discord.Message,
-        embed: discord.Embed,
-        attachment_snapshots: list[dict[str, typing.Any]],
-    ) -> None:
-        addendum = discord.Embed(
-            title=_("Additional message while review is pending"),
-            description=f">>> {message.content}" if message.content else _("*(message with attachments only)*"),
-            color=discord.Color.orange(),
-            timestamp=message.created_at,
-        )
-        addendum.add_field(
-            name=_("Review:"),
-            value=review_message.jump_url,
-            inline=False,
-        )
-        addendum.add_field(
-            name=_("Channel:"),
-            value=getattr(message.channel, "mention", f"<#{message.channel.id}>"),
-            inline=True,
-        )
-        attachment_summary = self._attachment_summary(attachment_snapshots)
-        if attachment_summary:
-            addendum.add_field(name=_("Attachments:"), value=attachment_summary, inline=False)
-        self._merge_embed_trigger_reasons(addendum, embed)
-        kwargs: dict[str, typing.Any] = {
-            "content": _("Additional message while review is pending: {url}").format(url=review_message.jump_url),
-            "embed": addendum,
-            "allowed_mentions": discord.AllowedMentions.none(),
-            "mention_author": False,
-        }
-        files = self._attachment_files(attachment_snapshots)
-        if files:
-            kwargs["files"] = files
-        try:
-            await review_message.reply(**kwargs)
-        except discord.HTTPException:
-            log.debug("Failed to send review addendum for review message %s", review_message.id)
-
     async def _merge_into_active_review(
         self,
         view: ReviewView,
@@ -3387,7 +3438,6 @@ class Honeypot(Cog):
         if message.channel.id not in view.channel_ids:
             view.channel_ids.append(message.channel.id)
         current_fingerprint = message_spam_fingerprint(message)
-        same_fingerprint = view.message_fingerprint in (None, current_fingerprint)
         if view.message_fingerprint is None:
             view.message_fingerprint = current_fingerprint
         self._upsert_embed_field(
@@ -3404,8 +3454,6 @@ class Honeypot(Cog):
             log.debug("Failed to merge review message %s", view.review_message.id)
             return False
         await self._update_pending_review_merge_data(message.guild, view)
-        if not same_fingerprint:
-            await self._send_review_addendum(view.review_message, message, embed, attachment_snapshots)
         return True
 
     async def _send_review(
@@ -3416,17 +3464,21 @@ class Honeypot(Cog):
         review_channel: discord.TextChannel | discord.Thread,
         logs_channel: discord.TextChannel | discord.Thread | None,
         attachment_snapshots: list[dict[str, typing.Any]],
-    ) -> None:
+    ) -> bool:
         embed.color = discord.Color.gold()
         embed.title = _("Review needed")
-        active_review = await self._find_active_review_for_user(message.guild.id, message.author.id)
+        lock_key = (message.guild.id, message.author.id)
+        review_lock = self._review_creation_locks.setdefault(lock_key, asyncio.Lock())
+        await review_lock.acquire()
+        active_review = await self._find_active_review_for_user(*lock_key)
         if active_review is not None and await self._merge_into_active_review(
             active_review,
             message,
             embed,
             attachment_snapshots,
         ):
-            return
+            review_lock.release()
+            return True
         self._upsert_embed_field(
             embed,
             _("Channels:"),
@@ -3486,13 +3538,17 @@ class Honeypot(Cog):
         }
         if review_files:
             review_send_kwargs["files"] = review_files
-        sent = await review_channel.send(**review_send_kwargs)
-        view.review_message = sent
-        view.active_key = sent.id
-        async with self._views_lock:
-            self._active_views[sent.id] = view
-        await self._store_pending_review(message.guild, view, review_channel.id, sent.id)
-        await self._increment_stat(message.guild, "reviewed")
+        try:
+            sent = await review_channel.send(**review_send_kwargs)
+            view.review_message = sent
+            view.active_key = sent.id
+            async with self._views_lock:
+                self._active_views[sent.id] = view
+            await self._store_pending_review(message.guild, view, review_channel.id, sent.id)
+            await self._increment_stat(message.guild, "reviewed")
+            return False
+        finally:
+            review_lock.release()
 
     async def _send_log(
         self,
@@ -3723,8 +3779,11 @@ class Honeypot(Cog):
                     value=_("Message posted in a honeypot channel without matching suspicious rules"),
                     inline=False,
                 )
-            await self._send_review(message, config, embed, review_channel, logs_channel, attachment_snapshots)
-            await self._send_imagescan_feedback_messages(review_channel, message, feedback_views)
+            merged = await self._send_review(
+                message, config, embed, review_channel, logs_channel, attachment_snapshots
+            )
+            if not merged:
+                await self._send_imagescan_feedback_messages(review_channel, message, feedback_views)
             return
 
         if force_review and review_channel is None:
@@ -3855,7 +3914,9 @@ class Honeypot(Cog):
                     pending_assignments = {}
                 if not pending_assignments and not pending_roles:
                     continue
-                logs_channel = self._get_text_channel_or_thread(guild, config.get("logs_channel"))
+                joinwatch_channel = self._get_text_channel_or_thread(
+                    guild, joinwatch_channel_id(config)
+                )
                 for member_id_str, data in list(pending_assignments.items()):
                     try:
                         member_id = int(member_id_str)
@@ -3897,7 +3958,7 @@ class Honeypot(Cog):
                         else:
                             await self._edit_joinwatch_alert_auto_role(guild, data, _("Auto-role timer expired."))
                         await self._delete_joinwatch_pending_assignment(guild, member_id)
-                        if logs_channel is not None:
+                        if joinwatch_channel is not None:
                             embed = discord.Embed(
                                 title=_("Joinwatch auto-role timer expired"),
                                 description=_("{mention} ({id}) left before the scheduled role could be applied.").format(
@@ -3913,7 +3974,7 @@ class Honeypot(Cog):
                                 inline=False,
                             )
                             try:
-                                await logs_channel.send(embed=embed)
+                                await joinwatch_channel.send(embed=embed)
                             except discord.HTTPException:
                                 log.debug(
                                     "Failed to send joinwatch missing-member log for user %s in guild %s",
@@ -4018,7 +4079,7 @@ class Honeypot(Cog):
                             else:
                                 await self._edit_joinwatch_alert_auto_role(guild, data, _("Auto-role timer expired."))
                             await self._delete_joinwatch_pending_role(guild, member_id)
-                        if logs_channel is not None:
+                        if joinwatch_channel is not None:
                             embed = discord.Embed(
                                 title=_("Joinwatch auto-role timer expired"),
                                 description=_("{mention} ({id}) left before the auto-role timer expired.").format(
@@ -4034,7 +4095,7 @@ class Honeypot(Cog):
                                 inline=False,
                             )
                             try:
-                                await logs_channel.send(embed=embed)
+                                await joinwatch_channel.send(embed=embed)
                             except discord.HTTPException:
                                 log.debug(
                                     "Failed to send joinwatch missing-member log for user %s in guild %s",
@@ -4084,7 +4145,7 @@ class Honeypot(Cog):
                         else:
                             await self._edit_joinwatch_alert_auto_role(guild, data, _("Auto-role timer expired."))
                         await self._delete_joinwatch_pending_role(guild, member_id)
-                    if logs_channel is not None:
+                    if joinwatch_channel is not None:
                         embed = discord.Embed(
                             title=_("Joinwatch auto-role timer expired"),
                             description=_("{mention} ({id}) still had {role} when the timer expired.").format(
@@ -4101,7 +4162,7 @@ class Honeypot(Cog):
                             inline=False,
                         )
                         try:
-                            await logs_channel.send(embed=embed)
+                            await joinwatch_channel.send(embed=embed)
                         except discord.HTTPException:
                             log.debug("Failed to send joinwatch auto-role log for user %s in guild %s", member.id, guild.id)
             except Exception:
