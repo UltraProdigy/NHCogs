@@ -149,16 +149,12 @@ def joinwatch_channel_id(config: dict) -> int | None:
 
 
 def imagescan_feedback_items(
-    considered: list[discord.Attachment],
-    matches: list[tuple[discord.Attachment, dict[str, typing.Any], dict[str, str]]],
+    attachments: list[discord.Attachment],
     attachment_snapshots: list[dict[str, typing.Any]],
 ) -> list[tuple[discord.Attachment, int, bytes]]:
     items = []
-    for attachment, result, _hashes in matches:
-        if result.get("exact_decision") is not None:
-            continue
-        index = considered.index(attachment)
-        if index >= len(attachment_snapshots):
+    for index, attachment in enumerate(attachments):
+        if not is_image_attachment(attachment) or index >= len(attachment_snapshots):
             continue
         data = attachment_snapshots[index].get("data")
         if data is not None:
@@ -172,6 +168,13 @@ def is_image_attachment(attachment: discord.Attachment) -> bool:
         return True
     filename = attachment.filename.lower()
     return any(filename.endswith(extension) for extension in IMAGE_ATTACHMENT_EXTENSIONS)
+
+
+def imagescan_detector_batches(
+    attachments: list[discord.Attachment],
+) -> tuple[list[discord.Attachment], list[discord.Attachment]]:
+    images = [attachment for attachment in attachments if is_image_attachment(attachment)]
+    return images[:IMAGE_SCAN_MAX_ATTACHMENTS], images[IMAGE_SCAN_MAX_ATTACHMENTS:]
 
 
 def plan_imagescan_event_cache_cleanup(
@@ -2807,7 +2810,7 @@ class Honeypot(Cog):
             )
             return None
 
-        considered = image_items[:IMAGE_SCAN_MAX_ATTACHMENTS]
+        considered = image_items
         samples = await self._imagescan_load_samples(message.guild.id)
         if not any(sample.decision == "true_positive" for sample in samples):
             embed.add_field(
@@ -2829,7 +2832,7 @@ class Honeypot(Cog):
             )
             return None
 
-        unknown_feedback: list[tuple[discord.Attachment, int, bytes]] = []
+        feedback_items: list[tuple[discord.Attachment, int, bytes]] = []
         has_known_match = False
         for message_index, attachment, snapshot in considered:
             data = snapshot.get("data")
@@ -2843,11 +2846,9 @@ class Honeypot(Cog):
             result = match_image(hashes, samples, int(state["effective_threshold"]))
             if result["matched"] or result.get("exact_decision") is not None:
                 has_known_match = True
-                continue
-            if result.get("exact_decision") is None:
-                unknown_feedback.append((attachment, message_index + 1, data))
+            feedback_items.append((attachment, message_index + 1, data))
 
-        status = "queued" if unknown_feedback else image_learning_status(
+        status = "queued" if feedback_items else image_learning_status(
             has_images=True,
             has_known_match=has_known_match,
             can_queue=False,
@@ -2859,7 +2860,7 @@ class Honeypot(Cog):
         )
         if status != "queued":
             return None
-        return ImageScanFeedbackView(self, message, unknown_feedback)
+        return ImageScanFeedbackView(self, message, feedback_items)
 
     async def _send_imagescan_feedback_messages(
         self,
@@ -2886,22 +2887,16 @@ class Honeypot(Cog):
     ) -> bool:
         if not config.get("imagescan_detector_enabled", False):
             return False
-        image_attachments = [
-            attachment
-            for attachment in message.attachments
-            if self._imagescan_is_image_attachment(attachment)
-        ]
-        if not image_attachments:
+        trigger_batch, remaining_batch = imagescan_detector_batches(message.attachments)
+        if not trigger_batch:
             return False
 
         started_at = datetime.now(timezone.utc)
-        considered = image_attachments[:IMAGE_SCAN_MAX_ATTACHMENTS]
-        ignored_over_limit = max(0, len(image_attachments) - len(considered))
         profile: dict[str, int] = {
             "messages_scanned": 1,
             "messages_with_images": 1,
-            "images_considered": len(considered),
-            "images_ignored_over_limit": ignored_over_limit,
+            "images_considered": len(trigger_batch),
+            "images_ignored_over_limit": len(remaining_batch),
         }
         samples = await self._imagescan_load_samples(message.guild.id)
         if not any(sample.decision == "true_positive" for sample in samples):
@@ -2916,40 +2911,48 @@ class Honeypot(Cog):
             return False
 
         matches: list[tuple[discord.Attachment, dict[str, typing.Any], dict[str, str]]] = []
-        for attachment in considered:
-            download_started = datetime.now(timezone.utc)
-            try:
-                data = await attachment.read(use_cached=True)
-            except (discord.HTTPException, discord.Forbidden, discord.NotFound, TypeError):
-                continue
-            profile["download_ms_total"] = profile.get("download_ms_total", 0) + int(
-                (datetime.now(timezone.utc) - download_started).total_seconds() * 1000
-            )
-            profile["download_ms_count"] = profile.get("download_ms_count", 0) + 1
 
-            hash_started = datetime.now(timezone.utc)
-            try:
-                hashes = await asyncio.to_thread(image_hashes_from_bytes, data)
-            except Exception:
-                log.debug("Failed to hash imagescan attachment %s", attachment.filename, exc_info=True)
-                continue
-            profile["hash_ms_total"] = profile.get("hash_ms_total", 0) + int(
-                (datetime.now(timezone.utc) - hash_started).total_seconds() * 1000
-            )
-            profile["hash_ms_count"] = profile.get("hash_ms_count", 0) + 1
+        async def scan_batch(attachments: list[discord.Attachment]) -> None:
+            for attachment in attachments:
+                download_started = datetime.now(timezone.utc)
+                try:
+                    data = await attachment.read(use_cached=True)
+                except (discord.HTTPException, discord.Forbidden, discord.NotFound, TypeError):
+                    continue
+                profile["download_ms_total"] = profile.get("download_ms_total", 0) + int(
+                    (datetime.now(timezone.utc) - download_started).total_seconds() * 1000
+                )
+                profile["download_ms_count"] = profile.get("download_ms_count", 0) + 1
 
-            compare_started = datetime.now(timezone.utc)
-            result = match_image(hashes, samples, int(state["effective_threshold"]))
-            profile["compare_ms_total"] = profile.get("compare_ms_total", 0) + int(
-                (datetime.now(timezone.utc) - compare_started).total_seconds() * 1000
-            )
-            profile["compare_ms_count"] = profile.get("compare_ms_count", 0) + 1
-            if result["matched"]:
-                matches.append((attachment, result, hashes))
-                if result["exact_decision"] == "true_positive":
-                    profile["exact_tp_hits"] = profile.get("exact_tp_hits", 0) + 1
-                else:
-                    profile["flagged_tp_hits"] = profile.get("flagged_tp_hits", 0) + 1
+                hash_started = datetime.now(timezone.utc)
+                try:
+                    hashes = await asyncio.to_thread(image_hashes_from_bytes, data)
+                except Exception:
+                    log.debug("Failed to hash imagescan attachment %s", attachment.filename, exc_info=True)
+                    continue
+                profile["hash_ms_total"] = profile.get("hash_ms_total", 0) + int(
+                    (datetime.now(timezone.utc) - hash_started).total_seconds() * 1000
+                )
+                profile["hash_ms_count"] = profile.get("hash_ms_count", 0) + 1
+
+                compare_started = datetime.now(timezone.utc)
+                result = match_image(hashes, samples, int(state["effective_threshold"]))
+                profile["compare_ms_total"] = profile.get("compare_ms_total", 0) + int(
+                    (datetime.now(timezone.utc) - compare_started).total_seconds() * 1000
+                )
+                profile["compare_ms_count"] = profile.get("compare_ms_count", 0) + 1
+                if result["matched"]:
+                    matches.append((attachment, result, hashes))
+                    if result["exact_decision"] == "true_positive":
+                        profile["exact_tp_hits"] = profile.get("exact_tp_hits", 0) + 1
+                    else:
+                        profile["flagged_tp_hits"] = profile.get("flagged_tp_hits", 0) + 1
+
+        await scan_batch(trigger_batch)
+        if matches and remaining_batch:
+            await scan_batch(remaining_batch)
+            profile["images_considered"] = len(trigger_batch) + len(remaining_batch)
+            profile["images_ignored_over_limit"] = 0
 
         profile["decision_ms_total"] = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
         profile["decision_ms_count"] = 1
@@ -2958,7 +2961,7 @@ class Honeypot(Cog):
             return False
 
         attachment_snapshots = await self._snapshot_attachments(message)
-        feedback_items = imagescan_feedback_items(considered, matches, attachment_snapshots)
+        feedback_items = imagescan_feedback_items(message.attachments, attachment_snapshots)
         feedback_view = ImageScanFeedbackView(self, message, feedback_items) if feedback_items else None
         embed = discord.Embed(
             title=_("Honeypot hit"),
