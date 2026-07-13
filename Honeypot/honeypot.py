@@ -360,6 +360,10 @@ def message_spam_fingerprint(message: discord.Message) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+# Interaction response policy: use ephemeral messages only for useful information
+# that is not already visible in the public message, such as permission denials,
+# errors, conflicts, or confirmation prompts. Do not repeat successful actions
+# when the updated embed, content, or disabled controls already show the result.
 class ReviewView(discord.ui.View):
     def __init__(
         self,
@@ -583,7 +587,7 @@ class ReviewView(discord.ui.View):
 
     @discord.ui.button(label="Ban", style=discord.ButtonStyle.danger, emoji="🔨", custom_id="honeypot:review:ban")
     async def ban_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         if not await self._claim_resolution():
             await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
             return
@@ -597,7 +601,7 @@ class ReviewView(discord.ui.View):
 
     @discord.ui.button(label="Kick", style=discord.ButtonStyle.secondary, emoji="👢", custom_id="honeypot:review:kick")
     async def kick_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         if not await self._claim_resolution():
             await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
             return
@@ -611,7 +615,7 @@ class ReviewView(discord.ui.View):
 
     @discord.ui.button(label="Ignore", style=discord.ButtonStyle.success, emoji="✅", custom_id="honeypot:review:ignore")
     async def ignore_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         if not await self._claim_resolution():
             await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
             return
@@ -631,7 +635,7 @@ class KickFailWarnView(discord.ui.View):
 
     @discord.ui.button(label="Yes", style=discord.ButtonStyle.danger, custom_id="honeypot:kickfailwarn:yes")
     async def warn_yes(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         if not self.review_view._check_perms(interaction):
             await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
             return
@@ -653,12 +657,11 @@ class KickFailWarnView(discord.ui.View):
             await interaction.followup.send(failed, ephemeral=True)
             return
         await self.review_view._update_done(interaction, label or _("Warning applied"))
-        await interaction.followup.send(_("Warning applied."), ephemeral=True)
         self.stop()
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.secondary, custom_id="honeypot:kickfailwarn:no")
     async def warn_no(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         if not self.review_view._check_perms(interaction):
             await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
             return
@@ -666,7 +669,6 @@ class KickFailWarnView(discord.ui.View):
             await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
             return
         await self.review_view._update_done(interaction, _("Kick skipped; target left the server."))
-        await interaction.followup.send(_("No warning applied."), ephemeral=True)
         self.stop()
 
 
@@ -717,21 +719,20 @@ class ImageScanReviewView(discord.ui.View):
                 await message.edit(content=_("✅ **Image scan classified**"), embed=embed, view=self)
             except discord.HTTPException:
                 log.debug("Failed to edit imagescan review message %s", getattr(message, "id", None))
-        await interaction.followup.send(_("Classification saved: {label}").format(label=label), ephemeral=True)
 
     @discord.ui.button(label="Confirm scam", style=discord.ButtonStyle.danger, custom_id="honeypot:imagescan:true_positive")
     async def confirm_scam(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         await self._set_decision(interaction, "true_positive", _("True positive"))
 
     @discord.ui.button(label="False positive", style=discord.ButtonStyle.secondary, custom_id="honeypot:imagescan:false_positive")
     async def false_positive(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         await self._set_decision(interaction, "false_positive", _("False positive"))
 
     @discord.ui.button(label="Ignore", style=discord.ButtonStyle.success, custom_id="honeypot:imagescan:ignored")
     async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         await self._set_decision(interaction, "ignored", _("Ignored"))
 
 
@@ -873,7 +874,7 @@ class ImageScanFeedbackView(discord.ui.View):
         self.add_item(self.confirm_fp)
         self.add_item(self.ignore_image)
 
-    async def _finish_interaction(self, interaction: discord.Interaction, note: str) -> None:
+    async def _finish_interaction(self, interaction: discord.Interaction, error: str | None = None) -> None:
         pending = self._next_pending_index()
         if pending is None:
             self.clear_items()
@@ -882,31 +883,31 @@ class ImageScanFeedbackView(discord.ui.View):
             self._show_individual_controls()
         if interaction.message is not None:
             await interaction.message.edit(content=self.status_content(), view=self)
-        await interaction.followup.send(note, ephemeral=True)
+        if error is not None:
+            await interaction.followup.send(error, ephemeral=True)
 
     async def _apply_bulk(self, interaction: discord.Interaction, decision: str, token: str) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         if not self._check_perms(interaction):
             await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
             return
         if not await self._confirm_text(interaction, token):
             return
-        saved = conflicts = 0
+        conflicts = 0
         for index, item in enumerate(self.items):
             if item["decision"] is not None:
                 continue
             status, _sample = await self._save_item_decision(interaction, index, decision)
-            if status in ("inserted", "duplicate"):
-                saved += 1
-            else:
+            if status not in ("inserted", "duplicate"):
                 conflicts += 1
         self._disable_all()
         if interaction.message is not None:
             await interaction.message.edit(content=self.status_content(), view=self)
-        await interaction.followup.send(
-            _("Saved: {saved}. Conflicts: {conflicts}.").format(saved=saved, conflicts=conflicts),
-            ephemeral=True,
-        )
+        if conflicts:
+            await interaction.followup.send(
+                _("Could not save {conflicts} image(s) because of TP/FP overlap.").format(conflicts=conflicts),
+                ephemeral=True,
+            )
 
     @discord.ui.button(label="All TP", style=discord.ButtonStyle.danger)
     async def all_tp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -918,7 +919,7 @@ class ImageScanFeedbackView(discord.ui.View):
 
     @discord.ui.button(label="Ignore all", style=discord.ButtonStyle.success)
     async def ignore_all(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         if not self._check_perms(interaction):
             await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
             return
@@ -928,7 +929,6 @@ class ImageScanFeedbackView(discord.ui.View):
         self._disable_all()
         if interaction.message is not None:
             await interaction.message.edit(content=self.status_content(), view=self)
-        await interaction.followup.send(_("All images ignored."), ephemeral=True)
 
     @discord.ui.button(label="Individual", style=discord.ButtonStyle.primary)
     async def individual(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -940,30 +940,32 @@ class ImageScanFeedbackView(discord.ui.View):
 
     @discord.ui.button(label="Confirm TP", style=discord.ButtonStyle.danger)
     async def confirm_tp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         if not self._check_perms(interaction):
             await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
             return
         status, _sample = await self._save_item_decision(interaction, self.selected_index, "true_positive")
-        await self._finish_interaction(interaction, _("TP saved.") if status != "conflict" else _("Rejected: TP/FP overlap."))
+        error = _("Rejected: TP/FP overlap.") if status == "conflict" else None
+        await self._finish_interaction(interaction, error)
 
     @discord.ui.button(label="Confirm FP", style=discord.ButtonStyle.secondary)
     async def confirm_fp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         if not self._check_perms(interaction):
             await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
             return
         status, _sample = await self._save_item_decision(interaction, self.selected_index, "false_positive")
-        await self._finish_interaction(interaction, _("FP saved.") if status != "conflict" else _("Rejected: TP/FP overlap."))
+        error = _("Rejected: TP/FP overlap.") if status == "conflict" else None
+        await self._finish_interaction(interaction, error)
 
     @discord.ui.button(label="Ignore image", style=discord.ButtonStyle.success)
     async def ignore_image(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         if not self._check_perms(interaction):
             await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
             return
         self.items[self.selected_index]["decision"] = "ignored"
-        await self._finish_interaction(interaction, _("Image ignored."))
+        await self._finish_interaction(interaction)
 
 
 @cog_i18n(_)
