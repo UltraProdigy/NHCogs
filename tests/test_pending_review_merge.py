@@ -47,6 +47,26 @@ class PendingReviewMergeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(honeypot.joinwatch_channel_id({"logs_channel": 456}))
 
+    def test_approximate_detector_match_builds_grouped_feedback_item(self) -> None:
+        attachment = SimpleNamespace(filename="hashdiff-12.png")
+        other = SimpleNamespace(filename="other.png")
+        data = b"approximate-image-bytes"
+        matches = [
+            (
+                attachment,
+                {"matched": True, "exact_decision": None, "score": 12, "threshold": 20},
+                {},
+            )
+        ]
+
+        items = honeypot.imagescan_feedback_items(
+            [other, attachment],
+            matches,
+            [{"data": b"other"}, {"data": data}],
+        )
+
+        self.assertEqual(items, [(attachment, 2, data)])
+
     async def test_feedback_sender_posts_one_panel_for_multiple_images(self) -> None:
         cog = object.__new__(honeypot.Honeypot)
         panel = SimpleNamespace(status_content=lambda: "panel")

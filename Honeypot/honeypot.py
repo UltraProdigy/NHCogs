@@ -148,6 +148,24 @@ def joinwatch_channel_id(config: dict) -> int | None:
     return channel_id if isinstance(channel_id, int) else None
 
 
+def imagescan_feedback_items(
+    considered: list[discord.Attachment],
+    matches: list[tuple[discord.Attachment, dict[str, typing.Any], dict[str, str]]],
+    attachment_snapshots: list[dict[str, typing.Any]],
+) -> list[tuple[discord.Attachment, int, bytes]]:
+    items = []
+    for attachment, result, _hashes in matches:
+        if result.get("exact_decision") is not None:
+            continue
+        index = considered.index(attachment)
+        if index >= len(attachment_snapshots):
+            continue
+        data = attachment_snapshots[index].get("data")
+        if data is not None:
+            items.append((attachment, index + 1, data))
+    return items
+
+
 def is_image_attachment(attachment: discord.Attachment) -> bool:
     content_type = (attachment.content_type or "").lower()
     if content_type.startswith("image/"):
@@ -2922,14 +2940,8 @@ class Honeypot(Cog):
 
         attachment_snapshots = await self._snapshot_attachments(message)
         best_attachment, best_match, _hashes = matches[0]
-        feedback_view = None
-        if best_match["exact_decision"] is None:
-            feedback_view = ImageScanFeedbackView(
-                self,
-                message,
-                best_attachment,
-                considered.index(best_attachment) + 1,
-            )
+        feedback_items = imagescan_feedback_items(considered, matches, attachment_snapshots)
+        feedback_view = ImageScanFeedbackView(self, message, feedback_items) if feedback_items else None
         embed = discord.Embed(
             title=_("Honeypot hit"),
             description=f">>> {message.content}" if message.content else _("*(message with attachments only)*"),
@@ -2974,7 +2986,7 @@ class Honeypot(Cog):
                 if not merged and feedback_view is not None:
                     try:
                         await review_channel.send(
-                            _("Image detector feedback: {url}").format(url=message.jump_url),
+                            feedback_view.status_content(),
                             view=feedback_view,
                             allowed_mentions=discord.AllowedMentions.none(),
                         )
