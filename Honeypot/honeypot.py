@@ -210,11 +210,14 @@ def format_image_hash_diff(score: int, threshold: int) -> str:
 def format_imagescan_matched_attachments(
     matches: list[tuple[discord.Attachment, dict[str, typing.Any], dict[str, str]]],
 ) -> str:
-    names = [
-        getattr(attachment, "filename", None) or "unknown"
-        for attachment, _match, _hashes in matches
+    lines = [
+        "`{hash_diff}` — {filename}".format(
+            hash_diff=format_image_hash_diff(match["score"], match["threshold"]),
+            filename=getattr(attachment, "filename", None) or "unknown",
+        )
+        for attachment, match, _hashes in matches
     ]
-    return "\n".join(names)
+    return "\n".join(lines)
 
 
 def match_imagescan_sample_identifier(
@@ -1050,6 +1053,20 @@ class Honeypot(Cog):
         self._imagescan_db_path = cog_data_path(self) / "imagescan.sqlite"
         self._imagescan_files_path = cog_data_path(self) / "imagescan_files"
         self._imagescan_db_lock: asyncio.Lock = asyncio.Lock()
+
+    async def cog_after_invoke(self, ctx: commands.Context) -> commands.Context | None:
+        """Finish command cleanup without AAA3A_utils' redundant success reaction."""
+        if isinstance(ctx.command, commands.Group) and (
+            ctx.invoked_subcommand is not None or not ctx.command.invoke_without_command
+        ):
+            return None
+        if ctx.command_failed:
+            return await super().cog_after_invoke(ctx)
+        typing = getattr(ctx, "_typing", None)
+        task = getattr(typing, "task", None)
+        if callable(getattr(task, "cancel", None)):
+            task.cancel()
+        return ctx
 
     async def _increment_stat(self, guild: discord.Guild, key: str, amount: int = 1) -> None:
         async with self.config.guild(guild).stats() as stats:
@@ -2941,7 +2958,6 @@ class Honeypot(Cog):
             return False
 
         attachment_snapshots = await self._snapshot_attachments(message)
-        best_attachment, best_match, _hashes = matches[0]
         feedback_items = imagescan_feedback_items(considered, matches, attachment_snapshots)
         feedback_view = ImageScanFeedbackView(self, message, feedback_items) if feedback_items else None
         embed = discord.Embed(
@@ -2957,16 +2973,11 @@ class Honeypot(Cog):
         embed.set_thumbnail(url=message.author.display_avatar)
         embed.add_field(name=_("Reason:"), value=_("Honeypot"), inline=False)
         embed.add_field(name=_("Channel:"), value=getattr(message.channel, "mention", f"<#{message.channel.id}>"), inline=True)
-        embed.add_field(
-            name=_("Hash Diff:"),
-            value=format_image_hash_diff(best_match["score"], best_match["threshold"]),
-            inline=True,
-        )
-        attachment_field = _("Attachments:") if len(matches) != 1 else _("Attachment:")
+        attachment_field = _("Matched attachments:") if len(matches) != 1 else _("Matched attachment:")
         embed.add_field(
             name=attachment_field,
             value=format_imagescan_matched_attachments(matches),
-            inline=True,
+            inline=False,
         )
         embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
 
