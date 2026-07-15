@@ -1169,7 +1169,7 @@ class Honeypot(Cog):
         samples = self._imagescan_load_samples_sync(guild_id)
         state = rebuild_model_state(samples, configured_threshold)
         state["stored_size_bytes"] = self._imagescan_stored_size_sync(guild_id)
-        with sqlite3.connect(self._imagescan_db_path) as conn:
+        with closing(sqlite3.connect(self._imagescan_db_path)) as conn, conn:
             conn.execute(
                 """
                 INSERT INTO imagescan_model_state (
@@ -1219,7 +1219,7 @@ class Honeypot(Cog):
         return int(row[0] or 0)
 
     def _imagescan_profile_sync(self, guild_id: int) -> dict[str, int]:
-        with sqlite3.connect(self._imagescan_db_path) as conn:
+        with closing(sqlite3.connect(self._imagescan_db_path)) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 f"SELECT {', '.join(IMAGE_SCAN_PROFILE_COLUMNS)} FROM imagescan_profile WHERE guild_id = ?",
@@ -1246,7 +1246,7 @@ class Honeypot(Cog):
         columns = ["guild_id", *filtered.keys()]
         placeholders = ", ".join("?" for _ in columns)
         updates = ", ".join(f"{key} = {key} + excluded.{key}" for key in filtered)
-        with sqlite3.connect(self._imagescan_db_path) as conn:
+        with closing(sqlite3.connect(self._imagescan_db_path)) as conn, conn:
             conn.execute(
                 f"""
                 INSERT INTO imagescan_profile ({", ".join(columns)})
@@ -3550,15 +3550,29 @@ class Honeypot(Cog):
     ) -> DetectionSignal | None:
         if not config.get("imagescan_detector_enabled", False):
             return None
-        if not any(is_image_attachment(attachment) for attachment in message.attachments):
+        image_count = sum(
+            1 for attachment in message.attachments if is_image_attachment(attachment)
+        )
+        if not image_count:
             return None
+        decision_started = perf_counter()
+        profile = {
+            "messages_scanned": 1,
+            "messages_with_images": 1,
+            "images_considered": min(image_count, IMAGE_SCAN_MAX_ATTACHMENTS),
+            "images_ignored_over_limit": max(
+                0, image_count - IMAGE_SCAN_MAX_ATTACHMENTS
+            ),
+        }
         samples = await self._imagescan_load_samples(message.guild.id)
         if not any(sample.decision == "true_positive" for sample in samples):
+            await self._imagescan_increment_profile(message.guild.id, profile)
             return None
         state = await self._imagescan_model_state(
             message.guild.id, int(config.get("imagescan_detector_threshold", 20))
         )
         if not state["valid"]:
+            await self._imagescan_increment_profile(message.guild.id, profile)
             return None
         matches: list[dict[str, object]] = []
         scans = await self._scan_image_attachments(
@@ -3569,6 +3583,16 @@ class Honeypot(Cog):
             stop_after_match=True,
             batch_key=(message.guild.id, message.id),
         )
+        successful_scans = [scan for scan in scans if scan["error"] is None]
+        for stage in ("download", "hash", "compare"):
+            profile[f"{stage}_ms_total"] = sum(
+                int(scan[f"{stage}_ms"]) for scan in successful_scans
+            )
+            profile[f"{stage}_ms_count"] = len(successful_scans)
+        profile["decision_ms_total"] = int(
+            (perf_counter() - decision_started) * 1000
+        )
+        profile["decision_ms_count"] = 1
         for scan in scans:
             if scan["error"] is not None:
                 log.debug(
@@ -3587,6 +3611,11 @@ class Honeypot(Cog):
                     "exact_decision": result.get("exact_decision"),
                 }
             )
+            if result.get("exact_decision") == "true_positive":
+                profile["exact_tp_hits"] = profile.get("exact_tp_hits", 0) + 1
+            else:
+                profile["flagged_tp_hits"] = profile.get("flagged_tp_hits", 0) + 1
+        await self._imagescan_increment_profile(message.guild.id, profile)
         if not matches:
             self._initial_image_scan_batches.pop((message.guild.id, message.id), None)
             return None
@@ -3937,6 +3966,7 @@ class Honeypot(Cog):
 
         async def scan_one(position, image_position, attachment):
             try:
+                download_started = perf_counter()
                 capture = captures.get(position)
                 if capture is not None and capture.path is not None:
                     data = await asyncio.wait_for(
@@ -3956,13 +3986,21 @@ class Honeypot(Cog):
                         ),
                         timeout=DETECTION_ATTACHMENT_TIMEOUT_SECONDS,
                     )
+                download_ms = (perf_counter() - download_started) * 1000
+                hash_started = perf_counter()
                 hashes = await asyncio.to_thread(image_hashes_from_bytes, data)
+                hash_ms = (perf_counter() - hash_started) * 1000
+                compare_started = perf_counter()
                 result = await asyncio.to_thread(match_image, hashes, samples, threshold)
+                compare_ms = (perf_counter() - compare_started) * 1000
                 error = None
             except Exception as exception:
                 hashes = {}
                 result = {}
                 error = f"{type(exception).__name__}: {exception}"[:512]
+                download_ms = 0.0
+                hash_ms = 0.0
+                compare_ms = 0.0
             return {
                 "position": position,
                 "image_position": image_position,
@@ -3971,6 +4009,9 @@ class Honeypot(Cog):
                 "result": result,
                 "error": error,
                 "data": data if error is None else None,
+                "download_ms": download_ms,
+                "hash_ms": hash_ms,
+                "compare_ms": compare_ms,
             }
 
         if stop_after_match:

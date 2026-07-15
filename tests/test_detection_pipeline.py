@@ -893,6 +893,7 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
                 cog = honeypot.Honeypot(_Bot())
+                await cog._init_imagescan_store()
                 started = 0
                 four_started = asyncio.Event()
                 release_non_matches = asyncio.Event()
@@ -931,7 +932,6 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                 cog._imagescan_model_state = mock.AsyncMock(
                     return_value={"valid": True, "effective_threshold": 20}
                 )
-                cog._imagescan_increment_profile = mock.AsyncMock()
                 cog._increment_stat = mock.AsyncMock()
                 cog._snapshot_attachments = mock.AsyncMock()
                 cog._send_review = mock.AsyncMock()
@@ -1000,7 +1000,16 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(
                     all(thread_id != event_loop_thread for thread_id in match_threads)
                 )
-                cog._imagescan_increment_profile.assert_not_awaited()
+                profile = await asyncio.to_thread(
+                    cog._imagescan_profile_sync, message.guild.id
+                )
+                self.assertEqual(profile["messages_scanned"], 1)
+                self.assertEqual(profile["messages_with_images"], 1)
+                self.assertGreaterEqual(profile["images_considered"], 1)
+                self.assertEqual(profile["decision_ms_count"], 1)
+                self.assertGreaterEqual(profile["download_ms_count"], 1)
+                self.assertGreaterEqual(profile["hash_ms_count"], 1)
+                self.assertGreaterEqual(profile["compare_ms_count"], 1)
                 cog._increment_stat.assert_not_awaited()
                 cog._snapshot_attachments.assert_not_awaited()
                 cog._send_review.assert_not_awaited()
@@ -1026,6 +1035,7 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                 cog._imagescan_model_state = mock.AsyncMock(
                     return_value={"valid": True, "effective_threshold": 20}
                 )
+                cog._imagescan_increment_profile = mock.AsyncMock()
                 with (
                     mock.patch.object(
                         honeypot,
@@ -6029,6 +6039,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
                 cog = honeypot.Honeypot(_Bot())
                 await asyncio.to_thread(cog._case_store.initialize)
+                await cog._init_imagescan_store()
                 message = self._message(honeypot, attachment_count=6)
                 config = {
                     "enabled": True, "dry_run": False, "logs_channel": None,
@@ -6095,6 +6106,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
                 cog = honeypot.Honeypot(_Bot())
                 await asyncio.to_thread(cog._case_store.initialize)
+                await cog._init_imagescan_store()
                 message = self._message(honeypot, attachment_count=2)
                 message.attachments[0].read.side_effect = [
                     OSError("temporary CDN failure"),
