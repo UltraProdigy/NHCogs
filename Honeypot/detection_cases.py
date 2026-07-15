@@ -665,13 +665,6 @@ class DetectionCaseStore:
             raise KeyError(case_id)
         return self._projection_endpoint_from_row(row)
 
-    def get_projection_endpoint(self, case_id: str) -> ProjectionEndpointRecord | None:
-        with closing(self._connect()) as connection:
-            row = connection.execute(
-                "SELECT * FROM detection_projection_endpoints WHERE case_id = ?",
-                (case_id,),
-            ).fetchone()
-        return None if row is None else self._projection_endpoint_from_row(row)
 
     def activate_projection_endpoint(
         self,
@@ -1139,49 +1132,6 @@ class DetectionCaseStore:
                 return None
             return self._snapshot(connection, case_row)
 
-    def add_signals(
-        self,
-        case_id: str,
-        message_sequence: int,
-        signals: tuple[DetectionSignal, ...],
-    ) -> int:
-        if not signals:
-            return 0
-        with closing(self._connect()) as connection, connection:
-            connection.execute("BEGIN IMMEDIATE")
-            next_position = connection.execute(
-                """SELECT COALESCE(MAX(position), -1) + 1 FROM detection_signals
-                   WHERE case_id = ? AND message_sequence = ?""",
-                (case_id, message_sequence),
-            ).fetchone()[0]
-            existing = {
-                (row["detector"], row["reason"])
-                for row in connection.execute(
-                    """SELECT detector, reason FROM detection_signals
-                       WHERE case_id = ? AND message_sequence = ?""",
-                    (case_id, message_sequence),
-                )
-            }
-            inserted = 0
-            for signal in signals:
-                if (signal.detector, signal.reason) in existing:
-                    continue
-                connection.execute(
-                    """INSERT INTO detection_signals VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        case_id,
-                        message_sequence,
-                        next_position + inserted,
-                        signal.detector,
-                        signal.reason,
-                        signal.action.value,
-                        signal.decisive,
-                        json.dumps(_json_value(signal.metadata), separators=(",", ":")),
-                    ),
-                )
-                existing.add((signal.detector, signal.reason))
-                inserted += 1
-            return inserted
 
     def claim_firstpost(
         self,
@@ -1802,17 +1752,6 @@ class DetectionCaseStore:
             )
             return result.rowcount == 1
 
-    def get_active_case(self, guild_id: int, user_id: int) -> CaseSnapshot | None:
-        with closing(self._connect()) as connection, connection:
-            connection.execute("BEGIN")
-            case_row = connection.execute(
-                """SELECT * FROM detection_cases
-                   WHERE guild_id = ? AND user_id = ? AND status = 'pending'""",
-                (guild_id, user_id),
-            ).fetchone()
-            if case_row is None:
-                return None
-            return self._snapshot(connection, case_row)
 
     def list_open_cases(self) -> tuple[CaseSnapshot, ...]:
         with closing(self._connect()) as connection, connection:

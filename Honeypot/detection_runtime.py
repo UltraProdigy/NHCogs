@@ -179,27 +179,6 @@ async def capture_attachment(
     )
 
 
-async def capture_attachments(
-    attachments: Iterable[object],
-    target_dir: Path,
-    timeout_seconds: float,
-    *,
-    max_bytes: int = 25 * 1024 * 1024,
-    reader: BoundedReader = read_attachment_bounded,
-) -> tuple[CaptureResult, ...]:
-    target_dir.mkdir(parents=True, exist_ok=True)
-    captures = (
-        capture_attachment(
-            attachment,
-            target_dir,
-            position,
-            timeout_seconds,
-            max_bytes=max_bytes,
-            reader=reader,
-        )
-        for position, attachment in enumerate(attachments)
-    )
-    return tuple(await asyncio.gather(*captures))
 
 
 async def delete_message(
@@ -227,10 +206,3 @@ async def delete_message(
             await sleep(retry_delay)
 
     raise AssertionError("unreachable")
-
-
-def cleanup_case_directory(path: Path) -> None:
-    if path.is_symlink():
-        path.unlink(missing_ok=True)
-    elif path.exists():
-        shutil.rmtree(path)

@@ -615,12 +615,6 @@ class CaseReviewProjectionTests(unittest.TestCase):
         self.assertNotIn("Image feedback:", field_names)
         self.assertEqual(len(projection.message_lines), 400)
         self.assertEqual(len(projection.feedback_lines), 400)
-        self.assertEqual(
-            case_review.attachment_custom_id(cases.AttachmentKey("case-1", 2, 3), "fp"),
-            "honeypot:case:case-1:images:2:3:fp",
-        )
-
-
 class CaseReviewServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.directory = TemporaryDirectory()
@@ -651,25 +645,6 @@ class CaseReviewServiceTests(unittest.IsolatedAsyncioTestCase):
                 f"case/1/{position}-same.png",
             )
         return appended.case.case_id
-
-    async def test_bulk_actions_persist_every_attachment_decision(self):
-        expected = {
-            "tp": "true_positive",
-            "fp": "false_positive",
-            "ignore": "ignored",
-        }
-        for action, decision in expected.items():
-            with self.subTest(action=action):
-                case_id = self.create_case()
-                service = case_review.CaseReviewService(self.store)
-
-                snapshot = await service.apply_bulk(case_id, action, moderator_id=7)
-
-                self.assertEqual(
-                    [item.learning_decision for item in snapshot.attachments],
-                    [decision, decision],
-                )
-                self.assertEqual(snapshot.case.status, cases.CaseStatus.RESOLVED)
 
     async def test_bulk_tp_ignores_captured_pdf_evidence(self):
         now = datetime(2026, 7, 14, tzinfo=timezone.utc)
@@ -710,8 +685,11 @@ class CaseReviewServiceTests(unittest.IsolatedAsyncioTestCase):
                 "tp",
                 moderator_id=7,
             )
-        snapshot = await case_review.CaseReviewService(self.store).apply_bulk(
-            appended.case.case_id, "tp", moderator_id=7
+        snapshot = await case_review.CaseReviewService(self.store).apply_message(
+            appended.case.case_id,
+            appended.message.sequence,
+            "tp",
+            moderator_id=7,
         )
 
         self.assertEqual(
@@ -770,36 +748,11 @@ class CaseReviewServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(snapshot.case.status, cases.CaseStatus.PENDING)
 
-    async def test_repeated_bulk_action_is_idempotent(self):
-        case_id = self.create_case()
-        service = case_review.CaseReviewService(self.store)
-
-        first = await service.apply_bulk(case_id, "tp", moderator_id=7)
-        repeated = await service.apply_bulk(case_id, "tp", moderator_id=7)
-
-        self.assertEqual(first, repeated)
-        self.assertEqual(
-            [item.learning_decision for item in repeated.attachments],
-            ["true_positive", "true_positive"],
-        )
-
-    async def test_concurrent_repeated_bulk_action_is_idempotent(self):
-        case_id = self.create_case()
-        service = case_review.CaseReviewService(self.store)
-
-        first, repeated = await asyncio.gather(
-            service.apply_bulk(case_id, "tp", moderator_id=7),
-            service.apply_bulk(case_id, "tp", moderator_id=7),
-        )
-
-        self.assertEqual(first, repeated)
-        self.assertEqual(first.case.resolution, "images:tp")
-
-    async def test_identical_individual_retry_after_bulk_resolution_is_a_noop(self):
+    async def test_identical_individual_retry_after_message_resolution_is_a_noop(self):
         case_id = self.create_case()
         service = case_review.CaseReviewService(self.store)
         key = cases.AttachmentKey(case_id, 1, 0)
-        resolved = await service.apply_bulk(case_id, "tp", moderator_id=7)
+        resolved = await service.apply_message(case_id, 1, "tp", moderator_id=7)
 
         repeated = await service.apply_individual(key, "tp", moderator_id=7)
 

@@ -24,6 +24,18 @@ PACKAGE_DIR = Path(__file__).resolve().parents[1] / "Honeypot"
 _MISSING = object()
 
 
+def active_case(store, guild_id: int, user_id: int):
+    return next(
+        (
+            snapshot
+            for snapshot in store.list_open_cases()
+            if snapshot.case.guild_id == guild_id
+            and snapshot.case.user_id == user_id
+        ),
+        None,
+    )
+
+
 def _load_module(name: str, path: Path):
     spec = util.spec_from_file_location(name, path)
     module = util.module_from_spec(spec)
@@ -1642,7 +1654,7 @@ class ThreadBackedCasePublicationTests(unittest.IsolatedAsyncioTestCase):
                     )
 
                 endpoint = await asyncio.to_thread(
-                    cog._case_store.get_projection_endpoint,
+                    cog._case_store.ensure_projection_endpoint,
                     appended.case.case_id,
                 )
                 timeline = await asyncio.to_thread(
@@ -1708,7 +1720,7 @@ class ThreadBackedCasePublicationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(adopted, thread)
                 self.assertEqual(summary.fetch_thread.await_count, 2)
                 endpoint = await asyncio.to_thread(
-                    cog._case_store.get_projection_endpoint,
+                    cog._case_store.ensure_projection_endpoint,
                     appended.case.case_id,
                 )
                 self.assertEqual(endpoint.thread_id, 60)
@@ -2405,7 +2417,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
                 message.delete.assert_not_awaited()
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case,
+                    active_case, cog._case_store,
                     message.guild.id,
                     message.author.id,
                 )
@@ -2445,7 +2457,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case,
+                    active_case, cog._case_store,
                     message.guild.id,
                     message.author.id,
                 )
@@ -2486,7 +2498,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case,
+                    active_case, cog._case_store,
                     message.guild.id,
                     message.author.id,
                 )
@@ -2598,7 +2610,8 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 release_first_detection.set()
                 await asyncio.gather(first_task, second_task)
 
-                snapshot = cog._case_store.get_active_case(
+                snapshot = active_case(
+                    cog._case_store,
                     first.guild.id, first.author.id
                 )
                 self.assertEqual(
@@ -2653,7 +2666,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     async with asyncio.timeout(0.5):
                         while True:
                             snapshot = await asyncio.to_thread(
-                                cog._case_store.get_active_case,
+                                active_case, cog._case_store,
                                 first.guild.id,
                                 first.author.id,
                             )
@@ -2703,7 +2716,8 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 message.delete.assert_awaited_once()
-                snapshot = cog._case_store.get_active_case(
+                snapshot = active_case(
+                    cog._case_store,
                     message.guild.id, message.author.id
                 )
                 self.assertFalse(snapshot.case.needs_attention)
@@ -2751,7 +2765,8 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(SimulatedCrash):
                         await crashed.on_message(message)
 
-                admitted = crashed._case_store.get_active_case(
+                admitted = active_case(
+                    crashed._case_store,
                     message.guild.id, message.author.id
                 )
                 self.assertEqual(
@@ -2836,7 +2851,8 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(SimulatedCrash):
                         await cog.on_message(message)
 
-                snapshot = cog._case_store.get_active_case(
+                snapshot = active_case(
+                    cog._case_store,
                     message.guild.id, message.author.id
                 )
                 self.assertEqual(
@@ -2870,7 +2886,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertIsNotNone(snapshot)
                 self.assertEqual(
@@ -2925,7 +2941,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(
                     [item.signal.detector for item in snapshot.signals], ["spam"]
@@ -2961,7 +2977,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(
                     [item.signal.detector for item in snapshot.signals], ["image"]
@@ -3010,7 +3026,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(
                     [item.capture_status for item in snapshot.attachments],
@@ -3146,7 +3162,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case,
+                    active_case, cog._case_store,
                     message.guild.id,
                     message.author.id,
                 )
@@ -3214,7 +3230,8 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(capture_task, deletion_task)
 
                 self.assertIsNone(
-                    cog._case_store.get_active_case(
+                    active_case(
+                        cog._case_store,
                         message.guild.id, message.author.id
                     )
                 )
@@ -3262,7 +3279,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     capture_task = asyncio.create_task(capture_cog.on_message(message))
                     await asyncio.wait_for(capture_started.wait(), timeout=1)
                     snapshot = await asyncio.to_thread(
-                        deletion_cog._case_store.get_active_case,
+                        active_case, deletion_cog._case_store,
                         message.guild.id,
                         message.author.id,
                     )
@@ -3285,7 +3302,8 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     await capture_task
 
                 self.assertIsNone(
-                    deletion_cog._case_store.get_active_case(
+                    active_case(
+                        deletion_cog._case_store,
                         message.guild.id, message.author.id
                     )
                 )
@@ -3364,7 +3382,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertIsNotNone(snapshot)
                 self.assertEqual([item.position for item in snapshot.attachments], [0, 1])
@@ -3414,7 +3432,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(second)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, first.guild.id, first.author.id
+                    active_case, cog._case_store, first.guild.id, first.author.id
                 )
                 self.assertEqual(
                     [(item.sequence, item.channel_id, item.delete_status.value) for item in snapshot.messages],
@@ -3545,7 +3563,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 message.delete.assert_awaited_once()
                 message.attachments[0].read.assert_not_awaited()
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case,
+                    active_case, cog._case_store,
                     message.guild.id,
                     message.author.id,
                 )
@@ -3591,7 +3609,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case,
+                    active_case, cog._case_store,
                     message.guild.id,
                     message.author.id,
                 )
@@ -3693,7 +3711,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(snapshot.messages[0].delete_status.value, "deleted")
                 operation = next(
@@ -3728,7 +3746,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(snapshot.messages[0].delete_status.value, "deleted")
                 operation = next(
@@ -3794,7 +3812,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(follow_up)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(len(snapshot.messages), 1)
                 self.assertEqual(snapshot.messages[0].delete_status.value, "planned")
@@ -3855,7 +3873,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 message.author.add_roles.assert_not_awaited()
                 self.assertFalse(
@@ -3891,7 +3909,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(len(snapshot.messages), 1)
                 message.delete.assert_awaited_once()
@@ -3955,7 +3973,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(snapshot.messages[0].delete_status.value, "deleted")
                 self.assertEqual(snapshot.attachments[0].capture_status, "captured")
@@ -4100,7 +4118,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case,
+                    active_case, cog._case_store,
                     message.guild.id,
                     message.author.id,
                 )
@@ -4250,7 +4268,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(snapshot.messages[0].delete_status.value, "deleted")
                 self.assertIn("model unavailable", snapshot.attachments[0].error)
@@ -4436,21 +4454,19 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                         side_effect=lambda *args, **kwargs: SimpleNamespace(resolved=kwargs["resolved"]),
                     ) as primary_view,
                 ):
-                    await fresh._case_review_service.apply_bulk(case_id, "tp", moderator_id=7)
+                    await fresh._case_review_service.apply_message(
+                        case_id, 1, "tp", moderator_id=7
+                    )
                     await fresh._case_review_rerender(case_id)
 
                 primary.edit.assert_awaited_once()
                 evidence_one.edit.assert_not_awaited()
                 evidence_two.edit.assert_not_awaited()
                 channel.send.assert_not_awaited()
-                self.assertEqual(thread.send.await_count, 5)
-                thread.edit.assert_awaited_once_with(
-                    archived=True,
-                    locked=True,
-                    reason="Honeypot detection case resolved",
-                )
+                self.assertEqual(thread.send.await_count, 4)
+                thread.edit.assert_not_awaited()
                 self.assertTrue(
-                    all(call.kwargs["resolved"] for call in primary_view.call_args_list)
+                    all(not call.kwargs["resolved"] for call in primary_view.call_args_list)
                 )
                 evidence_calls = [
                     call
@@ -4745,7 +4761,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(hashes.call_count, 3)
                 self.assertEqual(
@@ -4783,7 +4799,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(
                     [signal.signal.detector for signal in snapshot.signals],
@@ -4888,7 +4904,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(
                     [item.signal.detector for item in snapshot.signals], ["firstpost"]
@@ -4938,7 +4954,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(snapshot.signals[0].signal.action, honeypot.ActionIntent.NONE)
                 self.assertEqual(snapshot.messages[0].delete_status.value, "pending")
@@ -5001,7 +5017,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
                 message.author.ban.assert_awaited_once()
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(
                     [item.signal.detector for item in snapshot.signals],
@@ -5047,7 +5063,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 guild.ban.assert_awaited_once()
                 self.assertIs(guild.ban.await_args.args[0], target)
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, guild.id, message.author.id
+                    active_case, cog._case_store, guild.id, message.author.id
                 )
                 operation = next(
                     item for item in snapshot.operations
@@ -5092,7 +5108,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, guild.id, message.author.id
+                    active_case, cog._case_store, guild.id, message.author.id
                 )
                 operation = next(
                     item for item in snapshot.operations
@@ -5136,7 +5152,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     await cog.on_message(message)
 
                     snapshot = await asyncio.to_thread(
-                        cog._case_store.get_active_case,
+                        active_case, cog._case_store,
                         message.guild.id,
                         message.author.id,
                     )
@@ -5296,7 +5312,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 outcome = (await asyncio.gather(task, return_exceptions=True))[0]
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 operation = next(
                     item
@@ -5386,7 +5402,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 release_role.set()
                 await task
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case,
+                    active_case, cog._case_store,
                     message.guild.id,
                     message.author.id,
                 )
@@ -5444,7 +5460,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case,
+                    active_case, cog._case_store,
                     message.guild.id,
                     message.author.id,
                 )
@@ -5604,7 +5620,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case,
+                    active_case, cog._case_store,
                     message.guild.id,
                     message.author.id,
                 )
@@ -5675,7 +5691,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 first_snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case,
+                    active_case, cog._case_store,
                     message.guild.id,
                     message.author.id,
                 )
@@ -5699,7 +5715,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
                 for expected_attempt in (2, 3):
                     snapshot = await asyncio.to_thread(
-                        cog._case_store.get_active_case,
+                        active_case, cog._case_store,
                         message.guild.id,
                         message.author.id,
                     )
@@ -5717,7 +5733,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                         claimed, operation.retry_at
                     )
                     snapshot = await asyncio.to_thread(
-                        cog._case_store.get_active_case,
+                        active_case, cog._case_store,
                         message.guild.id,
                         message.author.id,
                     )
@@ -5777,7 +5793,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 operation = next(
                     item
@@ -5805,7 +5821,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog._execute_detection_case_operation(claimed, now)
 
                 retried = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 operation = next(
                     item
@@ -5855,7 +5871,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
                 await cog.on_message(message)
                 failed = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 operation = next(
                     item for item in failed.operations
@@ -5866,7 +5882,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
 
                 completed = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 operation = next(
                     item for item in completed.operations
@@ -5968,7 +5984,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(cog.on_message(first), other.on_message(second))
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, first.guild.id, first.author.id
+                    active_case, cog._case_store, first.guild.id, first.author.id
                 )
                 firstpost_signals = [
                     item for item in snapshot.signals
@@ -6026,7 +6042,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(
                     [item.sha256 for item in snapshot.attachments],
@@ -6100,7 +6116,7 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     await cog.on_message(message)
 
                 snapshot = await asyncio.to_thread(
-                    cog._case_store.get_active_case, message.guild.id, message.author.id
+                    active_case, cog._case_store, message.guild.id, message.author.id
                 )
                 self.assertEqual(
                     [item.sha256 for item in snapshot.attachments],

@@ -64,8 +64,6 @@ def case_custom_id(case_id: str, group: str, action: str) -> str:
     return f"honeypot:case:{case_id}:{group}:{action}"
 
 
-def attachment_custom_id(key: AttachmentKey, action: str) -> str:
-    return f"honeypot:case:{key.case_id}:images:{key.message_sequence}:{key.position}:{action}"
 
 
 @dataclass(frozen=True)
@@ -157,21 +155,6 @@ class CaseReviewService:
     def __init__(self, store: DetectionCaseStore) -> None:
         self._store = store
 
-    async def apply_bulk(
-        self, case_id: str, action: str, moderator_id: int
-    ) -> CaseSnapshot:
-        decision = self._decision(action)
-        snapshot = await self._snapshot(case_id)
-        decisions = {item.key: decision for item in case_feedback_items(snapshot)}
-        await asyncio.to_thread(
-            self._store.apply_attachment_decisions,
-            case_id,
-            decisions,
-            moderator_id,
-            datetime.now(timezone.utc),
-            f"images:{action}",
-        )
-        return await self._snapshot(case_id)
 
     async def apply_message(
         self,

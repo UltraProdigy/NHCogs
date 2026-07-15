@@ -473,7 +473,7 @@ class DetectionCaseStoreTests(unittest.TestCase):
         self.assertEqual(active.generation, 1)
         self.assertEqual(active.summary_message_id, 60)
         self.assertEqual(active.thread_id, 60)
-        self.assertEqual(restarted.get_projection_endpoint(case.case_id), active)
+        self.assertEqual(restarted.ensure_projection_endpoint(case.case_id), active)
 
     def test_timeline_publications_use_semantic_identity_and_case_order(self):
         now = datetime(2026, 7, 14, 12, tzinfo=timezone.utc)
@@ -705,31 +705,6 @@ class DetectionCaseStoreTests(unittest.TestCase):
             )
         )
         self.assertTrue(publish_primary(self.store, appended.case.case_id, 50, 60))
-        self.assertEqual(
-            self.store.add_signals(
-                appended.case.case_id,
-                1,
-                (
-                    DetectionSignal(
-                        "firstpost", "first", ActionIntent.REVIEW, True, {}
-                    ),
-                ),
-            ),
-            1,
-        )
-        self.assertEqual(
-            self.store.add_signals(
-                appended.case.case_id,
-                1,
-                (
-                    DetectionSignal(
-                        "firstpost", "first", ActionIntent.REVIEW, True, {}
-                    ),
-                ),
-            ),
-            0,
-        )
-
         snapshot = self.store.get_case(appended.case.case_id)
         self.assertTrue(snapshot.case.needs_attention)
         self.assertEqual(
@@ -742,7 +717,7 @@ class DetectionCaseStoreTests(unittest.TestCase):
         self.assertTrue(snapshot.attachments[0].match_metadata["matched"])
         self.assertEqual(
             [signal.signal.detector for signal in snapshot.signals],
-            ["forward_purge", "firstpost"],
+            ["forward_purge"],
         )
 
     def test_shared_sqlite_reservations_cap_concurrent_case_evidence(self):
@@ -1066,12 +1041,11 @@ class DetectionCaseStoreTests(unittest.TestCase):
         signal = DetectionSignal("spam", "known", ActionIntent.REVIEW, True, {})
         result = self.store.append_message(self.message(40, created_at), (signal,))
 
-        active = self.store.get_active_case(10, 20)
         open_cases = self.store.list_open_cases()
+        active = open_cases[0]
 
         self.assertEqual(active, self.store.get_case(result.case.case_id))
         self.assertEqual(open_cases, (active,))
-        self.assertIsNone(self.store.get_active_case(10, 999))
         self.assertIsNone(self.store.get_case("missing"))
 
     def test_list_due_cases_uses_persisted_expiry_and_stable_order(self):
@@ -1655,7 +1629,7 @@ class DetectionCaseStoreTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = tuple(executor.map(lambda message: self.store.append_message(message, ()), messages))
 
-        active = self.store.get_active_case(10, 20)
+        active = self.store.list_open_cases()[0]
         self.assertEqual({result.case.case_id for result in results}, {active.case.case_id})
         self.assertEqual({message.sequence for message in active.messages}, {1, 2})
 

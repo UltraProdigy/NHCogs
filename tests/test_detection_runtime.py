@@ -67,7 +67,6 @@ with isolated_runtime_modules() as loaded_modules:
 CaptureStatus = detection_runtime.CaptureStatus
 DeleteStatus = detection_cases.DeleteStatus
 read_attachment_bounded = detection_runtime.read_attachment_bounded
-cleanup_case_directory = detection_runtime.cleanup_case_directory
 delete_message = detection_runtime.delete_message
 
 
@@ -75,9 +74,9 @@ async def _test_bounded_reader(attachment, max_bytes):
     return await attachment.read_bounded(max_bytes)
 
 
-async def capture_attachments(*args, **kwargs):
+async def capture_attachment(*args, **kwargs):
     kwargs["reader"] = _test_bounded_reader
-    return await detection_runtime.capture_attachments(*args, **kwargs)
+    return await detection_runtime.capture_attachment(*args, **kwargs)
 
 
 class Attachment:
@@ -179,54 +178,26 @@ class CaptureAttachmentTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(detection_runtime.AttachmentTooLargeError):
             await read_attachment_bounded(attachment, 4)
 
-    async def test_captures_duplicate_names_in_input_order_to_distinct_safe_paths(self):
-        attachments = [
-            Attachment("../../same.jpg", b"first", delay=0.02),
-            Attachment("same.jpg", b"second"),
-            Attachment("bad\x00/name\n.png", b"third"),
-        ]
-        with TemporaryDirectory() as directory:
-            target = Path(directory) / "case"
-            results = await capture_attachments(attachments, target, 1)
-
-            self.assertEqual([result.position for result in results], [0, 1, 2])
-            self.assertEqual([result.status for result in results], [CaptureStatus.CAPTURED] * 3)
-            self.assertEqual([result.path.name for result in results], [
-                "0000-same.jpg",
-                "0001-same.jpg",
-                "0002-name_.png",
-            ])
-            self.assertEqual([result.path.read_bytes() for result in results], [b"first", b"second", b"third"])
-            self.assertTrue(all(result.path.resolve().is_relative_to(target.resolve()) for result in results))
-            self.assertEqual([attachment.calls for attachment in attachments], [[True], [True], [True]])
-            self.assertTrue(all(result.error is None for result in results))
-
-            with self.assertRaises(FrozenInstanceError):
-                results[0].status = CaptureStatus.FAILED
-
-    async def test_slow_attachment_times_out_without_delaying_or_blocking_other_capture(self):
+    async def test_slow_attachment_times_out_without_publishing_file(self):
         slow = GatedReadAttachment("slow.jpg")
         with TemporaryDirectory() as directory:
             target = Path(directory)
-            task = asyncio.create_task(
-                capture_attachments([slow, Attachment("fast.jpg", b"fast")], target, 0.02)
-            )
+            task = asyncio.create_task(capture_attachment(slow, target, 0, 0.02))
             await slow.started.wait()
-            results = await task
+            result = await task
 
-            self.assertEqual(results[0].status, CaptureStatus.TIMEOUT)
-            self.assertIsNone(results[0].path)
-            self.assertEqual(results[1].status, CaptureStatus.CAPTURED)
-            self.assertEqual(results[1].path.read_bytes(), b"fast")
+            self.assertEqual(result.status, CaptureStatus.TIMEOUT)
+            self.assertIsNone(result.path)
             self.assertFalse((target / "0000-slow.jpg").exists())
 
     async def test_actual_bytes_above_bound_stop_without_publishing_file(self):
         with TemporaryDirectory() as directory:
             target = Path(directory)
 
-            result, = await capture_attachments(
-                [Attachment("lying.jpg", b"12345")],
+            result = await capture_attachment(
+                Attachment("lying.jpg", b"12345"),
                 target,
+                0,
                 1,
                 max_bytes=4,
             )
@@ -252,10 +223,12 @@ class CaptureAttachmentTests(unittest.IsolatedAsyncioTestCase):
 
         with TemporaryDirectory() as directory, mock.patch.object(Path, "write_bytes", slow_write):
             target = Path(directory)
-            task = asyncio.create_task(capture_attachments([Attachment("late.jpg", b"late")], target, 0.02))
+            task = asyncio.create_task(
+                capture_attachment(Attachment("late.jpg", b"late"), target, 0, 0.02)
+            )
             await asyncio.to_thread(write_started.wait, 1)
-            results = await task
-            self.assertEqual(results[0].status, CaptureStatus.TIMEOUT)
+            result = await task
+            self.assertEqual(result.status, CaptureStatus.TIMEOUT)
             write_release.set()
             self.assertTrue(await asyncio.to_thread(write_finished.wait, 1))
             for _ in range(20):
@@ -280,7 +253,9 @@ class CaptureAttachmentTests(unittest.IsolatedAsyncioTestCase):
 
         with TemporaryDirectory() as directory, mock.patch.object(Path, "write_bytes", gated_write):
             target = Path(directory)
-            task = asyncio.create_task(capture_attachments([Attachment("cancel.jpg", b"late")], target, 5))
+            task = asyncio.create_task(
+                capture_attachment(Attachment("cancel.jpg", b"late"), target, 0, 5)
+            )
             await asyncio.to_thread(write_started.wait, 1)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
@@ -293,16 +268,14 @@ class CaptureAttachmentTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
             self.assertEqual(list(target.iterdir()), [])
 
-    async def test_hostile_filename_failure_is_contained_to_that_attachment(self):
+    async def test_hostile_filename_failure_is_structured(self):
         with TemporaryDirectory() as directory:
             target = Path(directory)
-            results = await capture_attachments(
-                [HostileFilenameAttachment("ignored"), Attachment("good.jpg", b"good")], target, 1
+            result = await capture_attachment(
+                HostileFilenameAttachment("ignored"), target, 0, 1
             )
-            self.assertEqual(results[0].status, CaptureStatus.FAILED)
-            self.assertIn("hostile filename", results[0].error)
-            self.assertEqual(results[1].status, CaptureStatus.CAPTURED)
-            self.assertEqual(results[1].path.read_bytes(), b"good")
+            self.assertEqual(result.status, CaptureStatus.FAILED)
+            self.assertIn("hostile filename", result.error)
 
     async def test_escaping_final_symlink_failure_is_contained(self):
         with TemporaryDirectory() as directory, TemporaryDirectory() as outside_directory:
@@ -317,18 +290,16 @@ class CaptureAttachmentTests(unittest.IsolatedAsyncioTestCase):
                     self.skipTest(f"symlinks unavailable: {error}")
                 raise
 
-            results = await capture_attachments(
-                [Attachment("linked.jpg", b"hostile"), Attachment("good.jpg", b"good")], target, 1
+            result = await capture_attachment(
+                Attachment("linked.jpg", b"hostile"), target, 0, 1
             )
-            self.assertEqual(results[0].status, CaptureStatus.FAILED)
+            self.assertEqual(result.status, CaptureStatus.FAILED)
             self.assertEqual(outside.read_bytes(), b"original")
-            self.assertEqual(results[1].status, CaptureStatus.CAPTURED)
-            self.assertEqual(results[1].path.read_bytes(), b"good")
 
     async def test_read_failure_is_structured_and_error_is_bounded(self):
         with TemporaryDirectory() as directory:
             target = Path(directory)
-            result, = await capture_attachments([FailingAttachment("bad.jpg")], target, 1)
+            result = await capture_attachment(FailingAttachment("bad.jpg"), target, 0, 1)
 
             self.assertEqual(result.status, CaptureStatus.FAILED)
             self.assertIsNone(result.path)
@@ -341,18 +312,12 @@ class CaptureAttachmentTests(unittest.IsolatedAsyncioTestCase):
             Path, "write_bytes", side_effect=OSError("disk full")
         ):
             target = Path(directory)
-            result, = await capture_attachments([Attachment("bad.jpg")], target, 1)
+            result = await capture_attachment(Attachment("bad.jpg"), target, 0, 1)
 
             self.assertEqual(result.status, CaptureStatus.FAILED)
             self.assertIsNone(result.path)
             self.assertIn("disk full", result.error)
             self.assertEqual(list(target.iterdir()), [])
-
-    async def test_empty_input_returns_empty_tuple_and_creates_target(self):
-        with TemporaryDirectory() as directory:
-            target = Path(directory) / "new"
-            self.assertEqual(await capture_attachments([], target, 1), ())
-            self.assertTrue(target.is_dir())
 
 
 class DeleteMessageTests(unittest.IsolatedAsyncioTestCase):
@@ -410,19 +375,3 @@ class DeleteMessageTests(unittest.IsolatedAsyncioTestCase):
         message = SimpleNamespace(delete=mock.AsyncMock(side_effect=asyncio.CancelledError()))
         with self.assertRaises(asyncio.CancelledError):
             await delete_message(message)
-
-
-class CleanupCaseDirectoryTests(unittest.TestCase):
-    def test_removes_exact_directory_tree_and_is_idempotent(self):
-        with TemporaryDirectory() as directory:
-            case_dir = Path(directory) / "case"
-            sibling = Path(directory) / "keep"
-            (case_dir / "nested").mkdir(parents=True)
-            (case_dir / "nested" / "evidence.bin").write_bytes(b"evidence")
-            sibling.mkdir()
-
-            cleanup_case_directory(case_dir)
-            cleanup_case_directory(case_dir)
-
-            self.assertFalse(case_dir.exists())
-            self.assertTrue(sibling.is_dir())
