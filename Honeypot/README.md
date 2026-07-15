@@ -99,8 +99,9 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 |---------|-------------|
 | `!honeypot review toggle <bool>` | Send suspicious messages to moderator review instead of acting immediately |
 | `!honeypot review channel <channel>` | Channel for review requests |
-| `!honeypot review timeout <1-10080>` | Minutes before review expires |
 | `!honeypot review kick_fail_warn <false\|true\|manual>` | How to handle a review kick when the target has already left |
+
+Detection cases expire 24 hours after the first detection. This lifetime is fixed.
 
 ### roles
 
@@ -160,12 +161,12 @@ By default, only the server owner can use `!honeypot` and all subcommands. Red P
 | `!honeypot config firstpost` | Show firstpost settings |
 | `!honeypot config spam` | Show spam detection settings |
 | `!honeypot config fakeactivity` | Show fake activity settings |
-| `!honeypot config review` | Show review settings and pending review count |
+| `!honeypot config review` | Show review settings |
 | `!honeypot config roles` | Show whitelist role settings |
 | `!honeypot config keywords` | Show keyword and attachment-pattern counts |
 | `!honeypot config joinwatch` | Show joinwatch and joinwatch auto-role settings |
 | `!honeypot config bait` | Show bait role settings |
-| `!honeypot config stats` | Show stored stats and pending review/timer counts |
+| `!honeypot config stats` | Show stored stats, detection-case operations, and pending timer counts |
 | `!honeypot stats` | Show public-facing stats |
 | `!honeypot modstats` | Show detailed moderator statistics |
 | `!honeypot resetstats` | Reset statistics |
@@ -225,15 +226,21 @@ Default attachment patterns: `^image$` (matches `image.jpeg`), `^image ?\(\d+\)$
 
 ## Review Flow
 
-1. Message deleted from honeypot channel
-2. Recent cached messages from that user purged (if enabled)
-3. Mute role applied while review is pending (if configured)
-4. Embed sent to review channel with Ban / Kick / Ignore buttons
-5. Attachments copied into the review message
-6. Moderators with `Moderate Members` permission can click buttons
-7. If review expires, mute role is removed and review marked as timed out
-8. Pending reviews survive bot restarts
-9. If kicked or banned, the mute role is removed first so it does not linger
+1. Attachment capture starts before the source message is deleted. A failed or
+   timed-out download is shown as missing evidence and does not block containment.
+2. The source and recent cached messages from that user are deleted when configured.
+3. The review mute role is applied while review is pending when configured.
+4. One compact summary is posted in the review channel and a public case thread is
+   created from it.
+5. The thread receives a chronological copy of every detected message, its signals,
+   deletion status, content, and copied attachment evidence.
+6. Ban / Kick / Ignore and image-learning controls are available on the summary and
+   on the relevant thread messages. Moderators can classify all images, one message,
+   or individual images.
+7. Resolution records the moderator and time, disables controls, releases owned
+   containment roles, and locks and archives the thread.
+8. Open cases, publications, and moderation operations survive bot restarts.
+9. Unresolved cases expire after the fixed 24-hour lifetime.
 
 Any configured honeypot channel uses the same flow. If a user with the review
 mute role or joinwatch auto-role posts in any honeypot channel, the bot treats it
@@ -248,8 +255,10 @@ punishments.
 `modstats` is the detailed moderator view. `Total detections` counts every
 non-exempt message caught in the honeypot channel. `Suspicious detections`
 counts only detections matching suspicious-account, keyword, or attachment
-rules. `Reviews sent` counts cases sent to moderator review, while `Active
-pending reviews` is the current number of unresolved review messages.
+rules. `Reviews sent` is a historical counter. `Active detection cases` is the
+current number of pending or resolving cases read from SQLite. The operational
+case counters also expose overdue cases, stale resolution leases, failed
+containment, forbidden message deletes, and outstanding durable operations.
 
 `Applied temporary mutes` and `Failed temporary mutes` are historical counters
 for temporary review mutes. They do not mean those users are still muted.
@@ -325,6 +334,10 @@ The bait role trap watches for users receiving a configured role. This is meant 
 roles that should not be assigned to normal users, for example a fake verification,
 reward, or access role used to catch automated accounts.
 
+The bait role must be dedicated to this trap. Do not reuse the review mute role
+or the Joinwatch auto-role: receiving the bait role directly triggers its configured
+kick or ban action regardless of which system assigned it.
+
 Setup:
 
 ```ini
@@ -345,7 +358,11 @@ the bait role is deleted or no bait role is configured, the trap does nothing.
 
 - View Channel, Send Messages, Read Message History, Manage Messages (in honeypot channel)
 - Manage Messages (in every visible channel where cached purge should remove recent scammer messages)
-- Send Messages (in logs, review, and joinwatch channels)
+- View Channel, Send Messages, Read Message History, Embed Links, and Attach Files
+  (in logs and review channels)
+- Create Public Threads, Send Messages in Threads, and Manage Threads
+  (in the review channel)
+- Send Messages (in the joinwatch channel)
 - Kick Members (if using kick)
 - Ban Members (if using ban)
 - Manage Roles (if using review mute role or joinwatch auto-role)
@@ -354,17 +371,34 @@ the bait role is deleted or no bait role is configured, the trap does nothing.
 
 ## Intents
 
-- `GUILD_MEMBERS` (privileged) — required for `on_member_join` (joinwatch) and `on_member_update` (joinwatch auto-role and bait role)
-- `MESSAGE_CONTENT` (privileged) — required for `on_message` (detection)
+- `GUILD_MEMBERS` (privileged): required for `on_member_join` (joinwatch) and `on_member_update` (joinwatch auto-role and bait role)
+- `MESSAGE_CONTENT` (privileged): required for `on_message` (detection)
 
 Both are enabled by default in RedBot v3.5+.
 
 ## Data Storage
 
 Guild configuration stores channel IDs, role IDs, booleans, numeric settings,
-custom messages, and pending review metadata. Firstpost seen authors are stored
-separately in `firstpost_seen.sqlite` under the cog data directory so large
-servers do not inflate Red Config.
+custom messages, historical counters, and joinwatch timers. Detection cases are
+stored separately in `detection_cases.sqlite`; SQLite is authoritative for case
+status, captured messages and signals, attachment metadata, containment state,
+review publications, and durable operations while the case is active. After the
+terminal summary/thread update, role release, and evidence cleanup complete, the
+detailed case data is compacted. Only the case/guild/user identifiers and Discord
+summary/thread endpoint needed for later privacy deletion remain.
+
+Copied case evidence is stored under `detection_case_files`. Resolution queues
+durable cleanup of those files. If moderators select attachments as image
+learning samples, both true-positive and false-positive files are copied to the
+separate image-scan dataset with SHA-256, pHash, dHash, and aHash before temporary
+case evidence cleanup. False-positive samples prevent known safe images from being
+reported again. Samples remain under the image-scan retention controls. Red
+user-data deletion removes case rows and case evidence for that
+user. When Red leaves a guild, the guild-removal listener removes that guild's
+case rows and case evidence.
+
+Firstpost seen authors are stored separately in `firstpost_seen.sqlite` under
+the cog data directory so large servers do not inflate Red Config.
 
 ## Operational Notes
 
