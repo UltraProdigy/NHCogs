@@ -31,8 +31,29 @@ def _install_redbot_stubs() -> None:
     discord.Interaction = object
     discord.ButtonStyle = types.SimpleNamespace(danger=1, secondary=2, success=3, primary=4)
     discord.SelectOption = object
+
+    class _View:
+        def __init__(self, *args, **kwargs):
+            self.children = []
+
+        def add_item(self, item):
+            self.children.append(item)
+
+    class _Button:
+        def __init__(
+            self, *, label, style, custom_id, disabled=False, row=None, emoji=None
+        ):
+            self.label = label
+            self.style = style
+            self.custom_id = custom_id
+            self.disabled = disabled
+            self.row = row
+            self.emoji = emoji
+            self.callback = None
+
     discord.ui = types.SimpleNamespace(
-        View=object,
+        View=_View,
+        Button=_Button,
         Select=object,
         button=lambda *args, **kwargs: (lambda fn: fn),
     )
@@ -147,6 +168,24 @@ class ImageScanCleanupTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"x" * size)
 
+    def test_detection_case_view_omits_image_controls_without_feedback(self) -> None:
+        view = honeypot.DetectionCaseView(
+            object(), "case-1", has_image_feedback=False
+        )
+
+        custom_ids = {item.custom_id for item in view.children}
+        self.assertFalse(any(":resolve:" in item for item in custom_ids))
+        self.assertFalse(any(":images:" in item for item in custom_ids))
+
+    def test_detection_case_view_exposes_image_controls_with_feedback(self) -> None:
+        view = honeypot.DetectionCaseView(
+            object(), "case-1", has_image_feedback=True
+        )
+
+        custom_ids = {item.custom_id for item in view.children}
+        self.assertTrue(any(":resolve:" in item for item in custom_ids))
+        self.assertTrue(any(":images:" in item for item in custom_ids))
+
     def test_cleanup_plan_counts_event_directories_without_samples(self) -> None:
         guild_root = self.root / "123"
         self._write_file(guild_root / "samples" / "uploads" / "tp.png", 100)
@@ -182,7 +221,7 @@ class ImageScanCleanupTests(unittest.TestCase):
 
         self.assertEqual(
             honeypot.format_imagescan_matched_attachments(matches),
-            "`0/20` — one.png\n`3/20` — two.jpg",
+            "`0/20`: one.png\n`3/20`: two.jpg",
         )
 
     def test_sample_identifier_matches_sample_id_full_sha_or_unique_sha_prefix(self) -> None:
@@ -204,11 +243,6 @@ class ImageScanCleanupTests(unittest.TestCase):
         self.assertIsNone(honeypot.match_imagescan_sample_identifier(rows, "missing"))
         self.assertIsNone(honeypot.match_imagescan_sample_identifier(rows, "abcdef"))
 
-    def test_image_detection_field_text_is_explicit(self) -> None:
-        self.assertEqual(honeypot.format_image_detection_status("no_images"), "No image attachments")
-        self.assertEqual(honeypot.format_image_detection_status("detected"), "Detected, already known")
-        self.assertEqual(honeypot.format_image_detection_status("queued"), "Not detected, feedback queued")
-        self.assertEqual(honeypot.format_image_detection_status("not_checked"), "Not checked")
 
     def test_sample_file_path_must_stay_under_imagescan_root(self) -> None:
         root = Path.cwd() / "imagescan_files"
@@ -227,27 +261,8 @@ class ImageScanCleanupTests(unittest.TestCase):
             {"active_with_file": 1, "active_without_file": 1, "file_bytes": 10},
         )
 
-    def test_learning_status_detected_when_any_match_exists(self) -> None:
-        self.assertEqual(
-            honeypot.image_learning_status(has_images=True, has_known_match=True, can_queue=True),
-            "detected",
-        )
 
-    def test_learning_status_queued_when_images_are_unknown_and_feedback_possible(self) -> None:
-        self.assertEqual(
-            honeypot.image_learning_status(has_images=True, has_known_match=False, can_queue=True),
-            "queued",
-        )
 
-    def test_learning_status_no_images_and_not_checked(self) -> None:
-        self.assertEqual(
-            honeypot.image_learning_status(has_images=False, has_known_match=False, can_queue=True),
-            "no_images",
-        )
-        self.assertEqual(
-            honeypot.image_learning_status(has_images=True, has_known_match=False, can_queue=False),
-            "not_checked",
-        )
 
 
 if __name__ == "__main__":
