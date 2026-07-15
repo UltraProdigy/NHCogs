@@ -225,21 +225,7 @@ def plan_imagescan_event_cache_cleanup(
     return plan
 
 
-def format_image_hash_diff(score: int, threshold: int) -> str:
-    return f"{score}/{threshold}"
 
-
-def format_imagescan_matched_attachments(
-    matches: list[tuple[discord.Attachment, dict[str, typing.Any], dict[str, str]]],
-) -> str:
-    lines = [
-            "`{hash_diff}`: {filename}".format(
-            hash_diff=format_image_hash_diff(match["score"], match["threshold"]),
-            filename=getattr(attachment, "filename", None) or "unknown",
-        )
-        for attachment, match, _hashes in matches
-    ]
-    return "\n".join(lines)
 
 
 def match_imagescan_sample_identifier(
@@ -1670,15 +1656,6 @@ class Honeypot(Cog):
                 if not remaining:
                     self._firstpost_dirty_seen_authors.pop(guild_id, None)
 
-    async def _mark_firstpost_seen(self, guild: discord.Guild, user_id: int) -> bool:
-        await self._ensure_firstpost_seen_loaded(guild.id)
-        async with self._firstpost_db_lock:
-            if user_id in self._firstpost_seen_authors[guild.id]:
-                return False
-            self._firstpost_seen_authors[guild.id].add(user_id)
-            self._firstpost_dirty_seen_authors[guild.id].add(user_id)
-        await self._increment_stat(guild, "firstpost_seen")
-        return True
 
 
 
@@ -1931,33 +1908,6 @@ class Honeypot(Cog):
             )
         return updated
 
-    async def _refresh_joinwatch_pending_role_alerts(
-        self,
-        guild: discord.Guild,
-        timer_minutes: int,
-    ) -> None:
-        pending_roles = await self.config.guild(guild).joinwatch_pending_roles()
-        for data in list(pending_roles.values()):
-            try:
-                role_id = int(data["role_id"])
-                if data.get("applied_at") is not None:
-                    applied_at = datetime.fromisoformat(data["applied_at"])
-                    expires_at = applied_at + timedelta(minutes=timer_minutes)
-                else:
-                    expires_at = datetime.fromisoformat(data["expires_at"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            role = guild.get_role(role_id)
-            if role is None:
-                continue
-            await self._edit_joinwatch_alert_auto_role(
-                guild,
-                data,
-                _("{role} applied until {time}.").format(
-                    role=role.mention,
-                    time=discord.utils.format_dt(expires_at, style="R"),
-                ),
-            )
 
     async def _get_member_or_fetch(self, guild: discord.Guild, member_id: int) -> discord.Member | None:
         member = guild.get_member(member_id)
@@ -2180,88 +2130,7 @@ class Honeypot(Cog):
             return f"{size / 1024:.1f} KB"
         return f"{size} B"
 
-    async def _snapshot_attachments(self, message: discord.Message) -> list[dict[str, typing.Any]]:
-        snapshots: list[dict[str, typing.Any]] = []
-        upload_limit = getattr(message.guild, "filesize_limit", 25 * 1024 * 1024)
-        for attachment in message.attachments[:10]:
-            snapshot: dict[str, typing.Any] = {
-                "filename": attachment.filename,
-                "url": attachment.url,
-                "size": attachment.size,
-                "content_type": attachment.content_type,
-                "description": attachment.description,
-                "spoiler": attachment.is_spoiler(),
-                "data": None,
-                "error": None,
-            }
-            if attachment.size > upload_limit:
-                snapshot["error"] = _("too large to re-upload ({size})").format(size=self._format_bytes(attachment.size))
-            else:
-                try:
-                    snapshot["data"] = await attachment.read()
-                except (discord.HTTPException, discord.Forbidden, discord.NotFound):
-                    try:
-                        snapshot["data"] = await attachment.read(use_cached=True)
-                    except TypeError:
-                        snapshot["error"] = _("could not download")
-                    except (discord.HTTPException, discord.Forbidden, discord.NotFound) as exc:
-                        log.warning("Failed to snapshot attachment %s (%s): %s", attachment.filename, attachment.url, exc)
-                        snapshot["error"] = _("could not download")
-                except TypeError:
-                    snapshot["error"] = _("could not download")
-            snapshots.append(snapshot)
-        if len(message.attachments) > 10:
-            snapshots.append(
-                {
-                    "filename": _("More attachments"),
-                    "url": None,
-                    "size": 0,
-                    "content_type": None,
-                    "description": None,
-                    "spoiler": False,
-                    "data": None,
-                    "error": _("{count} more attachments were not included; Discord only allows 10 files per message.").format(
-                        count=len(message.attachments) - 10
-                    ),
-                }
-            )
-        return snapshots
 
-    def _attachment_files(self, attachment_snapshots: list[dict[str, typing.Any]]) -> list[discord.File]:
-        files: list[discord.File] = []
-        for snapshot in attachment_snapshots:
-            data = snapshot.get("data")
-            if data is None:
-                continue
-            files.append(
-                discord.File(
-                    io.BytesIO(data),
-                    filename=snapshot["filename"],
-                    spoiler=snapshot.get("spoiler", False),
-                    description=snapshot.get("description"),
-                )
-            )
-        return files
-
-    def _attachment_summary(self, attachment_snapshots: list[dict[str, typing.Any]]) -> str | None:
-        if not attachment_snapshots:
-            return None
-        lines: list[str] = []
-        for snapshot in attachment_snapshots:
-            filename = snapshot["filename"]
-            if snapshot.get("url"):
-                line = f"[{filename}]({snapshot['url']})"
-            else:
-                line = str(filename)
-            if snapshot.get("size"):
-                line += f" ({self._format_bytes(snapshot['size'])})"
-            if snapshot.get("data") is not None:
-                line += " - copied"
-            elif snapshot.get("error"):
-                line += f" - {snapshot['error']}"
-            lines.append(line)
-        summary = "\n".join(lines)
-        return summary if len(summary) <= 1024 else summary[:1000] + "\n..."
 
     async def cog_load(self) -> None:
         await super().cog_load()
@@ -3454,38 +3323,6 @@ class Honeypot(Cog):
             metadata={"reasons": tuple(reasons)},
         )
 
-    async def _reserve_forward_firstpost_signal(
-        self,
-        message: discord.Message,
-        config: dict,
-        case_id: str,
-        sequence: int,
-    ) -> bool:
-        tracking_enabled = config.get("firstpost_enabled", False) or config.get(
-            "firstpost_collect_enabled", False
-        )
-        if not tracking_enabled:
-            return False
-        candidate = self._firstpost_candidate(message, config)
-        await self._ensure_firstpost_seen_loaded(message.guild.id)
-        async with self._firstpost_db_lock:
-            if message.author.id in self._firstpost_seen_authors[message.guild.id]:
-                return False
-            claimed = await asyncio.to_thread(
-                self._case_store.claim_firstpost,
-                message.guild.id,
-                message.author.id,
-                case_id,
-                sequence,
-                candidate,
-            )
-            if not claimed:
-                self._firstpost_seen_authors[message.guild.id].add(message.author.id)
-                return False
-            self._firstpost_seen_authors[message.guild.id].add(message.author.id)
-            self._firstpost_dirty_seen_authors[message.guild.id].add(message.author.id)
-        await self._increment_stat(message.guild, "firstpost_seen")
-        return candidate is not None
 
     async def _honeypot_signals(
         self, message: discord.Message, config: dict
@@ -5272,34 +5109,6 @@ class Honeypot(Cog):
             ephemeral=True,
         )
 
-    async def _record_publication_failure(self, case_id: str, error: BaseException) -> None:
-        now = datetime.now(timezone.utc)
-        snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
-        latest_sequence = max(
-            (message.sequence for message in snapshot.messages), default=0
-        )
-        operation = await asyncio.to_thread(
-            self._case_store.ensure_operation,
-            case_id,
-            "review_publish",
-            f"review_publish:{case_id}:{latest_sequence}",
-            latest_sequence or None,
-        )
-        running = await asyncio.to_thread(
-            self._case_store.claim_operation,
-            operation.operation_id,
-            now,
-        )
-        if running is None or running.claim_token is None:
-            return
-        await asyncio.to_thread(
-            self._case_store.fail_operation,
-            running.operation_id,
-            running.claim_token,
-            f"{type(error).__name__}: {error}",
-            now,
-            now + timedelta(minutes=1),
-        )
 
     async def _process_detected_message(
         self,
@@ -5626,25 +5435,6 @@ class Honeypot(Cog):
     ) -> typing.Any | None:
         return guild.get_channel(channel_id) or guild.get_thread(channel_id)
 
-    def _count_recent_cached_user_messages(
-        self,
-        guild: discord.Guild,
-        user_id: int,
-        config: dict,
-        *,
-        exclude_message_id: int | None = None,
-    ) -> int:
-        retention_seconds = self._purge_retention_seconds(config)
-        self._prune_recent_user_messages(
-            guild.id, user_id, retention_seconds=retention_seconds
-        )
-        refs = self._recent_user_messages.get(guild.id, {}).get(user_id, ())
-        return sum(
-            1
-            for ref in refs
-            if exclude_message_id is None or ref.message_id != exclude_message_id
-        )
-
     async def _delete_cached_message_ref(
         self, guild: discord.Guild, user_id: int, ref: MessageRef
     ) -> bool:
@@ -5733,32 +5523,6 @@ class Honeypot(Cog):
                 guild_id,
             )
 
-    def _dry_run_purge_label(
-        self,
-        guild: discord.Guild,
-        user_id: int,
-        config: dict,
-        *,
-        include_current_message: bool = False,
-        current_message_id: int | None = None,
-    ) -> str:
-        backward_seconds = self._purge_retention_seconds(config)
-        forward_seconds = self._purge_forward_seconds(config)
-        cached_count = self._count_recent_cached_user_messages(
-            guild,
-            user_id,
-            config,
-            exclude_message_id=current_message_id if include_current_message else None,
-        )
-        if include_current_message:
-            cached_count += 1
-        return _(
-            "Dry run: I would purge {count} cached message(s) from the last {backward}s and forward-purge new messages for {forward}s."
-        ).format(
-            count=cached_count,
-            backward=backward_seconds,
-            forward=forward_seconds,
-        )
 
     async def _purge_detection_case_cached_messages(
         self,
@@ -5945,30 +5709,6 @@ class Honeypot(Cog):
 
 
 
-    async def _send_log(
-        self,
-        channel: discord.TextChannel | discord.Thread | None,
-        embed: discord.Embed,
-        attachment_snapshots: list[dict[str, typing.Any]],
-        content: str | None = None,
-        allowed_mentions: discord.AllowedMentions | None = None,
-        view: discord.ui.View | None = None,
-    ) -> None:
-        if channel is None:
-            return
-        send_kwargs: dict[str, typing.Any] = {"content": content, "embed": embed}
-        if allowed_mentions is not None:
-            send_kwargs["allowed_mentions"] = allowed_mentions
-        if view is not None:
-            send_kwargs["view"] = view
-        files = self._attachment_files(attachment_snapshots)
-        if files:
-            send_kwargs["files"] = files
-        try:
-            await channel.send(**send_kwargs)
-        except discord.HTTPException:
-            guild_id = channel.guild.id if isinstance(channel, discord.TextChannel) else channel.guild.id
-            log.debug("Failed to send honeypot log in guild %s", guild_id)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -6740,25 +6480,6 @@ class Honeypot(Cog):
 
 
 
-    def _imagescan_counts_sync(self, guild_id: int) -> dict[str, int]:
-        counts = {"pending": 0, "true_positive": 0, "false_positive": 0, "ignored": 0}
-        with sqlite3.connect(self._imagescan_db_path) as conn:
-            rows = conn.execute(
-                """
-                SELECT decision, COUNT(*)
-                FROM imagescan_events
-                WHERE guild_id = ?
-                GROUP BY decision
-                """,
-                (str(guild_id),),
-            ).fetchall()
-        for decision, count in rows:
-            counts[str(decision)] = int(count)
-        return counts
-
-    async def _imagescan_counts(self, guild_id: int) -> dict[str, int]:
-        async with self._imagescan_db_lock:
-            return await asyncio.to_thread(self._imagescan_counts_sync, guild_id)
 
     def _imagescan_export_rows_sync(self, guild_id: int) -> list[dict[str, typing.Any]]:
         with sqlite3.connect(self._imagescan_db_path) as conn:

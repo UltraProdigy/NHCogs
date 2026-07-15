@@ -210,20 +210,6 @@ class ImageScanCleanupTests(unittest.TestCase):
         self.assertFalse((guild_root / "111").exists())
         self.assertTrue((guild_root / "samples" / "uploads" / "tp.png").exists())
 
-    def test_hash_diff_is_compact(self) -> None:
-        self.assertEqual(honeypot.format_image_hash_diff(0, 20), "0/20")
-
-    def test_matched_attachment_summary_lists_each_match_with_its_hash_diff(self) -> None:
-        matches = [
-            (SimpleNamespace(filename="one.png"), {"score": 0, "threshold": 20}, {}),
-            (SimpleNamespace(filename="two.jpg"), {"score": 3, "threshold": 20}, {}),
-        ]
-
-        self.assertEqual(
-            honeypot.format_imagescan_matched_attachments(matches),
-            "`0/20`: one.png\n`3/20`: two.jpg",
-        )
-
     def test_sample_identifier_matches_sample_id_full_sha_or_unique_sha_prefix(self) -> None:
         rows = [
             {"sample_id": "upload-aaa", "sha256": "aaaabbbbccccdddd"},

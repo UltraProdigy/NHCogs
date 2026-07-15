@@ -694,11 +694,9 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                 message.delete = mock.AsyncMock()
                 cog._is_forward_purge_active = mock.Mock(return_value=True)
                 cog._spam_suspicion_reasons = mock.Mock(return_value=["duplicate"])
-                cog._mark_firstpost_seen = mock.AsyncMock(return_value=True)
                 cog._firstpost_loaded_guilds.add(message.guild.id)
                 cog._initial_image_signal = mock.AsyncMock()
                 cog._send_review = mock.AsyncMock()
-                cog._send_log = mock.AsyncMock()
                 cog._increment_stat = mock.AsyncMock()
 
                 signals = await cog._collect_detection_signals(
@@ -719,7 +717,6 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                 cog._initial_image_signal.assert_not_awaited()
                 message.delete.assert_not_awaited()
                 cog._send_review.assert_not_awaited()
-                cog._send_log.assert_not_awaited()
                 cog._increment_stat.assert_not_awaited()
 
     async def test_spam_and_firstpost_signals_are_both_collected_in_priority_order(self):
@@ -729,7 +726,6 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                 message = self._message(attachments=[object()] * 4)
                 cog._is_forward_purge_active = mock.Mock(return_value=False)
                 cog._spam_suspicion_reasons = mock.Mock(return_value=["duplicate"])
-                cog._mark_firstpost_seen = mock.AsyncMock(return_value=True)
                 cog._firstpost_loaded_guilds.add(message.guild.id)
 
                 signals = await cog._collect_detection_signals(
@@ -745,7 +741,6 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([signal.detector for signal in signals], ["spam", "firstpost"])
                 self.assertEqual(signals[0].action, honeypot.ActionIntent.NONE)
                 self.assertEqual(signals[1].action, honeypot.ActionIntent.KICK)
-                cog._mark_firstpost_seen.assert_not_awaited()
 
     async def test_invalid_spam_action_defaults_to_review(self):
         with TemporaryDirectory() as directory:
@@ -798,7 +793,6 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                 cog = honeypot.Honeypot(_Bot())
                 message = self._message(attachments=[object()] * 3)
                 cog._is_forward_purge_active = mock.Mock(return_value=False)
-                cog._mark_firstpost_seen = mock.AsyncMock(return_value=True)
                 cog._firstpost_loaded_guilds.add(message.guild.id)
 
                 signals = await cog._collect_detection_signals(
@@ -806,7 +800,6 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 self.assertEqual(signals, ())
-                cog._mark_firstpost_seen.assert_not_awaited()
 
     async def test_collect_only_firstpost_does_not_reserve_before_case_append(self):
         with TemporaryDirectory() as directory:
@@ -814,7 +807,6 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                 cog = honeypot.Honeypot(_Bot())
                 message = self._message(attachments=[object()] * 4)
                 cog._is_forward_purge_active = mock.Mock(return_value=False)
-                cog._mark_firstpost_seen = mock.AsyncMock(return_value=True)
                 cog._firstpost_loaded_guilds.add(message.guild.id)
 
                 signals = await cog._collect_detection_signals(
@@ -822,7 +814,6 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 self.assertEqual(signals, ())
-                cog._mark_firstpost_seen.assert_not_awaited()
 
     async def test_honeypot_channel_collects_signal_and_other_channel_does_not(self):
         with TemporaryDirectory() as directory:
@@ -933,9 +924,7 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                     return_value={"valid": True, "effective_threshold": 20}
                 )
                 cog._increment_stat = mock.AsyncMock()
-                cog._snapshot_attachments = mock.AsyncMock()
                 cog._send_review = mock.AsyncMock()
-                cog._send_log = mock.AsyncMock()
                 event_loop_thread = get_ident()
                 match_threads = []
 
@@ -1011,9 +1000,7 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertGreaterEqual(profile["hash_ms_count"], 1)
                 self.assertGreaterEqual(profile["compare_ms_count"], 1)
                 cog._increment_stat.assert_not_awaited()
-                cog._snapshot_attachments.assert_not_awaited()
                 cog._send_review.assert_not_awaited()
-                cog._send_log.assert_not_awaited()
 
     async def test_four_negative_initial_images_do_not_scan_later_attachments(self):
         with TemporaryDirectory() as directory:
@@ -2385,7 +2372,6 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         cog._handle_imagescan_detector_message = mock.AsyncMock()
         cog._increment_stat = mock.AsyncMock()
         cog._purge_detection_case_cached_messages = mock.AsyncMock(return_value=0)
-        cog._mark_firstpost_seen = mock.AsyncMock(return_value=False)
 
     async def test_whitelist_bypass_records_case_without_deleting_honeypot_message(self):
         with TemporaryDirectory() as directory:
@@ -4804,46 +4790,6 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     ["forward_purge", "firstpost"],
                 )
 
-    async def test_forward_firstpost_store_failure_leaves_author_unseen_for_retry(self):
-        with TemporaryDirectory() as directory:
-            with _isolated_honeypot_modules(Path(directory)) as honeypot:
-                cog = honeypot.Honeypot(_Bot())
-                other = honeypot.Honeypot(_Bot())
-                await asyncio.to_thread(cog._case_store.initialize)
-                await asyncio.to_thread(other._case_store.initialize)
-                cog._firstpost_loaded_guilds.add(100)
-                other._firstpost_loaded_guilds.add(100)
-                cog._increment_stat = mock.AsyncMock()
-                message = self._message(honeypot, attachment_count=4)
-                config = {"firstpost_enabled": True, "firstpost_action": "review"}
-                appended = await asyncio.to_thread(
-                    cog._case_store.append_message,
-                    cog._new_case_message(message),
-                    (honeypot.DetectionSignal(
-                        "forward_purge", "active", honeypot.ActionIntent.REVIEW, True, {}
-                    ),),
-                )
-                real_claim = cog._case_store.claim_firstpost
-                with mock.patch.object(
-                    cog._case_store, "claim_firstpost", side_effect=RuntimeError("sqlite failed")
-                ):
-                    with self.assertRaisesRegex(RuntimeError, "sqlite failed"):
-                        await cog._reserve_forward_firstpost_signal(
-                            message, config, appended.case.case_id, 1
-                        )
-                self.assertNotIn(
-                    message.author.id, cog._firstpost_seen_authors[message.guild.id]
-                )
-
-                with mock.patch.object(cog._case_store, "claim_firstpost", side_effect=real_claim):
-                    reserved = await cog._reserve_forward_firstpost_signal(
-                        message, config, appended.case.case_id, 1
-                    )
-
-                self.assertTrue(reserved)
-                self.assertIn(
-                    message.author.id, cog._firstpost_seen_authors[message.guild.id]
-                )
 
     async def test_spam_review_deletes_before_review_publication(self):
         with TemporaryDirectory() as directory:
@@ -4888,7 +4834,6 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     set_thumbnail=lambda **thumbnail: None,
                     set_footer=lambda **footer: None,
                 )
-                cog._attachment_files = mock.Mock(return_value=[])
                 cog._scan_all_case_message_images = mock.AsyncMock()
                 cog._is_forward_purge_active.return_value = False
                 cog._get_text_channel_or_thread = mock.Mock(
@@ -6726,50 +6671,6 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                     cog._case_store.owned_role_ids(second.case.case_id), (role.id,)
                 )
 
-    async def test_later_publication_failure_gets_new_durable_work(self):
-        with TemporaryDirectory() as directory:
-            with _isolated_honeypot_modules(Path(directory)) as honeypot:
-                now = datetime.now(timezone.utc)
-                cog = honeypot.Honeypot(_Bot())
-                first = self._append_case(honeypot, cog, now)
-                await cog._record_publication_failure(
-                    first.case.case_id, RuntimeError("first failure")
-                )
-                snapshot = cog._case_store.get_case(first.case.case_id)
-                first_operation = next(
-                    item
-                    for item in snapshot.operations
-                    if item.operation_type == "review_publish"
-                )
-                running = cog._case_store.claim_due_operations(
-                    first_operation.retry_at
-                )[0]
-                self.assertTrue(
-                    cog._case_store.complete_operation(
-                        running.operation_id,
-                        running.claim_token,
-                        first_operation.retry_at,
-                    )
-                )
-                self._append_case(
-                    honeypot, cog, now + timedelta(seconds=1), message_id=41
-                )
-
-                await cog._record_publication_failure(
-                    first.case.case_id, RuntimeError("later failure")
-                )
-
-                snapshot = cog._case_store.get_case(first.case.case_id)
-                publication_operations = tuple(
-                    item
-                    for item in snapshot.operations
-                    if item.operation_type == "review_publish"
-                )
-                self.assertEqual(len(publication_operations), 2)
-                self.assertEqual(
-                    {item.status.value for item in publication_operations},
-                    {"succeeded", "failed"},
-                )
 
     async def test_case_projection_warns_about_failed_required_operations(self):
         with TemporaryDirectory() as directory:
