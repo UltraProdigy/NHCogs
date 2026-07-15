@@ -125,7 +125,7 @@ msgstr ""
 # ─── on_message listener ──────────────────────────────────────────────
 
 #: honeypot\honeypot.py:360
-msgid "Honeypot — Self-bot/Scammer Detected!"
+msgid "Honeypot: Self-bot/Scammer Detected!"
 msgstr ""
 
 #: honeypot\honeypot.py:361
@@ -145,11 +145,11 @@ msgid "Whitelisted role:"
 msgstr ""
 
 #: honeypot\honeypot.py:392
-msgid "User has a whitelisted role — no punishment applied."
+msgid "User has a whitelisted role. No punishment applied."
 msgstr ""
 
 #: honeypot\honeypot.py:405
-msgid "Honeypot — Review Required"
+msgid "Honeypot: Review Required"
 msgstr ""
 
 #: honeypot\honeypot.py:407
@@ -161,7 +161,7 @@ msgid "⏳ Pending moderator review"
 msgstr ""
 
 #: honeypot\honeypot.py:421
-msgid "🟡 **Review required** for {user} ({user_id}) — sent to {channel}."
+msgid "🟡 **Review required** for {user} ({user_id}). Sent to {channel}."
 msgstr ""
 
 # auto-action

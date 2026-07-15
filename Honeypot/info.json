@@ -12,8 +12,11 @@
         "moderation",
         "security"
     ],
-    "requirements": ["git+https://github.com/AAA3A-AAA3A/AAA3A_utils.git"],
+    "requirements": [
+        "git+https://github.com/AAA3A-AAA3A/AAA3A_utils.git",
+        "Pillow"
+    ],
     "min_bot_version": "3.5.0",
     "min_python_version": [3, 10, 0],
-    "end_user_data_statement": "This cog does not persistently store data or metadata about users."
+    "end_user_data_statement": "This cog stores moderation case metadata about detected users and messages in SQLite and publishes a summary, thread timeline, and captured attachment copies to a configured Discord review channel. Case evidence files are removed by resolution cleanup; the resolved Discord thread is locked and archived. Attachments selected as image-learning samples are copied to separate image-scan storage and may remain there under its own retention controls. Red user-data deletion and guild removal delete the matching Discord case workspace, local evidence, and case rows; unavailable Discord deletions remain queued for retry."
 }

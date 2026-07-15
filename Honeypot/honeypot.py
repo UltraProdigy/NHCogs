@@ -9,11 +9,14 @@ import random
 import re
 import sqlite3
 import tempfile
+from time import perf_counter
 import typing
 import zipfile
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager, closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import discord
 from discord.ext import tasks
@@ -25,6 +28,27 @@ from redbot.core.data_manager import cog_data_path
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.chat_formatting import box, pagify
 
+from .detection_cases import (
+    ActionIntent,
+    AttachmentKey,
+    CaseStatus,
+    DeleteStatus,
+    DetectionCaseStore,
+    DetectionSignal,
+    NewAttachment,
+    NewMessage,
+    effective_action,
+)
+from .case_review import (
+    CaseFeedbackItem,
+    CaseReviewService,
+    case_custom_id,
+    case_feedback_items,
+    is_persisted_image_attachment,
+    render_case,
+    render_timeline,
+)
+from . import detection_runtime
 from .image_detector import (
     ImageSample,
     image_hashes_from_bytes,
@@ -34,6 +58,7 @@ from .image_detector import (
 
 _ = Translator("Honeypot", __file__)
 log = logging.getLogger("red.Honeypot")
+_TIMELINE_VIEW_UNSET = object()
 
 try:
     from PIL import Image
@@ -61,6 +86,10 @@ DEFAULT_STATS = {
     "purged_messages": 0,
     "cached_purge_deletes": 0,
     "forward_purge_deletes": 0,
+    "forward_purge_delete_failures": 0,
+    "evidence_capture_failures": 0,
+    "delete_forbidden": 0,
+    "delete_transient_failures": 0,
     "firstpost_seen": 0,
     "firstpost_hits": 0,
     "firstpost_reviews": 0,
@@ -81,7 +110,7 @@ DEFAULT_STATS = {
     "joinwatch_auto_role_punishments": 0,
 }
 
-JOINWATCH_RETRY_DELAY_MINUTES = 5
+JOINWATCH_RETRY_DELAY_MINUTES = 1
 JOINWATCH_MAX_RETRIES = 5
 POST_BAN_SWEEP_DELAY_SECONDS = 5
 PURGE_MIN_RETENTION_SECONDS = 60
@@ -100,6 +129,13 @@ IMAGE_SCAN_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 IMAGE_SCAN_COUNTS = (2, 4)
 IMAGE_SCAN_MAX_ATTACHMENTS = 4
 IMAGE_SCAN_FEEDBACK_TIMEOUT_SECONDS = 24 * 60 * 60
+DETECTION_CAPTURE_DEADLINE_SECONDS = 20.0
+DETECTION_ATTACHMENT_TIMEOUT_SECONDS = 15.0
+DETECTION_CAPTURE_START_TIMEOUT_SECONDS = 1.0
+DETECTION_IMAGE_READ_MAX_BYTES = 25 * 1024 * 1024
+DETECTION_EVIDENCE_RESERVATION_STALE_SECONDS = 5 * 60
+DETECTION_CAPTURE_CONCURRENCY = 4
+DETECTION_HEARTBEAT_INTERVAL_SECONDS = 60.0
 IMAGE_SCAN_FEEDBACK_BULK_LABELS = ("All TP", "All FP", "Ignore all", "Individual")
 IMAGE_SCAN_DECISIONS = ("true_positive", "false_positive")
 IMAGE_SCAN_DETECTOR_ACTION_OPTIONS = ("none", "review", "kick", "ban")
@@ -148,18 +184,6 @@ def joinwatch_channel_id(config: dict) -> int | None:
     return channel_id if isinstance(channel_id, int) else None
 
 
-def imagescan_feedback_items(
-    attachments: list[discord.Attachment],
-    attachment_snapshots: list[dict[str, typing.Any]],
-) -> list[tuple[discord.Attachment, int, bytes]]:
-    items = []
-    for index, attachment in enumerate(attachments):
-        if not is_image_attachment(attachment) or index >= len(attachment_snapshots):
-            continue
-        data = attachment_snapshots[index].get("data")
-        if data is not None:
-            items.append((attachment, index + 1, data))
-    return items
 
 
 def is_image_attachment(attachment: discord.Attachment) -> bool:
@@ -170,11 +194,6 @@ def is_image_attachment(attachment: discord.Attachment) -> bool:
     return any(filename.endswith(extension) for extension in IMAGE_ATTACHMENT_EXTENSIONS)
 
 
-def imagescan_detector_batches(
-    attachments: list[discord.Attachment],
-) -> tuple[list[discord.Attachment], list[discord.Attachment]]:
-    images = [attachment for attachment in attachments if is_image_attachment(attachment)]
-    return images[:IMAGE_SCAN_MAX_ATTACHMENTS], images[IMAGE_SCAN_MAX_ATTACHMENTS:]
 
 
 def plan_imagescan_event_cache_cleanup(
@@ -214,7 +233,7 @@ def format_imagescan_matched_attachments(
     matches: list[tuple[discord.Attachment, dict[str, typing.Any], dict[str, str]]],
 ) -> str:
     lines = [
-        "`{hash_diff}` — {filename}".format(
+            "`{hash_diff}`: {filename}".format(
             hash_diff=format_image_hash_diff(match["score"], match["threshold"]),
             filename=getattr(attachment, "filename", None) or "unknown",
         )
@@ -243,14 +262,6 @@ def match_imagescan_sample_identifier(
     return prefix[0] if len(prefix) == 1 else None
 
 
-def format_image_detection_status(status: str) -> str:
-    labels = {
-        "no_images": "No image attachments",
-        "detected": "Detected, already known",
-        "queued": "Not detected, feedback queued",
-        "not_checked": "Not checked",
-    }
-    return labels.get(status, "Not checked")
 
 
 def is_imagescan_sample_path_safe(files_root: Path, candidate: Path) -> bool:
@@ -259,6 +270,11 @@ def is_imagescan_sample_path_safe(files_root: Path, candidate: Path) -> bool:
         return True
     except (OSError, ValueError):
         return False
+
+
+def case_evidence_root(evidence_root: Path, guild_id: int, case_id: str) -> Path:
+    """Return the canonical storage root for one guild-scoped detection case."""
+    return evidence_root / str(guild_id) / case_id
 
 
 def summarize_imagescan_sample_storage(rows: list[dict[str, typing.Any]]) -> dict[str, int]:
@@ -279,14 +295,6 @@ def summarize_imagescan_sample_storage(rows: list[dict[str, typing.Any]]) -> dic
     return stats
 
 
-def image_learning_status(*, has_images: bool, has_known_match: bool, can_queue: bool) -> str:
-    if not has_images:
-        return "no_images"
-    if has_known_match:
-        return "detected"
-    if can_queue:
-        return "queued"
-    return "not_checked"
 
 
 class MessageRef(typing.NamedTuple):
@@ -370,608 +378,265 @@ def message_spam_fingerprint(message: discord.Message) -> str:
 # that is not already visible in the public message, such as permission denials,
 # errors, conflicts, or confirmation prompts. Do not repeat successful actions
 # when the updated embed, content, or disabled controls already show the result.
-class ReviewView(discord.ui.View):
+class DetectionCaseView(discord.ui.View):
+    """Persistent controls whose callbacks always resolve state through SQLite."""
+
     def __init__(
         self,
         cog: "Honeypot",
-        target_id: int,
-        guild_id: int,
-        content: str,
-        attachment_urls: list[str],
-        pending_mute_role_id: int | None = None,
-        review_timeout_minutes: int = 1440,
-        expires_at: datetime | None = None,
-        message_fingerprint: str | None = None,
-        channel_ids: list[int] | None = None,
+        case_id: str,
+        *,
+        has_image_feedback: bool,
+        message_sequence: int | None = None,
+        resolved: bool = False,
+        allow_individual: bool = True,
     ) -> None:
-        super().__init__(timeout=None)
+        super().__init__()
+        self.timeout = None
         self.cog = cog
-        self.target_id = target_id
-        self.guild_id = guild_id
-        self.content = content
-        self.attachment_urls = attachment_urls
-        self.pending_mute_role_id = pending_mute_role_id
-        self.message_fingerprint = message_fingerprint
-        normalized_channel_ids = []
-        for channel_id in channel_ids or []:
-            try:
-                normalized_channel_ids.append(int(channel_id))
-            except (TypeError, ValueError):
-                continue
-        self.channel_ids = list(dict.fromkeys(normalized_channel_ids))
-        self.created_at = datetime.now(timezone.utc)
-        self.expires_at = expires_at or self.created_at + timedelta(minutes=review_timeout_minutes)
-        self.review_message: discord.Message | None = None
-        self.claimed_by: int | None = None
-        self.active_key: int | None = None
-        self._resolution_lock: asyncio.Lock = asyncio.Lock()
-        self._resolution_started = False
+        self.case_id = case_id
+        self.message_sequence = message_sequence
+        scope = f"message-{message_sequence}" if message_sequence is not None else None
+        add_item = getattr(self, "add_item", None)
+        if not callable(add_item):
+            return
+        if self.message_sequence is None:
+            for label, action, style, emoji in (
+                ("Ban", "ban", discord.ButtonStyle.danger, "🔨"),
+                ("Kick", "kick", discord.ButtonStyle.secondary, "👢"),
+                ("Ignore", "ignore", discord.ButtonStyle.success, "✅"),
+            ):
+                button = discord.ui.Button(
+                    label=label,
+                    style=style,
+                    emoji=emoji,
+                    custom_id=case_custom_id(case_id, "moderate", action),
+                    disabled=resolved,
+                    row=0,
+                )
 
-    def _check_perms(self, interaction: discord.Interaction) -> bool:
-        guild_permissions = getattr(interaction.user, "guild_permissions", None)
-        if guild_permissions is None or not guild_permissions.moderate_members:
-            return False
-        return True
+                async def moderation_callback(interaction, selected=action):
+                    await self.cog._case_review_moderation_interaction(
+                        interaction, self.case_id, selected
+                    )
 
-    def _disable_all(self) -> None:
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-
-    @staticmethod
-    def _remove_review_expiry_field(embed: discord.Embed) -> None:
-        for index in reversed(
-            [
-                index
-                for index, field in enumerate(embed.fields)
-                if field.name == _("Review expires in:")
-            ]
+                button.callback = moderation_callback
+                add_item(button)
+        if not has_image_feedback:
+            return
+        for label, action, style in (
+            ("All TP", "tp", discord.ButtonStyle.success),
+            ("All FP", "fp", discord.ButtonStyle.danger),
+            ("Ignore", "ignore", discord.ButtonStyle.secondary),
         ):
-            embed.remove_field(index)
-
-    async def _create_modlog_case(
-        self,
-        guild: discord.Guild,
-        user: discord.Member | discord.User | discord.Object,
-        action: str,
-        reason: str,
-        moderator: typing.Any = None,
-    ) -> None:
-        try:
-            await modlog.create_case(
-                self.cog.bot,
-                guild,
-                datetime.now(timezone.utc),
-                action_type=action,
-                user=user,
-                moderator=moderator or guild.me,
-                reason=reason,
-            )
-        except Exception:
-            log.exception("Failed to create modlog case in ReviewView")
-
-    async def _claim_resolution(self) -> bool:
-        async with self._resolution_lock:
-            if self._resolution_started:
-                return False
-            self._resolution_started = True
-            return True
-
-    async def _release_resolution(self) -> None:
-        async with self._resolution_lock:
-            self._resolution_started = False
-
-    async def _update_done(self, interaction: discord.Interaction, action_taken: str) -> None:
-        self._disable_all()
-        embed = self.review_message.embeds[0] if self.review_message and self.review_message.embeds else None
-        if embed:
-            embed.color = discord.Color.green()
-            self._remove_review_expiry_field(embed)
-            reviewed_value = (
-                f"{interaction.user.mention} ({interaction.user.id})\n"
-                f"{discord.utils.format_dt(datetime.now(timezone.utc), style='F')}"
-            )
-            status_field_index = next(
-                (
-                    index
-                    for index, field in enumerate(embed.fields)
-                    if field.name == _("Status:") or field.value == _("Pending moderator review")
+            button = discord.ui.Button(
+                label=label,
+                style=style,
+                custom_id=case_custom_id(
+                    case_id,
+                    f"{scope}-resolve" if scope is not None else "resolve",
+                    action,
                 ),
-                None,
+                disabled=resolved,
+                row=1,
             )
-            if status_field_index is None:
-                embed.add_field(name=_("Reviewed by:"), value=reviewed_value, inline=False)
-            else:
-                embed.set_field_at(
-                    status_field_index,
-                    name=_("Reviewed by:"),
-                    value=reviewed_value,
-                    inline=False,
-                )
-            embed.add_field(
-                name=_("Action taken:"),
-                value=action_taken,
-                inline=False,
-            )
-        review_message = self.review_message or interaction.message
-        if review_message is not None:
-            try:
-                await review_message.edit(content=_("\u2705 **Review resolved**"), embed=embed, view=self)
-            except discord.HTTPException:
-                log.debug("Failed to edit completed review message %s", getattr(review_message, "id", None))
-        async with self.cog._views_lock:
-            self.cog._active_views.pop(self.active_key or self.target_id, None)
-        if interaction.guild is not None:
-            await self.cog._delete_pending_review(interaction.guild, self.active_key)
-        self.stop()
 
-    async def _action_perform(self, interaction: discord.Interaction, action: str) -> tuple[str | None, str | None]:
-        """Returns (result_message, action_label) or (None, None) to abort."""
-        if not self._check_perms(interaction):
-            return (_("You need `Moderate Members` permission."), None)
-        guild = self.cog.bot.get_guild(self.guild_id)
-        if guild is None:
-            return (_("Guild not found."), None)
-        config = await self.cog.config.guild(guild).all()
-        member = guild.get_member(self.target_id)
-        if member is None and action == "kick":
-            return (_("User left the server before the kick could be applied. Review is still pending; use Ban or Ignore."), None)
-        if member is None and action not in ("ban", "ignore"):
-            return (_("User is no longer in the server."), None)
-        if action == "ignore":
-            self.cog._deactivate_forward_purge(guild.id, self.target_id)
-            if member is not None and self.pending_mute_role_id is not None:
-                mute_role = guild.get_role(self.pending_mute_role_id)
-                if mute_role is not None and mute_role in member.roles:
-                    removed = await self.cog._remove_review_mute_role(
-                        member,
-                        mute_role,
-                        _("Honeypot review ignored; removing pending mute."),
+            async def callback(interaction, selected=action):
+                if self.message_sequence is None:
+                    await self.cog._case_review_bulk_interaction(
+                        interaction, self.case_id, selected
                     )
-                    if not removed:
-                        return (_("I couldn't remove the temporary mute role. Check my role permissions."), None)
-            await self.cog._increment_stat(guild, "ignored")
-            return (None, _("Ignored (no action)"))
-        reason = _("Honeypot review: {action}").format(action=action.title())
-        if config.get("dry_run"):
-            self.cog._deactivate_forward_purge(guild.id, self.target_id)
-            if member is not None and self.pending_mute_role_id is not None:
-                mute_role = guild.get_role(self.pending_mute_role_id)
-                if mute_role is not None and mute_role in member.roles:
-                    removed = await self.cog._remove_review_mute_role(
-                        member,
-                        mute_role,
-                        _("Honeypot dry-run review completed; removing pending mute."),
+                else:
+                    await self.cog._case_review_message_bulk_interaction(
+                        interaction,
+                        self.case_id,
+                        self.message_sequence,
+                        selected,
                     )
-                    if not removed:
-                        return (_("I couldn't remove the temporary mute role. Check my role permissions."), None)
-            await self.cog._increment_stat(guild, "dry_run_actions")
-            return (None, self.cog._dry_run_label(action))
-        missing_permission = self.cog._missing_action_permission(guild, action)
-        if missing_permission is not None:
-            self.cog._deactivate_forward_purge(guild.id, self.target_id)
-            await self.cog._increment_stat(guild, "failed_actions")
-            return (missing_permission, None)
-        try:
-            if member is not None and self.pending_mute_role_id is not None:
-                mute_role = guild.get_role(self.pending_mute_role_id)
-                if mute_role is not None and mute_role in member.roles:
-                    removed = await self.cog._remove_review_mute_role(
-                        member,
-                        mute_role,
-                        _("Removing pending mute before {action}.").format(action=action),
-                    )
-                    if not removed:
-                        log.debug("Failed to remove pending mute role before %s for user %s", action, self.target_id)
-            if action == "kick":
-                if member is None:
-                    return (_("User is no longer in the server."), None)
-                self.cog._activate_forward_purge(guild.id, self.target_id, config)
-                await member.kick(reason=reason)
-                await self._create_modlog_case(guild, member, action, reason, interaction.user)
-                await self.cog._increment_stat(guild, "kicked")
-                await self.cog._purge_after_review_action(guild, self.target_id, config)
-                return (None, _("Kicked"))
-            elif action == "ban":
-                target = member if member is not None else await self.cog._get_user_or_object(self.target_id)
-                self.cog._activate_forward_purge(guild.id, target.id, config)
-                await guild.ban(
-                    target,
-                    reason=reason,
-                    delete_message_seconds=self.cog._ban_delete_message_seconds(config),
-                )
-                self.cog._schedule_post_ban_sweep(guild, target.id)
-                await self._create_modlog_case(guild, target, action, reason, interaction.user)
-                await self.cog._increment_stat(guild, "banned")
-                await self.cog._purge_after_review_action(guild, target.id, config)
-                return (None, _("Banned"))
-        except discord.HTTPException:
-            self.cog._deactivate_forward_purge(guild.id, self.target_id)
-            await self.cog._increment_stat(guild, "failed_actions")
-            return (_("Action failed. Check my permissions and role position."), None)
-        return (None, None)
 
-    @discord.ui.button(label="Ban", style=discord.ButtonStyle.danger, emoji="🔨", custom_id="honeypot:review:ban")
-    async def ban_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        if not await self._claim_resolution():
-            await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
+            button.callback = callback
+            add_item(button)
+        if not allow_individual:
             return
-        msg, label = await self._action_perform(interaction, "ban")
-        if label:
-            await self._update_done(interaction, label)
-        else:
-            await self._release_resolution()
-        if msg:
-            await interaction.followup.send(msg, ephemeral=True)
-
-    @discord.ui.button(label="Kick", style=discord.ButtonStyle.secondary, emoji="👢", custom_id="honeypot:review:kick")
-    async def kick_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        if not await self._claim_resolution():
-            await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
-            return
-        msg, label = await self._action_perform(interaction, "kick")
-        if label:
-            await self._update_done(interaction, label)
-        else:
-            await self._release_resolution()
-        if msg:
-            await interaction.followup.send(msg, ephemeral=True)
-
-    @discord.ui.button(label="Ignore", style=discord.ButtonStyle.success, emoji="✅", custom_id="honeypot:review:ignore")
-    async def ignore_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        if not await self._claim_resolution():
-            await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
-            return
-        msg, label = await self._action_perform(interaction, "ignore")
-        if label:
-            await self._update_done(interaction, label)
-        else:
-            await self._release_resolution()
-        if msg:
-            await interaction.followup.send(msg, ephemeral=True)
-
-
-class KickFailWarnView(discord.ui.View):
-    def __init__(self, review_view: ReviewView) -> None:
-        super().__init__(timeout=300)
-        self.review_view = review_view
-
-    @discord.ui.button(label="Yes", style=discord.ButtonStyle.danger, custom_id="honeypot:kickfailwarn:yes")
-    async def warn_yes(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        if not self.review_view._check_perms(interaction):
-            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
-            return
-        if not await self.review_view._claim_resolution():
-            await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
-            return
-        guild = self.review_view.cog.bot.get_guild(self.review_view.guild_id)
-        if guild is None:
-            await self.review_view._release_resolution()
-            await interaction.followup.send(_("Guild not found."), ephemeral=True)
-            return
-        label, failed = await self.review_view.cog._create_kick_fail_warning(
-            guild,
-            self.review_view.target_id,
-            moderator=interaction.user,
-        )
-        if failed:
-            await self.review_view._release_resolution()
-            await interaction.followup.send(failed, ephemeral=True)
-            return
-        await self.review_view._update_done(interaction, label or _("Warning applied"))
-        self.stop()
-
-    @discord.ui.button(label="No", style=discord.ButtonStyle.secondary, custom_id="honeypot:kickfailwarn:no")
-    async def warn_no(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        if not self.review_view._check_perms(interaction):
-            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
-            return
-        if not await self.review_view._claim_resolution():
-            await interaction.followup.send(_("Someone is already handling this review."), ephemeral=True)
-            return
-        await self.review_view._update_done(interaction, _("Kick skipped; target left the server."))
-        self.stop()
-
-
-class ImageScanReviewView(discord.ui.View):
-    def __init__(self, cog: "Honeypot", event_id: str, guild_id: int) -> None:
-        super().__init__(timeout=None)
-        self.cog = cog
-        self.event_id = event_id
-        self.guild_id = guild_id
-        self.review_message: discord.Message | None = None
-
-    @staticmethod
-    def _check_perms(interaction: discord.Interaction) -> bool:
-        permissions = getattr(interaction.user, "guild_permissions", None)
-        return bool(permissions and permissions.moderate_members)
-
-    def _disable_all(self) -> None:
-        for item in self.children:
-            item.disabled = True
-
-    async def _set_decision(
-        self,
-        interaction: discord.Interaction,
-        decision: str,
-        label: str,
-    ) -> None:
-        if not self._check_perms(interaction):
-            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
-            return
-        await self.cog._imagescan_set_decision(self.guild_id, self.event_id, decision, interaction.user.id)
-        self._disable_all()
-        message = self.review_message or interaction.message
-        embed = message.embeds[0] if message and message.embeds else None
-        if embed:
-            embed.color = discord.Color.green()
-            reviewed_value = (
-                f"{interaction.user.mention} ({interaction.user.id})\n"
-                f"{discord.utils.format_dt(datetime.now(timezone.utc), style='F')}"
-            )
-            status_index = self.cog._embed_field_index(embed, _("Status:"))
-            if status_index is None:
-                embed.add_field(name=_("Classification:"), value=label, inline=False)
-            else:
-                embed.set_field_at(status_index, name=_("Classification:"), value=label, inline=False)
-            embed.add_field(name=_("Reviewed by:"), value=reviewed_value, inline=False)
-        if message is not None:
-            try:
-                await message.edit(content=_("✅ **Image scan classified**"), embed=embed, view=self)
-            except discord.HTTPException:
-                log.debug("Failed to edit imagescan review message %s", getattr(message, "id", None))
-
-    @discord.ui.button(label="Confirm scam", style=discord.ButtonStyle.danger, custom_id="honeypot:imagescan:true_positive")
-    async def confirm_scam(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        await self._set_decision(interaction, "true_positive", _("True positive"))
-
-    @discord.ui.button(label="False positive", style=discord.ButtonStyle.secondary, custom_id="honeypot:imagescan:false_positive")
-    async def false_positive(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        await self._set_decision(interaction, "false_positive", _("False positive"))
-
-    @discord.ui.button(label="Ignore", style=discord.ButtonStyle.success, custom_id="honeypot:imagescan:ignored")
-    async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        await self._set_decision(interaction, "ignored", _("Ignored"))
-
-
-class ImageScanFeedbackSelect(discord.ui.Select):
-    def __init__(self, panel: "ImageScanFeedbackView") -> None:
-        self.panel = panel
-        options = [
-            discord.SelectOption(
-                label=panel.item_label(index),
-                value=str(index),
-                default=index == panel.selected_index,
-            )
-            for index, item in enumerate(panel.items)
-            if item["decision"] is None
-        ]
-        super().__init__(placeholder=_("Select an image"), options=options, min_values=1, max_values=1)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        self.panel.selected_index = int(self.values[0])
-        self.panel._show_individual_controls()
-        await interaction.response.edit_message(
-            content=self.panel.status_content(),
-            view=self.panel,
+        individual = discord.ui.Button(
+            label="Individual",
+            style=discord.ButtonStyle.primary,
+            custom_id=case_custom_id(
+                case_id,
+                f"{scope}-images" if scope is not None else "images",
+                "individual",
+            ),
+            disabled=resolved,
+            row=1,
         )
 
+        async def individual_callback(interaction):
+            if self.message_sequence is None:
+                await self.cog._case_review_individual_prompt(
+                    interaction, self.case_id
+                )
+            else:
+                await self.cog._case_review_individual_prompt(
+                    interaction,
+                    self.case_id,
+                    message_sequence=self.message_sequence,
+                )
 
-class ImageScanFeedbackView(discord.ui.View):
+        individual.callback = individual_callback
+        add_item(individual)
+
+
+class DetectionBulkConfirmationView(discord.ui.View):
     def __init__(
         self,
         cog: "Honeypot",
-        source_message: discord.Message,
-        items: list[tuple[discord.Attachment, int, bytes]],
+        case_id: str,
+        action: str,
+        *,
+        message_sequence: int | None = None,
     ) -> None:
-        super().__init__(timeout=IMAGE_SCAN_FEEDBACK_TIMEOUT_SECONDS)
+        super().__init__()
+        self.timeout = 60
         self.cog = cog
-        self.source_message = source_message
-        self.items = [
-            {"attachment": attachment, "index": index, "data": data, "decision": None}
-            for attachment, index, data in items
-        ]
-        self.selected_index = 0
-        self.clear_items()
-        self.add_item(self.all_tp)
-        self.add_item(self.all_fp)
-        self.add_item(self.ignore_all)
-        self.add_item(self.individual)
+        self.case_id = case_id
+        self.action = action
+        self.message_sequence = message_sequence
+        add_item = getattr(self, "add_item", None)
+        if not callable(add_item):
+            return
+        label = "Confirm All TP" if action == "tp" else "Confirm All FP"
+        style = (
+            discord.ButtonStyle.success
+            if action == "tp"
+            else discord.ButtonStyle.danger
+        )
+        button = discord.ui.Button(label=label, style=style)
 
-    def item_label(self, index: int) -> str:
-        item = self.items[index]
-        filename = item["attachment"].filename or f"attachment-{item['index']}"
-        return f"{item['index']}. {filename}"[:100]
+        async def callback(interaction):
+            if self.message_sequence is None:
+                await self.cog._case_review_bulk_interaction(
+                    interaction,
+                    self.case_id,
+                    self.action,
+                    confirmed=True,
+                )
+            else:
+                await self.cog._case_review_message_bulk_interaction(
+                    interaction,
+                    self.case_id,
+                    self.message_sequence,
+                    self.action,
+                    confirmed=True,
+                )
 
-    def status_content(self) -> str:
-        labels = {"true_positive": "✅ TP", "false_positive": "✅ FP", "ignored": "➖ Ignored", None: "⏳ Pending"}
-        lines = [_("**Image detector feedback**")]
-        for index, item in enumerate(self.items):
-            marker = "➡️ " if item["decision"] is None and index == self.selected_index else ""
-            lines.append(f"{marker}{self.item_label(index)} — {labels[item['decision']]}")
-        return "\n".join(lines)
+        button.callback = callback
+        add_item(button)
 
-    @staticmethod
-    def _check_perms(interaction: discord.Interaction) -> bool:
-        permissions = getattr(interaction.user, "guild_permissions", None)
-        return bool(permissions and permissions.moderate_members)
 
-    def _disable_all(self) -> None:
-        for item in self.children:
-            item.disabled = True
-
-    async def _confirm_text(self, interaction: discord.Interaction, token: str) -> bool:
-        await interaction.followup.send(
-            _("Type `{token}` to confirm.").format(token=token),
-            ephemeral=True,
+class DetectionModerationConfirmationView(discord.ui.View):
+    def __init__(self, cog: "Honeypot", case_id: str, action: str) -> None:
+        super().__init__()
+        self.timeout = 60
+        self.cog = cog
+        self.case_id = case_id
+        self.action = action
+        add_item = getattr(self, "add_item", None)
+        if not callable(add_item):
+            return
+        button = discord.ui.Button(
+            label=f"Confirm {action.title()}",
+            style=(
+                discord.ButtonStyle.danger
+                if action == "ban"
+                else discord.ButtonStyle.secondary
+            ),
         )
 
-        def check(message: discord.Message) -> bool:
-            return (
-                message.author.id == interaction.user.id
-                and message.channel.id == interaction.channel_id
-                and message.content.strip().upper() == token
+        async def callback(interaction):
+            await self.cog._case_review_moderation_interaction(
+                interaction, self.case_id, self.action, confirmed=True
             )
 
-        try:
-            await self.cog.bot.wait_for("message", check=check, timeout=60)
-        except asyncio.TimeoutError:
-            await interaction.followup.send(_("Cancelled."), ephemeral=True)
-            return False
-        return True
+        button.callback = callback
+        add_item(button)
 
-    async def _save_item_decision(
-        self,
-        interaction: discord.Interaction,
-        item_index: int,
-        decision: str,
-    ) -> tuple[str, dict[str, typing.Any] | None]:
-        item = self.items[item_index]
-        status, sample = await self.cog._imagescan_add_bytes_sample(
-            self.source_message.guild.id,
-            item["data"],
-            item["attachment"].filename or f"attachment-{item['index']}",
-            self.source_message.jump_url,
-            decision,
-            interaction.user.id,
+
+class DetectionIndividualView(discord.ui.View):
+    def __init__(
+        self, cog: "Honeypot", feedback_items: tuple[CaseFeedbackItem, ...]
+    ) -> None:
+        super().__init__()
+        self.timeout = 300
+        self.cog = cog
+        self.selected_key: AttachmentKey | None = None
+        add_item = getattr(self, "add_item", None)
+        if not callable(add_item):
+            return
+        choices = feedback_items[:25]
+        keys = {str(index): item.key for index, item in enumerate(choices)}
+        selector = discord.ui.Select(
+            placeholder="Choose an image",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=(
+                        f"{item.key.message_sequence}.{item.key.position + 1} "
+                        f"{item.filename}"
+                    )[:100],
+                    value=str(index),
+                )
+                for index, item in enumerate(choices)
+            ],
+            row=0,
         )
-        config = await self.cog.config.guild(self.source_message.guild).all()
-        state = await self.cog._imagescan_model_state(
-            self.source_message.guild.id,
-            int(config.get("imagescan_detector_threshold", 20)),
-        )
-        if status == "inserted" and state["valid"]:
-            item["decision"] = decision
-            return status, sample
-        if status == "duplicate":
-            item["decision"] = decision
-            return status, sample
-        if status == "inserted" and sample is not None:
-            await self.cog._imagescan_deactivate_sample(
-                self.source_message.guild.id,
-                sample["sample_id"],
-            )
-            await self.cog._imagescan_model_state(
-                self.source_message.guild.id,
-                int(config.get("imagescan_detector_threshold", 20)),
-            )
-        return "conflict", sample
+        action_buttons = []
 
-    def _next_pending_index(self) -> int | None:
-        return next((index for index, item in enumerate(self.items) if item["decision"] is None), None)
-
-    def _show_individual_controls(self) -> None:
-        self.clear_items()
-        pending = self._next_pending_index()
-        if pending is None:
-            return
-        if self.items[self.selected_index]["decision"] is not None:
-            self.selected_index = pending
-        self.add_item(ImageScanFeedbackSelect(self))
-        self.add_item(self.confirm_tp)
-        self.add_item(self.confirm_fp)
-        self.add_item(self.ignore_image)
-
-    async def _finish_interaction(self, interaction: discord.Interaction, error: str | None = None) -> None:
-        pending = self._next_pending_index()
-        if pending is None:
-            self.clear_items()
-        else:
-            self.selected_index = pending
-            self._show_individual_controls()
-        if interaction.message is not None:
-            await interaction.message.edit(content=self.status_content(), view=self)
-        if error is not None:
-            await interaction.followup.send(error, ephemeral=True)
-
-    async def _apply_bulk(self, interaction: discord.Interaction, decision: str, token: str) -> None:
-        await interaction.response.defer()
-        if not self._check_perms(interaction):
-            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
-            return
-        if not await self._confirm_text(interaction, token):
-            return
-        conflicts = 0
-        for index, item in enumerate(self.items):
-            if item["decision"] is not None:
-                continue
-            status, _sample = await self._save_item_decision(interaction, index, decision)
-            if status not in ("inserted", "duplicate"):
-                conflicts += 1
-        self._disable_all()
-        if interaction.message is not None:
-            await interaction.message.edit(content=self.status_content(), view=self)
-        if conflicts:
-            await interaction.followup.send(
-                _("Could not save {conflicts} image(s) because of TP/FP overlap.").format(conflicts=conflicts),
-                ephemeral=True,
+        async def select_callback(interaction):
+            selected_value = selector.values[0]
+            self.selected_key = keys[selected_value]
+            for option in selector.options:
+                option.default = option.value == selected_value
+            for button in action_buttons:
+                button.disabled = False
+            await interaction.response.edit_message(
+                content=_("Choose the result for the selected image."), view=self
             )
 
-    @discord.ui.button(label="All TP", style=discord.ButtonStyle.danger)
-    async def all_tp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self._apply_bulk(interaction, "true_positive", "ALL TP")
+        selector.callback = select_callback
+        add_item(selector)
+        for label, action, style in (
+            ("TP", "tp", discord.ButtonStyle.success),
+            ("FP", "fp", discord.ButtonStyle.danger),
+            ("Ignore", "ignore", discord.ButtonStyle.secondary),
+        ):
+            button = discord.ui.Button(
+                label=label,
+                style=style,
+                disabled=True,
+                row=1,
+            )
 
-    @discord.ui.button(label="All FP", style=discord.ButtonStyle.secondary)
-    async def all_fp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self._apply_bulk(interaction, "false_positive", "ALL FP")
+            async def callback(interaction, selected=action):
+                if self.selected_key is None:
+                    return
+                await self.cog._case_review_attachment_interaction(
+                    interaction, self.selected_key, selected
+                )
 
-    @discord.ui.button(label="Ignore all", style=discord.ButtonStyle.success)
-    async def ignore_all(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        if not self._check_perms(interaction):
-            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
-            return
-        for item in self.items:
-            if item["decision"] is None:
-                item["decision"] = "ignored"
-        self._disable_all()
-        if interaction.message is not None:
-            await interaction.message.edit(content=self.status_content(), view=self)
+            button.callback = callback
+            action_buttons.append(button)
+            add_item(button)
 
-    @discord.ui.button(label="Individual", style=discord.ButtonStyle.primary)
-    async def individual(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self._check_perms(interaction):
-            await interaction.response.send_message(_("You need `Moderate Members` permission."), ephemeral=True)
-            return
-        self._show_individual_controls()
-        await interaction.response.edit_message(content=self.status_content(), view=self)
 
-    @discord.ui.button(label="Confirm TP", style=discord.ButtonStyle.danger)
-    async def confirm_tp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        if not self._check_perms(interaction):
-            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
-            return
-        status, _sample = await self._save_item_decision(interaction, self.selected_index, "true_positive")
-        error = _("Rejected: TP/FP overlap.") if status == "conflict" else None
-        await self._finish_interaction(interaction, error)
 
-    @discord.ui.button(label="Confirm FP", style=discord.ButtonStyle.secondary)
-    async def confirm_fp(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        if not self._check_perms(interaction):
-            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
-            return
-        status, _sample = await self._save_item_decision(interaction, self.selected_index, "false_positive")
-        error = _("Rejected: TP/FP overlap.") if status == "conflict" else None
-        await self._finish_interaction(interaction, error)
 
-    @discord.ui.button(label="Ignore image", style=discord.ButtonStyle.success)
-    async def ignore_image(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        if not self._check_perms(interaction):
-            await interaction.followup.send(_("You need `Moderate Members` permission."), ephemeral=True)
-            return
-        self.items[self.selected_index]["decision"] = "ignored"
-        await self._finish_interaction(interaction)
+
+
+
+
+
+
 
 
 @cog_i18n(_)
@@ -1012,12 +677,10 @@ class Honeypot(Cog):
             imagescan_detector_threshold=20,
             review_enabled=False,
             review_channel=None,
-            review_timeout_minutes=1440,
             review_kick_fail_warning="false",
             automated_kick_fail_warning=False,
             whitelist_mode="bypass",
             stats=DEFAULT_STATS.copy(),
-            pending_reviews={},
             scam_keywords=SCAM_KEYWORDS.copy(),
             attachment_patterns=DEFAULT_ATTACHMENT_PATTERNS.copy(),
             joinwatch_enabled=False,
@@ -1038,10 +701,6 @@ class Honeypot(Cog):
             baitrole_action="ban",
         )
 
-        self._active_views: dict[int, ReviewView] = {}
-        self._views_lock: asyncio.Lock = asyncio.Lock()
-        self._review_creation_locks: dict[tuple[int, int], asyncio.Lock] = {}
-        self._restore_task: asyncio.Task | None = None
         self._post_ban_sweep_tasks: set[asyncio.Task] = set()
         self._recent_user_messages: dict[int, dict[int, deque[MessageRef]]] = defaultdict(
             lambda: defaultdict(deque)
@@ -1056,6 +715,239 @@ class Honeypot(Cog):
         self._imagescan_db_path = cog_data_path(self) / "imagescan.sqlite"
         self._imagescan_files_path = cog_data_path(self) / "imagescan_files"
         self._imagescan_db_lock: asyncio.Lock = asyncio.Lock()
+        self._detection_case_db_path = cog_data_path(self) / "detection_cases.sqlite"
+        self._detection_case_files_path = cog_data_path(self) / "detection_case_files"
+        self._case_store = DetectionCaseStore(self._detection_case_db_path)
+        self._case_review_service = CaseReviewService(self._case_store)
+        self._case_views: dict[str, object] = {}
+        self._case_restore_task: asyncio.Task | None = None
+        self._initial_image_scan_tasks: set[asyncio.Task] = set()
+        self._initial_image_scan_batches: dict[
+            tuple[int, int], dict[int, asyncio.Task]
+        ] = {}
+        self._detection_case_evidence_lock: asyncio.Lock = asyncio.Lock()
+        self._detection_case_capture_slots = asyncio.Semaphore(
+            DETECTION_CAPTURE_CONCURRENCY
+        )
+        self._detection_admission_locks = tuple(asyncio.Lock() for _ in range(64))
+        self._detection_publication_locks = tuple(asyncio.Lock() for _ in range(64))
+        self._detection_heartbeat_interval_seconds = DETECTION_HEARTBEAT_INTERVAL_SECONDS
+
+    def _delete_detection_case_evidence(
+        self, cases: tuple[tuple[int, str], ...]
+    ) -> None:
+        evidence_root = self._detection_case_files_path.resolve()
+        for guild_id, case_id in cases:
+            case_root = case_evidence_root(
+                self._detection_case_files_path, guild_id, case_id
+            )
+            if not case_root.exists():
+                continue
+            if not case_root.resolve().is_relative_to(evidence_root):
+                raise RuntimeError("detection case evidence path escapes storage root")
+            shutil.rmtree(case_root)
+
+    def _discard_rejected_detection_case_capture(
+        self, guild_id: int, case_id: str, capture_path: Path
+    ) -> None:
+        evidence_root = self._detection_case_files_path.resolve()
+        case_root = case_evidence_root(
+            self._detection_case_files_path, guild_id, case_id
+        ).resolve()
+        resolved_capture = capture_path.resolve()
+        if not case_root.is_relative_to(evidence_root):
+            raise RuntimeError("detection case evidence path escapes storage root")
+        if not resolved_capture.is_relative_to(case_root):
+            raise RuntimeError("detection case evidence path escapes case root")
+        capture_path.unlink(missing_ok=True)
+        parent = resolved_capture.parent
+        while parent != case_root:
+            try:
+                parent.rmdir()
+            except OSError:
+                return
+            parent = parent.parent
+        try:
+            case_root.rmdir()
+        except OSError:
+            pass
+
+    @asynccontextmanager
+    async def _detection_case_deletion_barrier(self):
+        async with self._detection_case_evidence_lock:
+            acquired_slots = 0
+            try:
+                for _ in range(DETECTION_CAPTURE_CONCURRENCY):
+                    await self._detection_case_capture_slots.acquire()
+                    acquired_slots += 1
+                yield
+            finally:
+                for _ in range(acquired_slots):
+                    self._detection_case_capture_slots.release()
+
+    async def _delete_detection_case_scope(
+        self,
+        delete_cases: typing.Callable[[int], tuple[tuple[int, str], ...]],
+        scope_id: int,
+    ) -> None:
+        async with self._detection_case_deletion_barrier():
+            await asyncio.to_thread(delete_cases, scope_id)
+            cases = await asyncio.to_thread(
+                self._case_store.list_planned_case_deletions
+            )
+            await self._finish_detection_case_deletions(cases)
+
+    async def _finish_detection_case_deletions(
+        self, cases: tuple[tuple[int, str], ...]
+    ) -> None:
+        errors: list[Exception] = []
+        for guild_id, case_id in cases:
+            job = await asyncio.to_thread(
+                self._case_store.get_case_deletion_job, case_id
+            )
+            if job is None:
+                continue
+            if not job.remote_deleted:
+                try:
+                    await self._delete_detection_case_publications(guild_id, case_id)
+                    await asyncio.to_thread(
+                        self._case_store.mark_case_deletion_remote, case_id
+                    )
+                except Exception as error:
+                    await asyncio.to_thread(
+                        self._case_store.mark_case_deletion_remote,
+                        case_id,
+                        error=str(error),
+                    )
+                    errors.append(error)
+            local_deleted = job.local_deleted
+            if not local_deleted:
+                try:
+                    await asyncio.to_thread(
+                        self._delete_detection_case_evidence,
+                        ((guild_id, case_id),),
+                    )
+                    await asyncio.to_thread(
+                        self._case_store.mark_case_deletion_local, case_id
+                    )
+                    local_deleted = True
+                except Exception as error:
+                    errors.append(error)
+            if not job.rows_deleted and local_deleted:
+                inflight = await asyncio.to_thread(
+                    self._case_store.case_deletion_has_inflight_publications,
+                    case_id,
+                )
+                if inflight:
+                    errors.append(
+                        RuntimeError(
+                            f"detection case publications are still in flight: {case_id}"
+                        )
+                    )
+                else:
+                    finalized = await asyncio.to_thread(
+                        self._case_store.finalize_case_deletion,
+                        guild_id,
+                        case_id,
+                    )
+                    if not finalized:
+                        errors.append(
+                            RuntimeError(
+                                f"detection case deletion job disappeared: {case_id}"
+                            )
+                        )
+                    else:
+                        self._case_views.pop(case_id, None)
+            await asyncio.to_thread(
+                self._case_store.complete_case_deletion_job, case_id
+            )
+        if errors:
+            raise errors[0]
+
+    async def _delete_detection_case_publications(
+        self, guild_id: int, case_id: str
+    ) -> None:
+        job = await asyncio.to_thread(
+            self._case_store.get_case_deletion_job, case_id
+        )
+        if job is None:
+            raise RuntimeError(f"detection case deletion job disappeared: {case_id}")
+        if (
+            job.parent_channel_id is None
+            and job.summary_message_id is None
+            and job.thread_id is None
+            and not job.legacy_publications
+        ):
+            return
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            raise RuntimeError(
+                f"guild {guild_id} is unavailable for detection case deletion"
+            )
+        parent = await self._fetch_text_channel_or_thread(
+            guild, job.parent_channel_id
+        )
+        summary = None
+        if parent is not None and job.summary_message_id is not None:
+            try:
+                summary = await parent.fetch_message(job.summary_message_id)
+            except discord.NotFound:
+                summary = None
+
+        thread = None
+        if summary is not None:
+            fetch_thread = getattr(summary, "fetch_thread", None)
+            if callable(fetch_thread):
+                try:
+                    thread = await fetch_thread()
+                except discord.NotFound:
+                    thread = None
+        if thread is None and job.thread_id is not None:
+            thread = await self._fetch_text_channel_or_thread(guild, job.thread_id)
+
+        if thread is not None:
+            try:
+                await thread.delete(reason="Honeypot user data deletion")
+            except discord.NotFound:
+                pass
+        for channel_id, message_id in job.legacy_publications:
+            legacy_channel = await self._fetch_text_channel_or_thread(
+                guild, channel_id
+            )
+            if legacy_channel is None:
+                continue
+            try:
+                legacy_message = await legacy_channel.fetch_message(message_id)
+                await legacy_message.delete()
+            except discord.NotFound:
+                pass
+        if summary is not None:
+            try:
+                await summary.delete()
+            except discord.NotFound:
+                pass
+
+    async def _retry_detection_case_deletions(self) -> None:
+        async with self._detection_case_deletion_barrier():
+            cases = await asyncio.to_thread(
+                self._case_store.list_planned_case_deletions
+            )
+            await self._finish_detection_case_deletions(cases)
+
+    async def red_delete_data_for_user(
+        self, *, requester: typing.Any, user_id: int
+    ) -> None:
+        """Delete detection-case metadata and evidence associated with a Red user."""
+        await self._delete_detection_case_scope(
+            self._case_store.plan_user_case_deletion, user_id
+        )
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        """Delete detection-case metadata and evidence when Red leaves a guild."""
+        await self._delete_detection_case_scope(
+            self._case_store.plan_guild_case_deletion, guild.id
+        )
 
     async def cog_after_invoke(self, ctx: commands.Context) -> commands.Context | None:
         """Finish command cleanup without AAA3A_utils' redundant success reaction."""
@@ -1072,9 +964,46 @@ class Honeypot(Cog):
         return ctx
 
     async def _increment_stat(self, guild: discord.Guild, key: str, amount: int = 1) -> None:
-        async with self.config.guild(guild).stats() as stats:
+        guild_config = getattr(self.config, "guild", None)
+        if not callable(guild_config):
+            return
+        async with guild_config(guild).stats() as stats:
             stats.setdefault(key, 0)
             stats[key] += amount
+
+    async def _record_detection_stats(
+        self, guild: discord.Guild, signals: tuple[DetectionSignal, ...]
+    ) -> None:
+        signals = tuple(
+            signal
+            for signal in signals
+            if not signal.metadata.get("whitelist_bypass")
+        )
+        if not signals:
+            return
+        await self._increment_stat(guild, "detections")
+        if any(signal.decisive for signal in signals):
+            await self._increment_stat(guild, "suspicious")
+        for detector, prefix, catch_key in (
+            ("firstpost", "firstpost", "early_catches"),
+            ("spam", "spam", "spam_catches"),
+        ):
+            detector_signals = tuple(
+                signal for signal in signals if signal.detector == detector
+            )
+            if not detector_signals:
+                continue
+            await self._increment_stat(guild, f"{prefix}_hits")
+            if any(signal.decisive for signal in detector_signals):
+                await self._increment_stat(guild, catch_key)
+            intents = {signal.action for signal in detector_signals}
+            for intent, suffix in (
+                (ActionIntent.REVIEW, "reviews"),
+                (ActionIntent.KICK, "kicks"),
+                (ActionIntent.BAN, "bans"),
+            ):
+                if intent in intents:
+                    await self._increment_stat(guild, f"{prefix}_{suffix}")
 
     def _init_firstpost_seen_store_sync(self) -> None:
         self._firstpost_db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1096,7 +1025,7 @@ class Honeypot(Cog):
     def _init_imagescan_store_sync(self) -> None:
         self._imagescan_db_path.parent.mkdir(parents=True, exist_ok=True)
         self._imagescan_files_path.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._imagescan_db_path) as conn:
+        with closing(sqlite3.connect(self._imagescan_db_path)) as conn, conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS imagescan_events (
@@ -1220,7 +1149,7 @@ class Honeypot(Cog):
         )
 
     def _imagescan_load_samples_sync(self, guild_id: int) -> list[ImageSample]:
-        with sqlite3.connect(self._imagescan_db_path) as conn:
+        with closing(sqlite3.connect(self._imagescan_db_path)) as conn, conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """
@@ -1376,6 +1305,71 @@ class Honeypot(Cog):
         async with self._imagescan_db_lock:
             return await asyncio.to_thread(self._imagescan_insert_sample_sync, sample)
 
+    def _imagescan_publish_file_sample_sync(
+        self,
+        sample: dict[str, typing.Any],
+        data: bytes,
+        path: Path,
+    ) -> str:
+        temp_path = path.with_name(f".sample-{uuid4().hex}.tmp")
+        published = False
+        with closing(sqlite3.connect(self._imagescan_db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    """SELECT decision FROM imagescan_samples
+                       WHERE guild_id = ? AND sha256 = ? AND active = 1""",
+                    (sample["guild_id"], sample["sha256"]),
+                ).fetchone()
+                if existing is not None:
+                    conn.rollback()
+                    return (
+                        "duplicate"
+                        if existing["decision"] == sample["decision"]
+                        else "conflict"
+                    )
+                if path.exists():
+                    conn.rollback()
+                    return "conflict"
+                temp_path.write_bytes(data)
+                conn.execute(
+                    """INSERT INTO imagescan_samples (
+                           sample_id, guild_id, decision, sha256, phash, dhash, ahash,
+                           source_message_id, source_channel_id, source_jump_url,
+                           file_path, file_size_bytes, created_at, moderator_id, active
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+                    (
+                        sample["sample_id"],
+                        sample["guild_id"],
+                        sample["decision"],
+                        sample["sha256"],
+                        sample["phash"],
+                        sample["dhash"],
+                        sample["ahash"],
+                        sample.get("source_message_id"),
+                        sample.get("source_channel_id"),
+                        sample.get("source_jump_url"),
+                        sample.get("file_path"),
+                        int(sample.get("file_size_bytes") or 0),
+                        int(sample["created_at"]),
+                        sample.get("moderator_id"),
+                    ),
+                )
+                temp_path.replace(path)
+                published = True
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                finally:
+                    if published:
+                        path.unlink(missing_ok=True)
+                raise
+            finally:
+                temp_path.unlink(missing_ok=True)
+        return "inserted"
+
     def _imagescan_sample_rows_sync(self, guild_id: int, include_inactive: bool = False) -> list[dict[str, typing.Any]]:
         where = "guild_id = ?" if include_inactive else "guild_id = ? AND active = 1"
         with sqlite3.connect(self._imagescan_db_path) as conn:
@@ -1527,11 +1521,6 @@ class Honeypot(Cog):
         sample_dir.mkdir(parents=True, exist_ok=True)
         filename = self._imagescan_safe_filename(source_path.name, 1)
         path = sample_dir / f"{hashes['sha256'][:12]}-{filename}"
-        try:
-            await asyncio.to_thread(path.write_bytes, data)
-        except OSError as exc:
-            log.debug("Failed to write imagescan import sample %s: %r", path, exc)
-            return "error", None
         sample = {
             "sample_id": sample_id,
             "guild_id": str(guild_id),
@@ -1548,12 +1537,17 @@ class Honeypot(Cog):
             "created_at": int(datetime.now(timezone.utc).timestamp()),
             "moderator_id": str(moderator_id) if moderator_id is not None else None,
         }
-        status = await self._imagescan_insert_sample(sample)
-        if status != "inserted":
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        try:
+            async with self._imagescan_db_lock:
+                status = await asyncio.to_thread(
+                    self._imagescan_publish_file_sample_sync,
+                    sample,
+                    data,
+                    path,
+                )
+        except (OSError, sqlite3.Error) as exc:
+            log.debug("Failed to write imagescan import sample %s: %r", path, exc)
+            return "error", None
         return status, sample
 
     async def _imagescan_add_bytes_sample(
@@ -1686,31 +1680,7 @@ class Honeypot(Cog):
         await self._increment_stat(guild, "firstpost_seen")
         return True
 
-    async def _store_pending_review(
-        self,
-        guild: discord.Guild,
-        view: ReviewView,
-        review_channel_id: int,
-        review_message_id: int,
-    ) -> None:
-        async with self.config.guild(guild).pending_reviews() as pending_reviews:
-            pending_reviews[str(review_message_id)] = {
-                "target_id": view.target_id,
-                "review_channel_id": review_channel_id,
-                "review_message_id": review_message_id,
-                "content": view.content,
-                "attachment_urls": view.attachment_urls,
-                "pending_mute_role_id": view.pending_mute_role_id,
-                "expires_at": view.expires_at.isoformat(),
-                "message_fingerprint": view.message_fingerprint,
-                "channel_ids": view.channel_ids,
-            }
 
-    async def _delete_pending_review(self, guild: discord.Guild, review_message_id: int | None) -> None:
-        if review_message_id is None:
-            return
-        async with self.config.guild(guild).pending_reviews() as pending_reviews:
-            pending_reviews.pop(str(review_message_id), None)
 
     async def _is_joinwatch_active_role(
         self,
@@ -2004,9 +1974,6 @@ class Honeypot(Cog):
         except (discord.HTTPException, discord.NotFound, discord.Forbidden):
             return discord.Object(id=user_id)
 
-    def _review_kick_fail_warning_mode(self, config: dict) -> str:
-        value = str(config.get("review_kick_fail_warning", "false")).lower()
-        return value if value in REVIEW_KICK_FAIL_WARNING_MODES else "false"
 
     def _automated_kick_fail_warning_enabled(self, config: dict) -> bool:
         return bool(config.get("automated_kick_fail_warning", False))
@@ -2056,6 +2023,23 @@ class Honeypot(Cog):
             return channel
         return None
 
+    async def _fetch_text_channel_or_thread(
+        self, guild: discord.Guild, channel_id: int | None
+    ) -> discord.TextChannel | discord.Thread | None:
+        channel = self._get_text_channel_or_thread(guild, channel_id)
+        if channel is not None or channel_id is None:
+            return channel
+        fetch_channel = getattr(guild, "fetch_channel", None)
+        if not callable(fetch_channel):
+            return None
+        try:
+            channel = await fetch_channel(channel_id)
+        except discord.NotFound:
+            return None
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return channel
+        return None
+
     def _missing_channel_permissions(
         self,
         guild: discord.Guild,
@@ -2063,6 +2047,11 @@ class Honeypot(Cog):
         *,
         read_history: bool = False,
         manage_messages: bool = False,
+        create_public_threads: bool = False,
+        send_in_threads: bool = False,
+        embed_links: bool = False,
+        attach_files: bool = False,
+        manage_threads: bool = False,
     ) -> str | None:
         me = guild.me
         if me is None:
@@ -2076,6 +2065,26 @@ class Honeypot(Cog):
             return _("I need `Read Message History` in {channel}.").format(channel=channel.mention)
         if manage_messages and not perms.manage_messages:
             return _("I need `Manage Messages` in {channel}.").format(channel=channel.mention)
+        if create_public_threads and not perms.create_public_threads:
+            return _("I need `Create Public Threads` in {channel}.").format(
+                channel=channel.mention
+            )
+        if send_in_threads and not perms.send_messages_in_threads:
+            return _("I need `Send Messages in Threads` in {channel}.").format(
+                channel=channel.mention
+            )
+        if embed_links and not perms.embed_links:
+            return _("I need `Embed Links` in {channel}.").format(
+                channel=channel.mention
+            )
+        if attach_files and not perms.attach_files:
+            return _("I need `Attach Files` in {channel}.").format(
+                channel=channel.mention
+            )
+        if manage_threads and not perms.manage_threads:
+            return _("I need `Manage Threads` in {channel}.").format(
+                channel=channel.mention
+            )
         return None
 
     def _format_channel_setting(self, guild: discord.Guild, channel_id: int | None) -> str:
@@ -2258,25 +2267,70 @@ class Honeypot(Cog):
         await super().cog_load()
         await self._init_firstpost_seen_store()
         await self._init_imagescan_store()
-        self.review_timeout_loop.start()
+        self._detection_case_files_path.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(self._case_store.initialize)
+        await self._run_detection_reconciliation()
         self.joinwatch_auto_role_loop.start()
         self.purge_cache_cleanup_loop.start()
         self.firstpost_seen_flush_loop.start()
-        self._restore_task = asyncio.create_task(self._restore_pending_reviews())
+        self.detection_case_loop.start()
+        self.detection_reconciliation_loop.start()
+        self._case_restore_task = asyncio.create_task(self._restore_detection_case_views())
+        self._case_restore_task.add_done_callback(
+            lambda task: self._observe_background_task(task, "detection case view restoration")
+        )
+
+    @staticmethod
+    def _observe_background_task(task: asyncio.Task, label: str) -> None:
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            log.error(
+                "%s failed",
+                label,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    async def _cancel_owned_task(self, task: asyncio.Task | None) -> None:
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # The done callback observes and logs task failures.
+            pass
 
     async def cog_unload(self) -> None:
-        self.review_timeout_loop.cancel()
         self.joinwatch_auto_role_loop.cancel()
         self.purge_cache_cleanup_loop.cancel()
         self.firstpost_seen_flush_loop.cancel()
-        if self._restore_task is not None:
-            self._restore_task.cancel()
+        self.detection_case_loop.cancel()
+        self.detection_reconciliation_loop.cancel()
+        try:
+            await self._cancel_owned_task(self._case_restore_task)
+        finally:
+            self._case_restore_task = None
         pending_sweeps = tuple(self._post_ban_sweep_tasks)
         for task in pending_sweeps:
             task.cancel()
         if pending_sweeps:
             await asyncio.gather(*pending_sweeps, return_exceptions=True)
         self._post_ban_sweep_tasks.clear()
+        pending_scans = tuple(self._initial_image_scan_tasks)
+        for task in pending_scans:
+            task.cancel()
+        if pending_scans:
+            await asyncio.gather(*pending_scans, return_exceptions=True)
+        self._initial_image_scan_tasks.clear()
+        self._initial_image_scan_batches.clear()
         await self._flush_firstpost_seen_authors()
         await super().cog_unload()
 
@@ -2289,146 +2343,3116 @@ class Honeypot(Cog):
         configs = {int(guild_id): config for guild_id, config in (await self.config.all_guilds()).items()}
         self._prune_purge_cache(configs)
 
+    @tasks.loop(minutes=1)
+    async def detection_case_loop(self) -> None:
+        await self._run_detection_case_expiry()
+
+    @detection_case_loop.before_loop
+    async def before_detection_case_loop(self) -> None:
+        await self.bot.wait_until_red_ready()
+
     @tasks.loop(minutes=5)
-    async def review_timeout_loop(self) -> None:
-        now = datetime.now(timezone.utc)
-        for view in list(self._active_views.values()):
-            if view.expires_at <= now:
-                await self._expire_review(view)
+    async def detection_reconciliation_loop(self) -> None:
+        await self._run_detection_reconciliation()
 
-    @review_timeout_loop.before_loop
-    async def before_review_timeout(self) -> None:
+    @detection_reconciliation_loop.before_loop
+    async def before_detection_reconciliation_loop(self) -> None:
         await self.bot.wait_until_red_ready()
 
-    async def _restore_pending_reviews(self) -> None:
-        await self.bot.wait_until_red_ready()
-        try:
-            all_guilds = await self.config.all_guilds()
-        except Exception:
-            log.exception("Failed to load guild configs during review restoration")
-            return
+    async def _run_detection_case_expiry(self) -> None:
         now = datetime.now(timezone.utc)
-        for guild_id, guild_config in all_guilds.items():
-            try:
-                guild = self.bot.get_guild(int(guild_id))
-                if guild is None:
-                    continue
-                pending_reviews = guild_config.get("pending_reviews", {})
-                for review_message_id, data in list(pending_reviews.items()):
-                    try:
-                        expires_at = datetime.fromisoformat(data["expires_at"])
-                    except (KeyError, ValueError, TypeError):
-                        await self._delete_pending_review(guild, int(review_message_id))
-                        continue
-                    view = ReviewView(
-                        self,
-                        int(data["target_id"]),
-                        guild.id,
-                        data.get("content", ""),
-                        data.get("attachment_urls", []),
-                        pending_mute_role_id=data.get("pending_mute_role_id"),
-                        expires_at=expires_at,
-                        message_fingerprint=data.get("message_fingerprint"),
-                        channel_ids=data.get("channel_ids", []),
-                    )
-                    view.active_key = int(review_message_id)
-                    review_channel = self._get_text_channel_or_thread(guild, data.get("review_channel_id"))
-                    if review_channel is not None:
-                        try:
-                            view.review_message = await review_channel.fetch_message(int(review_message_id))
-                        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
-                            view.review_message = None
-                    if expires_at <= now and await self._expire_review(view):
-                        continue
-                    self.bot.add_view(view, message_id=int(review_message_id))
-                    async with self._views_lock:
-                        self._active_views[int(review_message_id)] = view
-            except Exception:
-                log.exception("Failed to restore pending reviews for guild %s", guild_id)
-        await self._restore_imagescan_views()
+        due_cases = await asyncio.to_thread(self._case_store.list_due_cases, now)
+        for case in due_cases:
+            await self.resolve_detection_case(case.case_id, "expired", now=now)
 
-    def _pending_imagescan_views_sync(self) -> list[tuple[int, str, int]]:
-        with sqlite3.connect(self._imagescan_db_path) as conn:
-            rows = conn.execute(
-                """
-                SELECT guild_id, event_id, review_message_id
-                FROM imagescan_events
-                WHERE decision = 'pending'
-                AND review_message_id IS NOT NULL
-                """
-            ).fetchall()
-        return [(int(row[0]), str(row[1]), int(row[2])) for row in rows]
-
-    async def _restore_imagescan_views(self) -> None:
+    async def _run_detection_reconciliation(
+        self, *, now: datetime | None = None
+    ) -> None:
         try:
-            rows = await asyncio.to_thread(self._pending_imagescan_views_sync)
+            await self._retry_detection_orphan_publications()
         except Exception:
-            log.exception("Failed to load pending image scan views")
-            return
-        for guild_id, event_id, review_message_id in rows:
-            try:
-                view = ImageScanReviewView(self, event_id, guild_id)
-                self.bot.add_view(view, message_id=review_message_id)
-            except Exception:
-                log.exception("Failed to restore image scan view %s", review_message_id)
+            log.warning("Detection orphan publication retry failed", exc_info=True)
+        try:
+            await self._retry_detection_case_deletions()
+        except Exception:
+            log.warning("Detection case deletion retry failed", exc_info=True)
+        current_time = now or datetime.now(timezone.utc)
+        stale_before = current_time - timedelta(minutes=5)
+        await asyncio.to_thread(
+            self._case_store.reconcile_moderator_actions, current_time
+        )
+        operations = await asyncio.to_thread(
+            self._case_store.claim_due_operations,
+            current_time,
+            50,
+            stale_before,
+        )
+        for operation in operations:
+            await self._execute_detection_case_operation(operation, current_time)
+        cases = await asyncio.to_thread(
+            self._case_store.list_reconcilable_cases, current_time, stale_before
+        )
+        for case in cases:
+            await self.resolve_detection_case(
+                case.case_id, "expired", now=current_time
+            )
 
-    async def _expire_review(self, view: ReviewView) -> bool:
-        if not await view._claim_resolution():
-            return True
-        guild = self.bot.get_guild(view.guild_id)
-        if guild is None:
-            async with self._views_lock:
-                self._active_views.pop(view.active_key or view.target_id, None)
-            view.stop()
-            return True
-        member = guild.get_member(view.target_id)
-        if member is not None and view.pending_mute_role_id is not None:
-            mute_role = guild.get_role(view.pending_mute_role_id)
-            if mute_role is not None and mute_role in member.roles:
-                removed = await self._remove_review_mute_role(
-                    member,
-                    mute_role,
-                    "Honeypot review expired; removing pending mute.",
+    async def resolve_detection_case(
+        self,
+        case_id: str,
+        resolution: str,
+        moderator_id: int | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        resolved_at = now or datetime.now(timezone.utc)
+        lease = await asyncio.to_thread(
+            self._case_store.claim_resolution,
+            case_id,
+            resolved_at,
+            resolved_at - timedelta(minutes=5),
+            require_terminal_captures=resolution == "ignore",
+        )
+        if lease is None:
+            return False
+        try:
+            status = CaseStatus.EXPIRED if resolution == "expired" else CaseStatus.RESOLVED
+            decision = {
+                "tp": "true_positive",
+                "fp": "false_positive",
+                "ignore": "ignored",
+            }.get(resolution.removeprefix("images:"))
+            snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+            decisions = (
+                {item.key: decision for item in case_feedback_items(snapshot)}
+                if snapshot is not None and decision is not None
+                else None
+            )
+            owned_role_ids = await asyncio.to_thread(
+                self._case_store.owned_role_ids, case_id
+            )
+            final_operations = [
+                ("review_update", f"review-update:{case_id}"),
+                ("evidence_cleanup", f"evidence-cleanup:{case_id}"),
+            ]
+            for role_id in owned_role_ids:
+                final_operations.append(
+                    ("role_release", f"role-release:{case_id}:{int(role_id)}")
                 )
-                if not removed:
-                    log.debug("Failed to remove mute role on expired review for user %s in guild %s", view.target_id, guild.id)
-                    view.expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
-                    async with self.config.guild(guild).pending_reviews() as pending_reviews:
-                        pending_review = pending_reviews.get(str(view.active_key))
-                        if pending_review is not None:
-                            pending_review["expires_at"] = view.expires_at.isoformat()
-                    await view._release_resolution()
-                    return False
-        view._disable_all()
-        embed = view.review_message.embeds[0] if view.review_message and view.review_message.embeds else None
-        if embed:
-            embed.color = discord.Color.green()
-            ReviewView._remove_review_expiry_field(embed)
-            embed.add_field(
-                name=_("Reviewed by:"),
-                value=_("Timed out"),
-                inline=False,
+            finished = await asyncio.to_thread(
+                self._case_store.finish_resolution,
+                lease,
+                status,
+                resolution,
+                moderator_id,
+                resolved_at,
+                decisions,
+                tuple(final_operations),
             )
-            embed.add_field(
-                name=_("Action taken:"),
-                value=_("Ignored after no staff response"),
-                inline=False,
+        except BaseException:
+            await asyncio.to_thread(self._case_store.release_resolution, lease)
+            raise
+        if not finished:
+            return False
+        snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+        guild = self.bot.get_guild(snapshot.case.guild_id)
+        if guild is not None and resolution == "expired":
+            await self._increment_stat(guild, "review_expired")
+        elif guild is not None and resolution == "ignore":
+            await self._increment_stat(guild, "ignored")
+        final_operation_priority = {
+            "review_update": 0,
+            "role_release": 1,
+            "evidence_cleanup": 2,
+        }
+        for operation in sorted(
+            snapshot.operations,
+            key=lambda item: (
+                final_operation_priority.get(item.operation_type, 99),
+                item.operation_id,
+            ),
+        ):
+            if operation.operation_type not in {
+                "review_update", "role_release", "evidence_cleanup"
+            }:
+                continue
+            claimed = await asyncio.to_thread(
+                self._case_store.claim_operation, operation.operation_id, resolved_at
             )
-        if view.review_message is not None:
-            try:
-                await view.review_message.edit(content=_("✅ **Review expired**"), embed=embed, view=view)
-            except discord.HTTPException:
-                log.debug("Failed to edit expired review message %s", view.active_key)
-        await self._increment_stat(guild, "review_expired")
-        await self._increment_stat(guild, "ignored")
-        async with self._views_lock:
-            self._active_views.pop(view.active_key or view.target_id, None)
-        await self._delete_pending_review(guild, view.active_key)
-        view.stop()
+            if claimed is not None:
+                await self._execute_detection_case_operation(claimed, resolved_at)
         return True
+
+    async def _execute_detection_message_child(
+        self,
+        snapshot,
+        operation_type: str,
+        sequence: int,
+        now: datetime,
+        *,
+        publication_channel=None,
+    ) -> None:
+        operation = next(
+            (
+                item
+                for item in snapshot.operations
+                if item.operation_type == operation_type
+                and item.message_sequence == sequence
+            ),
+            None,
+        )
+        if operation is None:
+            return
+        claim_time = now
+        if operation.status.value == "failed" and operation.retry_at is not None:
+            claim_time = max(claim_time, operation.retry_at)
+        claimed = await asyncio.to_thread(
+            self._case_store.claim_operation, operation.operation_id, claim_time
+        )
+        if claimed is not None:
+            await self._execute_detection_case_operation(
+                claimed,
+                claim_time,
+                publication_channel=publication_channel,
+            )
+
+    @staticmethod
+    def _persisted_capture_results(snapshot, sequence: int):
+        terminal_statuses = {
+            status.value for status in detection_runtime.CaptureStatus
+        }
+        return tuple(
+            detection_runtime.CaptureResult(
+                attachment.position,
+                detection_runtime.CaptureStatus(attachment.capture_status),
+                Path(attachment.evidence_path)
+                if attachment.evidence_path is not None
+                else None,
+                attachment.error,
+            )
+            for attachment in snapshot.attachments
+            if attachment.message_sequence == sequence
+            and attachment.capture_status in terminal_statuses
+        )
+
+    async def _execute_detection_message_process(
+        self,
+        operation,
+        snapshot,
+        now: datetime,
+        *,
+        live_message=None,
+        publication_channel=None,
+        timings: dict[str, float] | None = None,
+    ) -> str:
+        timings = timings if timings is not None else {}
+        source = next(
+            (
+                message
+                for message in snapshot.messages
+                if message.sequence == operation.message_sequence
+            ),
+            None,
+        )
+        if source is None:
+            raise RuntimeError("detection case source message is unavailable")
+        signals = tuple(
+            item.signal
+            for item in snapshot.signals
+            if item.message_sequence == source.sequence
+        )
+        containment_required = any(
+            signal.action != ActionIntent.NONE
+            or (
+                signal.detector == "honeypot"
+                and not signal.metadata.get("whitelist_bypass")
+            )
+            or signal.metadata.get("containment_required")
+            for signal in signals
+        )
+        has_forward_purge_signal = any(
+            signal.detector == "forward_purge" for signal in signals
+        )
+        action = effective_action(signals)
+        config = await self.config.guild_from_id(snapshot.case.guild_id).all()
+        guild = (
+            live_message.guild
+            if live_message is not None
+            else self.bot.get_guild(snapshot.case.guild_id)
+        )
+        if guild is None:
+            raise RuntimeError("detection case guild is unavailable")
+        direct_message = live_message is not None
+        channel = None
+        if live_message is None:
+            channel = self._get_text_channel_or_thread(guild, source.channel_id)
+        if channel is not None:
+            fetch_message = getattr(channel, "fetch_message", None)
+            if callable(fetch_message):
+                try:
+                    live_message = await fetch_message(source.message_id)
+                except discord.NotFound:
+                    live_message = None
+
+        persisted = self._persisted_capture_results(snapshot, source.sequence)
+        message_attachments = tuple(
+            attachment
+            for attachment in snapshot.attachments
+            if attachment.message_sequence == source.sequence
+        )
+        evidence_started = perf_counter()
+        capture_started = asyncio.Event()
+        if live_message is not None and len(persisted) < len(message_attachments):
+            capture_task = asyncio.create_task(
+                self._capture_case_attachments(
+                    live_message,
+                    operation.case_id,
+                    source.sequence,
+                    started_event=capture_started,
+                )
+            )
+        else:
+            capture_started.set()
+            capture_task = asyncio.create_task(asyncio.sleep(0, result=persisted))
+
+        try:
+            containment_started = perf_counter()
+            if message_attachments and not persisted:
+                try:
+                    await asyncio.wait_for(
+                        capture_started.wait(),
+                        timeout=DETECTION_CAPTURE_START_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    await asyncio.to_thread(
+                        self._case_store.fail_pending_attachment_captures,
+                        operation.case_id,
+                        source.sequence,
+                        "attachment capture could not start before containment",
+                    )
+                    capture_task.cancel()
+                    await asyncio.gather(capture_task, return_exceptions=True)
+                    refreshed = await asyncio.to_thread(
+                        self._case_store.get_case, operation.case_id
+                    )
+                    persisted = self._persisted_capture_results(
+                        refreshed, source.sequence
+                    )
+                    capture_task = asyncio.create_task(
+                        asyncio.sleep(0, result=persisted)
+                    )
+            delete_result = detection_runtime.DeleteResult(
+                source.delete_status, 0, source.error
+            )
+            if source.delete_status is DeleteStatus.PENDING and containment_required:
+                if config.get("dry_run"):
+                    delete_result = detection_runtime.DeleteResult(
+                        DeleteStatus.PLANNED, 0, None
+                    )
+                elif live_message is None:
+                    delete_result = detection_runtime.DeleteResult(
+                        DeleteStatus.ALREADY_GONE, 1, None
+                    )
+                else:
+                    delete_result = await detection_runtime.delete_message(live_message)
+                needs_attention = delete_result.status in {
+                    DeleteStatus.FORBIDDEN,
+                    DeleteStatus.TRANSIENT_FAILURE,
+                }
+                await asyncio.to_thread(
+                    self._case_store.update_message_delete,
+                    operation.case_id,
+                    source.sequence,
+                    delete_result.status,
+                    delete_result.error,
+                    needs_attention,
+                )
+                if direct_message:
+                    if delete_result.status is DeleteStatus.DELETED:
+                        await self._increment_stat(guild, "purged_messages")
+                        if has_forward_purge_signal:
+                            await self._increment_stat(guild, "forward_purge_deletes")
+                    elif delete_result.status is DeleteStatus.FORBIDDEN:
+                        await self._increment_stat(guild, "delete_forbidden")
+                        if has_forward_purge_signal:
+                            await self._increment_stat(
+                                guild, "forward_purge_delete_failures"
+                            )
+                    elif delete_result.status is DeleteStatus.TRANSIENT_FAILURE:
+                        await self._increment_stat(guild, "delete_transient_failures")
+                        if has_forward_purge_signal:
+                            await self._increment_stat(
+                                guild, "forward_purge_delete_failures"
+                            )
+            if containment_required and direct_message:
+                deleted = await self._purge_detection_case_cached_messages(
+                    guild,
+                    snapshot.case.user_id,
+                    config,
+                    operation.case_id,
+                    source.sequence,
+                    exclude_message_id=source.message_id,
+                )
+                if deleted:
+                    await self._increment_stat(guild, "purged_messages", deleted)
+                    await self._increment_stat(guild, "cached_purge_deletes", deleted)
+
+            refreshed = await asyncio.to_thread(
+                self._case_store.get_case, operation.case_id
+            )
+            if refreshed is None:
+                return "case_deleted"
+            if action in {ActionIntent.KICK, ActionIntent.BAN}:
+                await self._execute_detection_message_child(
+                    refreshed, "moderation_action", source.sequence, now
+                )
+            elif action is ActionIntent.REVIEW:
+                await self._execute_detection_message_child(
+                    refreshed, "role_apply", source.sequence, now
+                )
+            timings["containment_ms"] = (
+                perf_counter() - containment_started
+            ) * 1000
+
+            first_publish_started = perf_counter()
+            logs_channel = publication_channel or self._get_text_channel_or_thread(
+                guild, config.get("logs_channel")
+            )
+            has_review_publication = any(
+                item.operation_type == "review_publish"
+                and item.message_sequence == source.sequence
+                for item in refreshed.operations
+            )
+            preview_published = False
+            if has_review_publication:
+                try:
+                    preview_published = await self._publish_detection_case(
+                        operation.case_id,
+                        config,
+                        logs_channel,
+                        message_sequence=source.sequence,
+                        skip_if_done=capture_task,
+                    )
+                except Exception as error:
+                    log.warning(
+                        "Detection case preview publication failed case=%s "
+                        "message=%s error=%s",
+                        operation.case_id,
+                        source.sequence,
+                        error,
+                    )
+            timings["first_publish_ms"] = (
+                perf_counter() - first_publish_started
+            ) * 1000
+
+            evidence_wait_started = perf_counter()
+            await capture_task
+            timings["evidence_wait_ms"] = (
+                perf_counter() - evidence_wait_started
+            ) * 1000
+            timings["evidence_ms"] = (perf_counter() - evidence_started) * 1000
+            refreshed = await asyncio.to_thread(
+                self._case_store.get_case, operation.case_id
+            )
+            if refreshed is None:
+                return "case_deleted"
+            captures = self._persisted_capture_results(refreshed, source.sequence)
+            if len(captures) < len(message_attachments):
+                raise RuntimeError(
+                    "attachment evidence is not terminal; retry after reservation expiry"
+                )
+            capture_failures = sum(
+                capture.status
+                in {
+                    detection_runtime.CaptureStatus.FAILED,
+                    detection_runtime.CaptureStatus.TIMEOUT,
+                    detection_runtime.CaptureStatus.TOO_LARGE,
+                }
+                for capture in captures
+            )
+            if capture_failures:
+                await self._increment_stat(
+                    guild, "evidence_capture_failures", capture_failures
+                )
+
+            scan_started = perf_counter()
+            if live_message is not None:
+                await self._scan_all_case_message_images(
+                    live_message,
+                    config,
+                    operation.case_id,
+                    source.sequence,
+                    captures,
+                )
+            else:
+                attachments = tuple(
+                    attachment
+                    for attachment in refreshed.attachments
+                    if attachment.message_sequence == source.sequence
+                )
+                await self._scan_case_message_images(
+                    snapshot.case.guild_id,
+                    attachments,
+                    config,
+                    operation.case_id,
+                    source.sequence,
+                    captures,
+                )
+            timings["scan_ms"] = (perf_counter() - scan_started) * 1000
+            refreshed = await asyncio.to_thread(
+                self._case_store.get_case, operation.case_id
+            )
+            refresh_started = perf_counter()
+            await self._execute_detection_message_child(
+                refreshed,
+                "review_publish",
+                source.sequence,
+                now,
+                publication_channel=publication_channel,
+            )
+            timings["refresh_ms"] = (perf_counter() - refresh_started) * 1000
+            await asyncio.to_thread(
+                self._case_store.reconcile_moderator_actions,
+                datetime.now(timezone.utc),
+            )
+            return "processed"
+        finally:
+            if not capture_task.done():
+                capture_task.cancel()
+            await asyncio.gather(capture_task, return_exceptions=True)
+
+    async def _execute_detection_case_operation(
+        self,
+        operation,
+        now: datetime,
+        *,
+        publication_channel=None,
+        live_message=None,
+        timings: dict[str, float] | None = None,
+    ) -> None:
+        heartbeat = asyncio.create_task(self._renew_detection_operation(operation))
+        operation_result = None
+        role_was_added = False
+        snapshot = None
+        try:
+            snapshot = await asyncio.to_thread(self._case_store.get_case, operation.case_id)
+            if snapshot is None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+                return
+            if operation.operation_type == "message_process":
+                if snapshot.case.status not in {
+                    CaseStatus.PENDING,
+                    CaseStatus.RESOLVING,
+                }:
+                    if operation.message_sequence is not None:
+                        await asyncio.to_thread(
+                            self._case_store.fail_pending_attachment_captures,
+                            operation.case_id,
+                            operation.message_sequence,
+                            "case closed before attachment capture completed",
+                        )
+                    operation_result = "case_terminal"
+                else:
+                    operation_result = await self._execute_detection_message_process(
+                        operation,
+                        snapshot,
+                        now,
+                        live_message=live_message,
+                        publication_channel=publication_channel,
+                        timings=timings,
+                    )
+            elif (
+                operation.operation_type == "role_apply"
+                and snapshot.case.status is not CaseStatus.PENDING
+            ):
+                operation_result = "case_terminal"
+            elif operation.operation_type == "review_update":
+                await self._case_review_rerender(operation.case_id)
+            elif operation.operation_type == "role_apply":
+                guild = self.bot.get_guild(snapshot.case.guild_id)
+                if guild is None:
+                    raise RuntimeError("detection case guild is unavailable")
+                role_id = int(operation.idempotency_key.rsplit(":", 1)[1])
+                member = guild.get_member(snapshot.case.user_id)
+                role = guild.get_role(role_id)
+                if member is None:
+                    raise RuntimeError("detection case member is unavailable")
+                if role is None:
+                    raise RuntimeError("detection case role is unavailable")
+                effect_started = await asyncio.to_thread(
+                    self._case_store.operation_effect_started, operation.operation_id
+                )
+                if role not in member.roles:
+                    started = await asyncio.to_thread(
+                        self._case_store.start_role_apply_effect,
+                        operation.operation_id,
+                        operation.claim_token,
+                        datetime.now(timezone.utc),
+                    )
+                    if not started:
+                        raise RuntimeError("detection operation lease was lost")
+                    await member.add_roles(
+                        role, reason="Detection case pending moderator review."
+                    )
+                    role_was_added = True
+                    ownership_result = await asyncio.to_thread(
+                        self._case_store.record_operation_role_ownership,
+                        operation.operation_id,
+                        operation.claim_token,
+                        operation.case_id,
+                        snapshot.case.guild_id,
+                        snapshot.case.user_id,
+                        role_id,
+                        datetime.now(timezone.utc),
+                    )
+                    if ownership_result is None:
+                        operation_result = "ambiguous_role_ownership"
+                        await asyncio.to_thread(
+                            self._case_store.mark_case_needs_attention,
+                            operation.case_id,
+                        )
+                    elif ownership_result == "release_required":
+                        terminal_snapshot = await asyncio.to_thread(
+                            self._case_store.get_case, operation.case_id
+                        )
+                        release = next(
+                            (
+                                item
+                                for item in terminal_snapshot.operations
+                                if item.operation_type == "role_release"
+                                and item.idempotency_key
+                                == f"role-release:{operation.case_id}:{role_id}"
+                            ),
+                            None,
+                        )
+                        if release is not None:
+                            claimed_release = await asyncio.to_thread(
+                                self._case_store.claim_operation,
+                                release.operation_id,
+                                datetime.now(timezone.utc),
+                            )
+                            if claimed_release is not None:
+                                await self._execute_detection_case_operation(
+                                    claimed_release, datetime.now(timezone.utc)
+                                )
+                elif effect_started:
+                    operation_result = "ambiguous_role_ownership"
+                    await asyncio.to_thread(
+                        self._case_store.mark_case_needs_attention,
+                        operation.case_id,
+                    )
+                else:
+                    owner_case_id = await asyncio.to_thread(
+                        self._case_store.role_owner_case,
+                        snapshot.case.guild_id,
+                        snapshot.case.user_id,
+                        role_id,
+                    )
+                    transferred = await asyncio.to_thread(
+                        self._case_store.transfer_terminal_role_ownership,
+                        operation.operation_id,
+                        operation.claim_token,
+                        operation.case_id,
+                        snapshot.case.guild_id,
+                        snapshot.case.user_id,
+                        role_id,
+                        datetime.now(timezone.utc),
+                    )
+                    if transferred:
+                        operation_result = "transferred_role_ownership"
+                    elif owner_case_id is not None and owner_case_id != operation.case_id:
+                        raise RuntimeError(
+                            "previous detection case role release is still in progress"
+                        )
+                    elif owner_case_id == operation.case_id:
+                        operation_result = "role_already_owned"
+                    else:
+                        operation_result = "preexisting_role"
+            elif operation.operation_type == "review_publish":
+                config = await self.config.guild_from_id(snapshot.case.guild_id).all()
+                guild = self.bot.get_guild(snapshot.case.guild_id)
+                logs_channel = publication_channel or (
+                    self._get_text_channel_or_thread(
+                        guild, config.get("logs_channel")
+                    )
+                    if guild is not None
+                    else None
+                )
+                await self._publish_detection_case(
+                    operation.case_id,
+                    config,
+                    logs_channel,
+                    message_sequence=operation.message_sequence,
+                )
+            elif operation.operation_type == "moderation_action":
+                source = next(
+                    (
+                        message
+                        for message in snapshot.messages
+                        if message.sequence == operation.message_sequence
+                    ),
+                    None,
+                )
+                if source is None:
+                    raise RuntimeError("detection case source message is unavailable")
+                signals = tuple(
+                    item.signal
+                    for item in snapshot.signals
+                    if item.message_sequence == source.sequence
+                )
+                action = effective_action(signals)
+                if action not in (ActionIntent.KICK, ActionIntent.BAN):
+                    raise RuntimeError(
+                        "detection case moderation action is no longer applicable"
+                    )
+                config = await self.config.guild_from_id(snapshot.case.guild_id).all()
+                if config.get("dry_run"):
+                    operation_result = f"planned_{action.value}"
+                else:
+                    guild = self.bot.get_guild(snapshot.case.guild_id)
+                    if guild is None:
+                        raise RuntimeError("detection case guild is unavailable")
+                    effect_started = await asyncio.to_thread(
+                        self._case_store.operation_effect_started, operation.operation_id
+                    )
+                    effect_confirmed = False
+                    if effect_started and action is ActionIntent.BAN:
+                        target = guild.get_member(snapshot.case.user_id)
+                        if target is None:
+                            target = await self._get_user_or_object(snapshot.case.user_id)
+                        try:
+                            await guild.fetch_ban(target)
+                        except discord.NotFound:
+                            pass
+                        else:
+                            effect_confirmed = True
+                    member = guild.get_member(snapshot.case.user_id)
+                    if member is None and action is ActionIntent.BAN:
+                        member = await self._get_user_or_object(snapshot.case.user_id)
+                    if member is None and action is ActionIntent.KICK:
+                        try:
+                            member = await guild.fetch_member(snapshot.case.user_id)
+                        except discord.NotFound:
+                            operation_result = "kick_missing"
+                            effect_confirmed = True
+                    if not effect_confirmed:
+                        if member is None:
+                            raise RuntimeError("detection case member is unavailable")
+                        reasons = "\n".join(signal.reason for signal in signals)
+                        started = await asyncio.to_thread(
+                            self._case_store.start_operation_effect,
+                            operation.operation_id,
+                            operation.claim_token,
+                            datetime.now(timezone.utc),
+                        )
+                        if not started:
+                            raise RuntimeError("moderation action operation lease was lost")
+                        _, failed = await self._execute_action(
+                            guild,
+                            member,
+                            source.created_at,
+                            config,
+                            reason=reasons,
+                            action=action.value,
+                        )
+                        if failed is not None:
+                            raise RuntimeError(failed)
+                        operation_result = action.value
+                    elif operation_result is None:
+                        operation_result = action.value
+            elif operation.operation_type == "cached_purge":
+                guild = self.bot.get_guild(snapshot.case.guild_id)
+                if guild is None:
+                    raise RuntimeError("detection case guild is unavailable")
+                _, case_id, channel_id, message_id = operation.idempotency_key.split(":")
+                if case_id != operation.case_id:
+                    raise RuntimeError("cached purge operation case identity does not match")
+                channel = self._get_cached_message_channel(guild, int(channel_id))
+                if channel is None:
+                    operation_result = "channel_unavailable"
+                    raise RuntimeError("cached purge channel is unavailable")
+                get_partial_message = getattr(channel, "get_partial_message", None)
+                if not callable(get_partial_message):
+                    operation_result = "unsupported_channel"
+                    raise RuntimeError("cached purge channel cannot resolve messages")
+                result = await detection_runtime.delete_message(
+                    get_partial_message(int(message_id))
+                )
+                operation_result = result.status.value
+                if result.status not in (
+                    DeleteStatus.DELETED,
+                    DeleteStatus.ALREADY_GONE,
+                ):
+                    raise RuntimeError(result.error or result.status.value)
+            elif operation.operation_type in {"moderator_ban", "moderator_kick"}:
+                action = operation.operation_type.removeprefix("moderator_")
+                config = await self.config.guild_from_id(snapshot.case.guild_id).all()
+                if config.get("dry_run"):
+                    operation_result = f"planned_{action}"
+                else:
+                    guild = self.bot.get_guild(snapshot.case.guild_id)
+                    if guild is None:
+                        raise RuntimeError("detection case guild is unavailable")
+                    effect_started = await asyncio.to_thread(
+                        self._case_store.operation_effect_started, operation.operation_id
+                    )
+                    effect_confirmed = False
+                    if effect_started and action == "ban":
+                        target = guild.get_member(snapshot.case.user_id)
+                        if target is None:
+                            target = await self._get_user_or_object(snapshot.case.user_id)
+                        try:
+                            await guild.fetch_ban(target)
+                        except discord.NotFound:
+                            pass
+                        else:
+                            effect_confirmed = True
+                    if not effect_confirmed:
+                        member = guild.get_member(snapshot.case.user_id)
+                        if member is None and action == "ban":
+                            member = await self._get_user_or_object(snapshot.case.user_id)
+                        if member is None and action == "kick":
+                            try:
+                                member = await guild.fetch_member(snapshot.case.user_id)
+                            except discord.NotFound:
+                                operation_result = "kick_missing"
+                                effect_confirmed = True
+                    if not effect_confirmed:
+                        if member is None:
+                            raise RuntimeError("detection case member is unavailable")
+                        moderator = guild.get_member(operation.actor_id)
+                        if moderator is None:
+                            moderator = await self._get_user_or_object(operation.actor_id)
+                        started = await asyncio.to_thread(
+                            self._case_store.start_operation_effect,
+                            operation.operation_id,
+                            operation.claim_token,
+                            datetime.now(timezone.utc),
+                        )
+                        if not started:
+                            raise RuntimeError("moderator action operation lease was lost")
+                        _, failed = await self._execute_action(
+                            guild,
+                            member,
+                            snapshot.case.created_at,
+                            config,
+                            reason=f"Moderator selected {action} for detection case {operation.case_id}.",
+                            action=action,
+                            moderator=moderator,
+                        )
+                        if failed is not None:
+                            raise RuntimeError(failed)
+                    if operation_result is None:
+                        operation_result = action
+            elif operation.operation_type == "role_release":
+                guild = self.bot.get_guild(snapshot.case.guild_id)
+                if guild is None:
+                    raise RuntimeError("detection case guild is unavailable")
+                role_id = int(operation.idempotency_key.rsplit(":", 1)[1])
+                member = guild.get_member(snapshot.case.user_id)
+                role = guild.get_role(role_id)
+                if member is None:
+                    raise RuntimeError("detection case member is unavailable")
+                if role is None:
+                    raise RuntimeError("detection case role is unavailable")
+                owned_role_ids = await asyncio.to_thread(
+                    self._case_store.owned_role_ids, operation.case_id
+                )
+                if role_id not in owned_role_ids:
+                    operation_result = "ownership_transferred"
+                else:
+                    started = await asyncio.to_thread(
+                        self._case_store.start_role_release_effect,
+                        operation.operation_id,
+                        operation.claim_token,
+                        operation.case_id,
+                        role_id,
+                        datetime.now(timezone.utc),
+                    )
+                    if not started:
+                        owner_case_id = await asyncio.to_thread(
+                            self._case_store.role_owner_case,
+                            snapshot.case.guild_id,
+                            snapshot.case.user_id,
+                            role_id,
+                        )
+                        if owner_case_id != operation.case_id:
+                            operation_result = "ownership_transferred"
+                        else:
+                            raise RuntimeError("detection operation lease was lost")
+                    if operation_result != "ownership_transferred":
+                        if role in member.roles:
+                            removed = await self._remove_review_mute_role(
+                                member,
+                                role,
+                                "Detection case resolved; removing pending mute.",
+                            )
+                            if not removed:
+                                raise RuntimeError("failed to release detection case role")
+                        await asyncio.to_thread(
+                            self._case_store.release_role_ownership,
+                            operation.case_id,
+                            role_id,
+                        )
+            elif operation.operation_type == "evidence_cleanup":
+                review_update = next(
+                    (
+                        item
+                        for item in snapshot.operations
+                        if item.operation_type == "review_update"
+                    ),
+                    None,
+                )
+                if (
+                    snapshot.case.review_message_id is not None
+                    and review_update is not None
+                    and review_update.status.value != "succeeded"
+                ):
+                    raise RuntimeError(
+                        "terminal review projection is not complete"
+                    )
+                case_root = case_evidence_root(
+                    self._detection_case_files_path,
+                    snapshot.case.guild_id,
+                    operation.case_id,
+                ).resolve()
+                evidence_root = self._detection_case_files_path.resolve()
+                if not case_root.is_relative_to(evidence_root):
+                    raise RuntimeError("detection case evidence path escapes storage root")
+                for attachment in snapshot.attachments:
+                    if attachment.evidence_path is None:
+                        continue
+                    path = Path(attachment.evidence_path).resolve()
+                    if not path.is_relative_to(case_root):
+                        raise RuntimeError("detection case evidence path escapes case root")
+                for attachment in snapshot.attachments:
+                    if (
+                        attachment.evidence_path is None
+                        or not is_persisted_image_attachment(attachment)
+                        or attachment.learning_decision
+                        not in {"true_positive", "false_positive"}
+                    ):
+                        continue
+                    evidence_path = Path(attachment.evidence_path)
+                    if not evidence_path.exists():
+                        continue
+                    result, _sample = await self._imagescan_add_file_sample(
+                        snapshot.case.guild_id,
+                        evidence_path,
+                        attachment.learning_decision,
+                        snapshot.case.moderator_id,
+                    )
+                    if result not in {"inserted", "duplicate"}:
+                        raise RuntimeError(
+                            f"failed to copy detection evidence into learning samples: {result}"
+                        )
+                if case_root.exists():
+                    for path in sorted(case_root.rglob("*"), reverse=True):
+                        resolved = path.resolve()
+                        if not resolved.is_relative_to(case_root):
+                            raise RuntimeError(
+                                "detection case evidence path escapes case root"
+                            )
+                        if path.is_dir():
+                            path.rmdir()
+                        else:
+                            path.unlink(missing_ok=True)
+                if case_root.exists():
+                    case_root.rmdir()
+            else:
+                raise RuntimeError(
+                    f"unsupported detection case operation: {operation.operation_type}"
+                )
+        except asyncio.CancelledError:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+            raise
+        except Exception as error:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+            retry_at = now + timedelta(minutes=5)
+            cached_purge_exhausted = (
+                operation.operation_type == "cached_purge"
+                and operation_result == DeleteStatus.TRANSIENT_FAILURE.value
+                and operation.attempts >= 3
+            )
+            if operation.operation_type == "cached_purge" and (
+                operation_result == DeleteStatus.FORBIDDEN.value
+                or operation_result == "channel_unavailable"
+                or operation_result == "unsupported_channel"
+                or cached_purge_exhausted
+            ):
+                retry_at = None
+                await asyncio.to_thread(
+                    self._case_store.mark_case_needs_attention, operation.case_id
+                )
+            await asyncio.to_thread(
+                self._case_store.fail_operation,
+                operation.operation_id,
+                operation.claim_token,
+                f"{type(error).__name__}: {error}",
+                now,
+                retry_at,
+                operation_result,
+            )
+            if operation.operation_type == "role_apply" and snapshot is not None:
+                failed_guild = self.bot.get_guild(snapshot.case.guild_id)
+                if failed_guild is not None:
+                    await self._increment_stat(
+                        failed_guild, "pending_mute_failures"
+                    )
+            log.warning(
+                "Detection case operation failed case=%s operation=%s kind=%s error=%s",
+                operation.case_id,
+                operation.operation_id,
+                operation.operation_type,
+                error,
+            )
+            return
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+        if operation.operation_type in {"moderator_ban", "moderator_kick"}:
+            completed = await asyncio.to_thread(
+                self._case_store.complete_moderator_action,
+                operation.operation_id,
+                operation.claim_token,
+                now,
+                operation_result,
+            )
+        else:
+            completed = await asyncio.to_thread(
+                self._case_store.complete_operation,
+                operation.operation_id,
+                operation.claim_token,
+                now,
+                operation_result,
+            )
+        if not completed:
+            current_case = await asyncio.to_thread(
+                self._case_store.get_case, operation.case_id
+            )
+            if current_case is not None:
+                raise RuntimeError(
+                    "detection case operation lease was lost before completion"
+                )
+        elif role_was_added and snapshot is not None:
+            guild = self.bot.get_guild(snapshot.case.guild_id)
+            if guild is not None:
+                await self._increment_stat(guild, "pending_mutes")
+        if operation.operation_type in {
+            "review_update",
+            "role_release",
+            "evidence_cleanup",
+        }:
+            await asyncio.to_thread(
+                self._case_store.compact_terminal_case, operation.case_id
+            )
+
+    async def _renew_detection_operation(self, operation) -> None:
+        while True:
+            await asyncio.sleep(self._detection_heartbeat_interval_seconds)
+            renewed = await asyncio.to_thread(
+                self._case_store.renew_operation_claim,
+                operation.operation_id,
+                operation.claim_token,
+                datetime.now(timezone.utc),
+            )
+            if not renewed:
+                return
+
+    async def _restore_detection_case_views(self) -> None:
+        await self.bot.wait_until_red_ready()
+        snapshots = await asyncio.to_thread(self._case_store.list_open_cases)
+        for snapshot in snapshots:
+            message_id = snapshot.case.review_message_id
+            if message_id is None:
+                continue
+            view = DetectionCaseView(
+                self,
+                snapshot.case.case_id,
+                has_image_feedback=bool(case_feedback_items(snapshot)),
+            )
+            self._case_views[snapshot.case.case_id] = view
+            self.bot.add_view(view, message_id=message_id)
+            await self._case_review_rerender(snapshot.case.case_id)
+
+
+
+
 
     # ─── Detection ────────────────────────────────────────────────────────
 
+    def _forward_purge_signal(self, message: discord.Message) -> DetectionSignal | None:
+        if not self._is_forward_purge_active(message.guild.id, message.author.id):
+            return None
+        return DetectionSignal(
+            detector="forward_purge",
+            reason="Active forward-purge containment window",
+            action=ActionIntent.REVIEW,
+            decisive=True,
+            metadata={"containment_required": True},
+        )
+
+    @staticmethod
+    def _signal_action(value: object, valid_actions: tuple[str, ...]) -> ActionIntent:
+        action = value if value in valid_actions else "review"
+        return ActionIntent(typing.cast(str, action))
+
+    def _spam_signal(self, message: discord.Message, config: dict) -> DetectionSignal | None:
+        if not config.get("spam_enabled", False):
+            return None
+        reasons = self._spam_suspicion_reasons(message, config)
+        if not reasons:
+            return None
+        return DetectionSignal(
+            detector="spam",
+            reason="\n".join(reasons),
+            action=self._signal_action(config.get("spam_action", "review"), CORE_ACTION_OPTIONS),
+            decisive=True,
+            metadata={"reasons": tuple(reasons)},
+        )
+
+    async def _firstpost_signal(
+        self, message: discord.Message, config: dict
+    ) -> DetectionSignal | None:
+        firstpost_enabled = config.get("firstpost_enabled", False)
+        collect_enabled = config.get("firstpost_collect_enabled", False)
+        if not firstpost_enabled and not collect_enabled:
+            return None
+        await self._ensure_firstpost_seen_loaded(message.guild.id)
+        if message.author.id in self._firstpost_seen_authors[message.guild.id]:
+            return None
+        if not firstpost_enabled:
+            return None
+        reasons = self._firstpost_suspicion_reasons(message, config)
+        if not reasons:
+            return None
+        return DetectionSignal(
+            detector="firstpost",
+            reason="\n".join(reasons),
+            action=self._signal_action(config.get("firstpost_action", "review"), CORE_ACTION_OPTIONS),
+            decisive=True,
+            metadata={"reasons": tuple(reasons)},
+        )
+
+    def _firstpost_candidate(
+        self, message: discord.Message, config: dict
+    ) -> DetectionSignal | None:
+        if not config.get("firstpost_enabled", False):
+            return None
+        reasons = self._firstpost_suspicion_reasons(message, config)
+        if not reasons:
+            return None
+        return DetectionSignal(
+            detector="firstpost",
+            reason="\n".join(reasons),
+            action=self._signal_action(
+                config.get("firstpost_action", "review"), CORE_ACTION_OPTIONS
+            ),
+            decisive=True,
+            metadata={"reasons": tuple(reasons)},
+        )
+
+    async def _reserve_forward_firstpost_signal(
+        self,
+        message: discord.Message,
+        config: dict,
+        case_id: str,
+        sequence: int,
+    ) -> bool:
+        tracking_enabled = config.get("firstpost_enabled", False) or config.get(
+            "firstpost_collect_enabled", False
+        )
+        if not tracking_enabled:
+            return False
+        candidate = self._firstpost_candidate(message, config)
+        await self._ensure_firstpost_seen_loaded(message.guild.id)
+        async with self._firstpost_db_lock:
+            if message.author.id in self._firstpost_seen_authors[message.guild.id]:
+                return False
+            claimed = await asyncio.to_thread(
+                self._case_store.claim_firstpost,
+                message.guild.id,
+                message.author.id,
+                case_id,
+                sequence,
+                candidate,
+            )
+            if not claimed:
+                self._firstpost_seen_authors[message.guild.id].add(message.author.id)
+                return False
+            self._firstpost_seen_authors[message.guild.id].add(message.author.id)
+            self._firstpost_dirty_seen_authors[message.guild.id].add(message.author.id)
+        await self._increment_stat(message.guild, "firstpost_seen")
+        return candidate is not None
+
+    async def _honeypot_signals(
+        self, message: discord.Message, config: dict
+    ) -> tuple[DetectionSignal, ...]:
+        if message.channel.id not in self._honeypot_channel_ids_from_config(config):
+            return ()
+        whitelisted_role_ids = set(config.get("whitelisted_roles", ()))
+        has_whitelist_role = any(
+            role.id in whitelisted_role_ids for role in message.author.roles
+        )
+        whitelist_mode = config.get("whitelist_mode", "bypass") if has_whitelist_role else None
+        if whitelist_mode == "bypass":
+            return (
+                DetectionSignal(
+                    detector="honeypot",
+                    reason="Message posted in a configured honeypot channel",
+                    action=ActionIntent.NONE,
+                    decisive=True,
+                    metadata={"whitelist_bypass": True},
+                ),
+            )
+        reasons = await self._suspicion_reasons(message, config)
+        second_strike_role_ids = {
+            role_id
+            for role_id in (config.get("mute_role"), config.get("joinwatch_auto_role_id"))
+            if role_id
+        }
+        second_strike = bool(second_strike_role_ids) and any(
+            role.id in second_strike_role_ids for role in message.author.roles
+        )
+        if second_strike:
+            reasons.append(_("Repeat honeypot activity"))
+        force_review = whitelist_mode == "review"
+        force_fallback = whitelist_mode == "fallback"
+        if second_strike and not force_review and not force_fallback:
+            action = ActionIntent.BAN
+        elif force_review:
+            action = ActionIntent.REVIEW
+        elif force_fallback or not reasons:
+            action = self._signal_action(
+                config.get("fallback_action", "review"), FALLBACK_ACTION_OPTIONS
+            )
+        else:
+            action = self._signal_action(config.get("action", "review"), CORE_ACTION_OPTIONS)
+        return (
+            DetectionSignal(
+                detector="honeypot",
+                reason="\n".join(reasons) if reasons else "Message posted in a configured honeypot channel",
+                action=action,
+                decisive=True,
+                metadata={
+                    "reasons": tuple(reasons),
+                    "second_strike": second_strike,
+                    "force_review": force_review,
+                    "force_fallback": force_fallback,
+                },
+            ),
+        )
+
+    async def _initial_image_signal(
+        self, message: discord.Message, config: dict
+    ) -> DetectionSignal | None:
+        if not config.get("imagescan_detector_enabled", False):
+            return None
+        if not any(is_image_attachment(attachment) for attachment in message.attachments):
+            return None
+        samples = await self._imagescan_load_samples(message.guild.id)
+        if not any(sample.decision == "true_positive" for sample in samples):
+            return None
+        state = await self._imagescan_model_state(
+            message.guild.id, int(config.get("imagescan_detector_threshold", 20))
+        )
+        if not state["valid"]:
+            return None
+        matches: list[dict[str, object]] = []
+        scans = await self._scan_image_attachments(
+            message,
+            samples,
+            int(state["effective_threshold"]),
+            limit=IMAGE_SCAN_MAX_ATTACHMENTS,
+            stop_after_match=True,
+            batch_key=(message.guild.id, message.id),
+        )
+        for scan in scans:
+            if scan["error"] is not None:
+                log.debug(
+                    "Failed to scan initial imagescan attachment %s",
+                    scan["attachment"].filename,
+                )
+                continue
+            result = scan["result"]
+            if not result["matched"]:
+                continue
+            matches.append(
+                {
+                    "position": scan["image_position"],
+                    "filename": scan["attachment"].filename,
+                    "hash_diff": result.get("score"),
+                    "exact_decision": result.get("exact_decision"),
+                }
+            )
+        if not matches:
+            self._initial_image_scan_batches.pop((message.guild.id, message.id), None)
+            return None
+        return DetectionSignal(
+            detector="image",
+            reason="Initial image scan matched known suspicious content",
+            action=self._signal_action(
+                config.get("imagescan_detector_action", "review"),
+                IMAGE_SCAN_DETECTOR_ACTION_OPTIONS,
+            ),
+            decisive=True,
+            metadata={"matches": tuple(matches)},
+        )
+
+    async def _collect_detection_signals(
+        self, message: discord.Message, config: dict
+    ) -> tuple[DetectionSignal, ...]:
+        forward = self._forward_purge_signal(message)
+        signals: list[DetectionSignal] = []
+        if forward is not None:
+            signals.append(forward)
+        if message.channel.id in self._honeypot_channel_ids_from_config(config):
+            signals.extend(await self._honeypot_signals(message, config))
+        else:
+            spam = self._spam_signal(message, config)
+            if spam is not None:
+                signals.append(spam)
+            firstpost = await self._firstpost_signal(message, config)
+            if firstpost is not None:
+                signals.append(firstpost)
+        if not any(signal.decisive for signal in signals):
+            image = await self._initial_image_signal(message, config)
+            if image is not None:
+                signals.append(image)
+        return tuple(signals)
+
+    @staticmethod
+    def _new_case_message(message: discord.Message) -> NewMessage:
+        return NewMessage(
+            guild_id=message.guild.id,
+            user_id=message.author.id,
+            channel_id=message.channel.id,
+            message_id=message.id,
+            content=message.content,
+            created_at=message.created_at,
+            jump_url=getattr(message, "jump_url", None),
+            attachments=tuple(
+                NewAttachment(
+                    position=position,
+                    filename=attachment.filename,
+                    size=attachment.size,
+                    content_type=attachment.content_type,
+                    width=getattr(attachment, "width", None),
+                    height=getattr(attachment, "height", None),
+                    url=attachment.url,
+                    description=getattr(attachment, "description", None),
+                    spoiler=attachment.is_spoiler(),
+                )
+                for position, attachment in enumerate(message.attachments)
+            ),
+            display_name=getattr(message.author, "display_name", None),
+            avatar_url=(
+                str(getattr(getattr(message.author, "display_avatar", None), "url"))
+                if getattr(getattr(message.author, "display_avatar", None), "url", None)
+                else None
+            ),
+            account_created_at=getattr(message.author, "created_at", None),
+            guild_joined_at=getattr(message.author, "joined_at", None),
+        )
+
+    async def _capture_case_attachments(
+        self,
+        message: discord.Message,
+        case_id: str,
+        sequence: int,
+        *,
+        started_event: asyncio.Event | None = None,
+    ) -> tuple[detection_runtime.CaptureResult, ...]:
+        async with self._detection_case_evidence_lock:
+            await self._detection_case_capture_slots.acquire()
+        try:
+            accepts_evidence = await asyncio.to_thread(
+                self._case_store.case_accepts_evidence,
+                message.guild.id,
+                case_id,
+            )
+            if not accepts_evidence:
+                return tuple(
+                    detection_runtime.CaptureResult(
+                        position,
+                        detection_runtime.CaptureStatus.FAILED,
+                        None,
+                        "detection case deletion is in progress",
+                    )
+                    for position, _attachment in enumerate(message.attachments)
+                )
+            return await self._capture_case_attachments_unlocked(
+                message,
+                case_id,
+                sequence,
+                started_event=started_event,
+                prefetched_scans=self._initial_image_scan_batches.get(
+                    (message.guild.id, message.id), {}
+                ),
+            )
+        finally:
+            self._detection_case_capture_slots.release()
+
+    async def _capture_case_attachments_unlocked(
+        self,
+        message: discord.Message,
+        case_id: str,
+        sequence: int,
+        *,
+        started_event: asyncio.Event | None = None,
+        prefetched_scans: dict[int, asyncio.Task] | None = None,
+    ) -> tuple[detection_runtime.CaptureResult, ...]:
+        target = case_evidence_root(
+            self._detection_case_files_path, message.guild.id, case_id
+        ) / str(sequence) / f".attempt-{uuid4().hex}"
+        if not message.attachments:
+            if started_event is not None:
+                started_event.set()
+            return ()
+        snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+        if snapshot is None:
+            return ()
+        case_declared_bytes = sum(
+            max(0, int(attachment.size)) for attachment in snapshot.attachments
+        )
+        tasks: dict[int, asyncio.Task] = {}
+        claim_tokens: dict[int, str] = {}
+        attachment_sizes: dict[int, int] = {}
+        captures_by_position = {}
+        for position, attachment in enumerate(message.attachments):
+            size = max(0, int(getattr(attachment, "size", 0) or 0))
+            attachment_sizes[position] = size
+            claimed_at = datetime.now(timezone.utc)
+            reservation = await asyncio.to_thread(
+                self._case_store.reserve_attachment_capture,
+                case_id,
+                sequence,
+                position,
+                size,
+                claimed_at,
+                stale_before=claimed_at
+                - timedelta(seconds=DETECTION_EVIDENCE_RESERVATION_STALE_SECONDS),
+                max_attachment_bytes=size,
+                max_case_bytes=case_declared_bytes,
+            )
+            if reservation.status == "too_large":
+                captures_by_position[position] = detection_runtime.CaptureResult(
+                    position,
+                    detection_runtime.CaptureStatus.TOO_LARGE,
+                    None,
+                    reservation.error,
+                )
+                continue
+            if reservation.status != "claimed" or reservation.claim_token is None:
+                captures_by_position[position] = detection_runtime.CaptureResult(
+                    position,
+                    detection_runtime.CaptureStatus.FAILED,
+                    None,
+                    reservation.error or "evidence capture reservation unavailable",
+                )
+                continue
+            claim_tokens[position] = reservation.claim_token
+            prefetched_task = (prefetched_scans or {}).get(position)
+
+            async def capture_reader(
+                candidate, max_bytes, *, prefetched=prefetched_task
+            ):
+                if prefetched is None:
+                    return await detection_runtime.read_attachment_bounded(
+                        candidate, max_bytes
+                    )
+                scan = await asyncio.shield(prefetched)
+                if scan["error"] is not None:
+                    return await detection_runtime.read_attachment_bounded(
+                        candidate, max_bytes
+                    )
+                data = scan["data"]
+                if len(data) > max_bytes:
+                    raise detection_runtime.AttachmentTooLargeError(
+                        f"attachment exceeds the {max_bytes} byte evidence limit"
+                    )
+                return data
+
+            tasks[position] = asyncio.create_task(
+                detection_runtime.capture_attachment(
+                    attachment,
+                    target,
+                    position,
+                    DETECTION_ATTACHMENT_TIMEOUT_SECONDS,
+                    max_bytes=size,
+                    reader=capture_reader,
+                )
+            )
+        if started_event is not None:
+            started_event.set()
+        try:
+            done, pending = await asyncio.wait(
+                tuple(tasks.values()), timeout=DETECTION_CAPTURE_DEADLINE_SECONDS
+            ) if tasks else (set(), set())
+        except BaseException:
+            for task in tasks.values():
+                task.cancel()
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+            for result in results:
+                if (
+                    isinstance(result, detection_runtime.CaptureResult)
+                    and result.path is not None
+                ):
+                    await asyncio.to_thread(
+                        self._discard_rejected_detection_case_capture,
+                        message.guild.id,
+                        case_id,
+                        result.path,
+                    )
+            for position, claim_token in claim_tokens.items():
+                await asyncio.to_thread(
+                    self._case_store.release_attachment_capture,
+                    case_id,
+                    sequence,
+                    position,
+                    claim_token,
+                    detection_runtime.CaptureStatus.FAILED.value,
+                    "attachment capture cancelled",
+                )
+            raise
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for position, task in tasks.items():
+            if task in done:
+                captures_by_position[position] = task.result()
+            else:
+                captures_by_position[position] = detection_runtime.CaptureResult(
+                    position,
+                    detection_runtime.CaptureStatus.TIMEOUT,
+                    None,
+                    "overall attachment capture deadline exceeded",
+                )
+        captures = tuple(
+            captures_by_position[position]
+            for position in range(len(message.attachments))
+        )
+        persisted_captures = []
+        for capture in captures:
+            claim_token = claim_tokens.get(capture.position)
+            if claim_token is None:
+                persisted_captures.append(capture)
+                continue
+            if capture.status is detection_runtime.CaptureStatus.CAPTURED and capture.path is not None:
+                actual_bytes = await asyncio.to_thread(lambda path=capture.path: path.stat().st_size)
+                completion = await asyncio.to_thread(
+                    self._case_store.complete_attachment_capture,
+                    case_id,
+                    sequence,
+                    capture.position,
+                    claim_token,
+                    actual_bytes,
+                    str(capture.path),
+                    datetime.now(timezone.utc),
+                    max_attachment_bytes=attachment_sizes[capture.position],
+                    max_case_bytes=case_declared_bytes,
+                )
+                if completion == "captured":
+                    persisted_captures.append(capture)
+                    continue
+                if completion == "too_large":
+                    await asyncio.to_thread(
+                        self._discard_rejected_detection_case_capture,
+                        message.guild.id,
+                        case_id,
+                        capture.path,
+                    )
+                    persisted_captures.append(
+                        detection_runtime.CaptureResult(
+                            capture.position,
+                            detection_runtime.CaptureStatus.TOO_LARGE,
+                            None,
+                            "captured attachment exceeds its reserved evidence bytes",
+                        )
+                    )
+                else:
+                    await asyncio.to_thread(
+                        self._discard_rejected_detection_case_capture,
+                        message.guild.id,
+                        case_id,
+                        capture.path,
+                    )
+                    persisted_captures.append(
+                        detection_runtime.CaptureResult(
+                            capture.position,
+                            detection_runtime.CaptureStatus.FAILED,
+                            None,
+                            "evidence capture claim is no longer owned",
+                        )
+                    )
+                continue
+            released = await asyncio.to_thread(
+                self._case_store.release_attachment_capture,
+                case_id,
+                sequence,
+                capture.position,
+                claim_token,
+                capture.status.value,
+                capture.error,
+            )
+            persisted_captures.append(
+                capture
+                if released
+                else detection_runtime.CaptureResult(
+                    capture.position,
+                    detection_runtime.CaptureStatus.FAILED,
+                    None,
+                    "evidence capture claim is no longer owned",
+                )
+            )
+        return tuple(persisted_captures)
+
+    async def _scan_image_attachments(
+        self,
+        message: discord.Message,
+        samples,
+        threshold: int,
+        *,
+        capture_results: tuple[detection_runtime.CaptureResult, ...] = (),
+        limit: int | None = None,
+        stop_after_match: bool = False,
+        batch_key: tuple[int, int] | None = None,
+        skip_positions: frozenset[int] = frozenset(),
+    ) -> tuple[dict[str, object], ...]:
+        captures = {capture.position: capture for capture in capture_results}
+        candidates = []
+        image_position = 0
+        for position, attachment in enumerate(message.attachments):
+            if position in skip_positions:
+                continue
+            if not is_image_attachment(attachment):
+                continue
+            image_position += 1
+            if limit is not None and image_position > limit:
+                break
+            candidates.append((position, image_position, attachment))
+
+        async def scan_one(position, image_position, attachment):
+            try:
+                capture = captures.get(position)
+                if capture is not None and capture.path is not None:
+                    data = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            detection_runtime.read_file_bounded,
+                            capture.path,
+                            DETECTION_IMAGE_READ_MAX_BYTES,
+                        ),
+                        timeout=DETECTION_ATTACHMENT_TIMEOUT_SECONDS,
+                    )
+                elif capture is not None:
+                    raise RuntimeError(capture.error or "attachment capture is unavailable")
+                else:
+                    data = await asyncio.wait_for(
+                        detection_runtime.read_attachment_bounded(
+                            attachment, DETECTION_IMAGE_READ_MAX_BYTES
+                        ),
+                        timeout=DETECTION_ATTACHMENT_TIMEOUT_SECONDS,
+                    )
+                hashes = await asyncio.to_thread(image_hashes_from_bytes, data)
+                result = await asyncio.to_thread(match_image, hashes, samples, threshold)
+                error = None
+            except Exception as exception:
+                hashes = {}
+                result = {}
+                error = f"{type(exception).__name__}: {exception}"[:512]
+            return {
+                "position": position,
+                "image_position": image_position,
+                "attachment": attachment,
+                "hashes": hashes,
+                "result": result,
+                "error": error,
+                "data": data if error is None else None,
+            }
+
+        if stop_after_match:
+            tasks = {
+                position: asyncio.create_task(
+                    scan_one(position, image_position, attachment)
+                )
+                for position, image_position, attachment in candidates
+            }
+            self._initial_image_scan_tasks.update(tasks.values())
+            if batch_key is not None:
+                self._initial_image_scan_batches[batch_key] = tasks
+            for task in tasks.values():
+                task.add_done_callback(self._initial_image_scan_tasks.discard)
+            scans = []
+            try:
+                for completed in asyncio.as_completed(tasks.values()):
+                    scan = await completed
+                    scans.append(scan)
+                    if scan["error"] is None and scan["result"].get("matched"):
+                        return tuple(scans)
+            except BaseException:
+                for task in tasks.values():
+                    task.cancel()
+                await asyncio.gather(*tasks.values(), return_exceptions=True)
+                raise
+            return tuple(scans)
+
+        return tuple(
+            [
+                await scan_one(position, image_position, attachment)
+                for position, image_position, attachment in candidates
+            ]
+        )
+
+    async def _scan_all_case_message_images(
+        self,
+        message: discord.Message,
+        config: dict,
+        case_id: str,
+        sequence: int,
+        capture_results: tuple[detection_runtime.CaptureResult, ...],
+    ) -> None:
+        await self._scan_case_message_images(
+            message.guild.id,
+            tuple(message.attachments),
+            config,
+            case_id,
+            sequence,
+            capture_results,
+            initial_scan_key=(message.guild.id, message.id),
+        )
+
+    async def _scan_case_message_images(
+        self,
+        guild_id: int,
+        attachments: tuple,
+        config: dict,
+        case_id: str,
+        sequence: int,
+        capture_results: tuple[detection_runtime.CaptureResult, ...],
+        initial_scan_key: tuple[int, int] | None = None,
+    ) -> None:
+        if not attachments:
+            return
+        try:
+            samples = await self._imagescan_load_samples(guild_id)
+            model = await self._imagescan_model_state(
+                guild_id,
+                config.get("imagescan_detector_threshold", 20),
+            )
+        except Exception as error:
+            bounded = f"{type(error).__name__}: {error}"[:512]
+            for position, attachment in enumerate(attachments):
+                if is_image_attachment(attachment):
+                    await asyncio.to_thread(
+                        self._case_store.update_attachment_scan,
+                        case_id, sequence, position, None, None, {}, bounded,
+                    )
+            return
+        reused_scans = ()
+        if initial_scan_key is not None:
+            initial_tasks = self._initial_image_scan_batches.pop(initial_scan_key, ())
+            if initial_tasks:
+                reused_scans = tuple(
+                    scan
+                    for scan in await asyncio.gather(*initial_tasks.values())
+                    if scan["error"] is None
+                )
+        reused_positions = frozenset(scan["position"] for scan in reused_scans)
+        new_scans = await self._scan_image_attachments(
+            type("PersistedDetectionMessage", (), {"attachments": attachments})(),
+            samples,
+            model["effective_threshold"],
+            capture_results=capture_results,
+            skip_positions=reused_positions,
+        )
+        scans = tuple(sorted(reused_scans + new_scans, key=lambda item: item["position"]))
+        for scan in scans:
+            position = scan["position"]
+            if scan["error"] is None:
+                hashes = scan["hashes"]
+                await asyncio.to_thread(
+                    self._case_store.update_attachment_scan,
+                    case_id,
+                    sequence,
+                    position,
+                    hashes.get("sha256"),
+                    hashes.get("phash"),
+                    scan["result"],
+                    None,
+                )
+            else:
+                await asyncio.to_thread(
+                    self._case_store.update_attachment_scan,
+                    case_id,
+                    sequence,
+                    position,
+                    None,
+                    None,
+                    {},
+                    scan["error"],
+                )
+
+    @staticmethod
+    def _case_timeline_attachment_line(attachment) -> str:
+        details = [attachment.capture_status]
+        metadata = attachment.match_metadata
+        matched_filename = metadata.get("matched_filename")
+        hash_diff = metadata.get("hash_diff", metadata.get("distance"))
+        if matched_filename:
+            match = f"matched {matched_filename}"
+            if hash_diff is not None:
+                match += f" (hash difference {hash_diff})"
+            details.append(match)
+        elif metadata.get("matched"):
+            details.append("matched known suspicious content")
+        matches = metadata.get("matches")
+        if isinstance(matches, (list, tuple)):
+            for match in matches[:3]:
+                if not isinstance(match, typing.Mapping):
+                    continue
+                filename = match.get("matched_filename", match.get("filename", "known sample"))
+                distance = match.get("hash_diff", match.get("distance", match.get("score")))
+                detail = f"matched {filename}"
+                if distance is not None:
+                    detail += f" (hash difference {distance})"
+                details.append(detail)
+        if attachment.learning_decision:
+            decisions = {
+                "true_positive": "True positive",
+                "false_positive": "False positive",
+                "ignored": "Ignored",
+            }
+            details.append(
+                decisions.get(attachment.learning_decision, attachment.learning_decision)
+            )
+        if attachment.publication_error:
+            details.append(f"upload warning: {attachment.publication_error}")
+        filename = attachment.filename.replace("`", "ˋ")
+        return (
+            f"- {attachment.key.position + 1}. `{filename}`\n"
+            f"  {'; '.join(details)}"
+        )
+
+    @staticmethod
+    def _case_timeline_message_content(message) -> str:
+        reasons = (
+            "\n".join(f"- {reason}" for reason in message.signal_reasons)
+            if message.signal_reasons
+            else "- Detection signal recorded"
+        )
+        content = (message.content or "(message with attachments only)").replace(
+            "```", "``\u200b`"
+        )
+        source = message.jump_url or "Source unavailable"
+        attachments = (
+            "\n\nAttachments:\n"
+            + "\n".join(
+                Honeypot._case_timeline_attachment_line(attachment)
+                for attachment in message.attachments
+            )
+            if message.attachments
+            else ""
+        )
+        return (
+            f"**Message {message.sequence}** • {source} • "
+            f"<t:{int(message.created_at.timestamp())}:F>\n"
+            f"Status: {message.delete_status}\n"
+            f"Signals:\n{reasons}\n```\n{content}\n```{attachments}"
+        )
+
+    @staticmethod
+    def _case_timeline_message_chunks(message) -> tuple[str, ...]:
+        rendered = Honeypot._case_timeline_message_content(message)
+        metadata, opening, fenced = rendered.partition("```\n")
+        content, closing, trailing = fenced.partition("\n```")
+        if not opening or not closing:
+            raise RuntimeError("timeline message content is missing its code fence")
+
+        chunks: list[str] = []
+        remaining = content
+        while remaining:
+            prefix = (
+                metadata + opening
+                if not chunks
+                else f"**Message {message.sequence} (continued)**\n```\n"
+            )
+            suffix = "\n```"
+            available = 2000 - len(prefix) - len(suffix)
+            if available <= 0:
+                raise RuntimeError("timeline message metadata exceeds Discord's limit")
+            split_at = min(len(remaining), available)
+            if split_at < len(remaining):
+                newline = remaining.rfind("\n", 0, split_at + 1)
+                if newline > 0:
+                    split_at = newline + 1
+            payload = prefix + remaining[:split_at] + suffix
+            remaining = remaining[split_at:]
+            if not remaining and trailing and len(payload) + len(trailing) <= 2000:
+                payload += trailing
+                trailing = ""
+            chunks.append(payload)
+
+        while trailing:
+            prefix = f"**Message {message.sequence} (continued)**\n"
+            available = 2000 - len(prefix)
+            split_at = min(len(trailing), available)
+            if split_at < len(trailing):
+                newline = trailing.rfind("\n", 0, split_at + 1)
+                if newline > 0:
+                    split_at = newline + 1
+            chunks.append(prefix + trailing[:split_at].lstrip("\n"))
+            trailing = trailing[split_at:]
+
+        return tuple(chunks)
+
+    @staticmethod
+    def _case_publication_nonce(logical_key: str) -> int:
+        digest = hashlib.blake2b(logical_key.encode("utf-8"), digest_size=8).digest()
+        return int.from_bytes(digest, "big") & ((1 << 63) - 1)
+
+    async def _complete_case_timeline_publication(
+        self, publication, sent_message, thread_id: int
+    ) -> None:
+        if publication.claim_token is None:
+            raise RuntimeError("timeline publication is not claimed")
+        try:
+            await asyncio.to_thread(
+                self._case_store.complete_timeline_publication,
+                publication.logical_key,
+                publication.claim_token,
+                channel_id=thread_id,
+                message_id=sent_message.id,
+                revision=1,
+            )
+        except KeyError:
+            current = next(
+                (
+                    item
+                    for item in await asyncio.to_thread(
+                        self._case_store.list_timeline_publications,
+                        publication.case_id,
+                    )
+                    if item.logical_key == publication.logical_key
+                ),
+                None,
+            )
+            if (
+                current is not None
+                and current.state == "published"
+                and current.channel_id == thread_id
+                and current.message_id == sent_message.id
+            ):
+                return
+            await self._compensate_case_publication(
+                publication.case_id, thread_id, sent_message
+            )
+            raise
+
+    async def _compensate_case_publication(
+        self, case_id: str, channel_id: int, message
+    ) -> None:
+        delete = getattr(message, "delete", None)
+        if callable(delete):
+            try:
+                await delete()
+                return
+            except discord.NotFound:
+                return
+            except discord.HTTPException:
+                pass
+        recorded = await asyncio.to_thread(
+            self._case_store.add_case_deletion_publication,
+            case_id,
+            channel_id,
+            message.id,
+        )
+        if not recorded:
+            recorded = await asyncio.to_thread(
+                self._case_store.record_orphan_publication,
+                case_id,
+                channel_id,
+                message.id,
+            )
+        if not recorded:
+            raise RuntimeError("failed to retain a late case publication for cleanup")
+
+    async def _retry_detection_orphan_publications(self) -> None:
+        publications = await asyncio.to_thread(
+            self._case_store.list_orphan_publications
+        )
+        for case_id, guild_id, channel_id, message_id in publications:
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                continue
+            channel = await self._fetch_text_channel_or_thread(guild, channel_id)
+            if channel is None:
+                continue
+            try:
+                message = await channel.fetch_message(message_id)
+                await message.delete()
+            except discord.NotFound:
+                pass
+            except discord.HTTPException:
+                continue
+            await asyncio.to_thread(
+                self._case_store.complete_orphan_publication,
+                case_id,
+                channel_id,
+                message_id,
+            )
+
+    async def _acquire_case_timeline_publication(
+        self, publication, *, replace_message_id: int | None = None
+    ):
+        for _attempt in range(20):
+            claimed = await asyncio.to_thread(
+                self._case_store.claim_timeline_publication,
+                publication.logical_key,
+                datetime.now(timezone.utc),
+                replace_message_id=replace_message_id,
+            )
+            if claimed is not None:
+                return claimed, True
+            current = next(
+                (
+                    item
+                    for item in await asyncio.to_thread(
+                        self._case_store.list_timeline_publications,
+                        publication.case_id,
+                    )
+                    if item.logical_key == publication.logical_key
+                ),
+                None,
+            )
+            if current is None:
+                raise KeyError(publication.logical_key)
+            if current.state == "published":
+                return current, False
+            await asyncio.sleep(0)
+        raise RuntimeError("timeline publication claim is unavailable")
+
+    async def _release_case_timeline_publication(self, publication) -> None:
+        if publication.claim_token is not None:
+            await asyncio.to_thread(
+                self._case_store.release_timeline_publication_claim,
+                publication.logical_key,
+                publication.claim_token,
+            )
+
+    async def _upsert_case_timeline_text(
+        self,
+        publication,
+        thread,
+        content: str,
+        *,
+        view: object = _TIMELINE_VIEW_UNSET,
+    ) -> None:
+        edit_kwargs = {"content": content}
+        send_kwargs = {}
+        if view is not _TIMELINE_VIEW_UNSET:
+            edit_kwargs["view"] = view
+            send_kwargs["view"] = view
+        replace_message_id = None
+        if publication.state == "published" and publication.message_id is not None:
+            try:
+                message = await thread.fetch_message(publication.message_id)
+                await message.edit(**edit_kwargs)
+                return
+            except discord.NotFound:
+                replace_message_id = publication.message_id
+        publication, owned = await self._acquire_case_timeline_publication(
+            publication, replace_message_id=replace_message_id
+        )
+        if not owned:
+            message = await thread.fetch_message(publication.message_id)
+            await message.edit(**edit_kwargs)
+            return
+        try:
+            message = await thread.send(
+                content,
+                **send_kwargs,
+                allowed_mentions=discord.AllowedMentions.none(),
+                nonce=self._case_publication_nonce(publication.logical_key),
+            )
+            await self._complete_case_timeline_publication(
+                publication, message, thread.id
+            )
+        except BaseException:
+            await self._release_case_timeline_publication(publication)
+            raise
+
+    @staticmethod
+    def _case_note_chunks(notes: tuple[str, ...]) -> tuple[str, ...]:
+        chunks: list[str] = []
+        current = "**Case operation notes**"
+        for note in notes:
+            line = f"\n- {note}"
+            if len(current) + len(line) > 2000:
+                chunks.append(current)
+                current = "**Case operation notes (continued)**" + line
+            else:
+                current += line
+        if notes:
+            chunks.append(current)
+        else:
+            chunks.append("**Case operation notes**\nNo current operation warnings.")
+        return tuple(chunks)
+
+    @staticmethod
+    def _case_resolution_timeline_content(snapshot) -> str:
+        resolution = snapshot.case.resolution or "resolved"
+        labels = {
+            "ban": "Banned",
+            "kick": "Kicked",
+            "ignore": "Ignored",
+            "expired": "Expired",
+            "images:tp": "Images marked as true positives",
+            "images:fp": "Images marked as false positives",
+            "images:ignore": "Images ignored",
+        }
+        label = labels.get(
+            resolution,
+            "Image review completed" if resolution.startswith("images:") else "Resolved",
+        )
+        timestamp = (
+            f" <t:{int(snapshot.case.resolved_at.timestamp())}:F>"
+            if snapshot.case.resolved_at is not None
+            else ""
+        )
+        if snapshot.case.moderator_id is None:
+            return f"**Resolved automatically: {label}**{timestamp}."
+        return (
+            f"**Resolved: {label}** by <@{snapshot.case.moderator_id}>{timestamp}."
+        )
+
+    async def _ensure_detection_case_thread(self, snapshot, summary_message):
+        fetch_thread = getattr(summary_message, "fetch_thread", None)
+        thread = None
+        if callable(fetch_thread):
+            try:
+                thread = await fetch_thread()
+            except discord.NotFound:
+                thread = None
+        if thread is None:
+            create_thread = getattr(summary_message, "create_thread", None)
+            if not callable(create_thread):
+                raise RuntimeError("detection case summary cannot create a thread")
+            try:
+                thread = await create_thread(
+                    name=f"case-{snapshot.case.user_id}",
+                    auto_archive_duration=1440,
+                    reason="Honeypot detection case",
+                )
+            except discord.HTTPException:
+                if not callable(fetch_thread):
+                    raise
+                thread = await fetch_thread()
+        parent = getattr(summary_message, "channel", None)
+        parent_channel_id = getattr(parent, "id", snapshot.case.review_channel_id)
+        try:
+            await asyncio.to_thread(
+                self._case_store.activate_projection_endpoint,
+                snapshot.case.case_id,
+                parent_channel_id=parent_channel_id,
+                summary_message_id=summary_message.id,
+                thread_id=thread.id,
+                projected_revision=len(snapshot.messages),
+                verified_at=datetime.now(timezone.utc),
+            )
+        except KeyError:
+            delete = getattr(thread, "delete", None)
+            if callable(delete):
+                try:
+                    await delete(reason="Honeypot user data deletion")
+                except discord.NotFound:
+                    pass
+            raise
+        return thread
+
+    async def _activate_detection_case_thread(self, thread):
+        if not getattr(thread, "archived", False) and not getattr(
+            thread, "locked", False
+        ):
+            return thread
+        return await thread.edit(
+            archived=False,
+            locked=False,
+            reason="Honeypot detection case update",
+        )
+
+    async def _finalize_detection_case_thread(self, thread) -> None:
+        await thread.edit(
+            archived=True,
+            locked=True,
+            reason="Honeypot detection case resolved",
+        )
+
+    async def _publish_case_timeline(
+        self,
+        snapshot,
+        thread,
+        *,
+        resolved: bool,
+        message_sequence: int | None = None,
+    ) -> None:
+        timeline = render_timeline(snapshot)
+        feedback_items = case_feedback_items(snapshot)
+        note_chunks = self._case_note_chunks(timeline.case_notes)
+        timeline_publications = await asyncio.to_thread(
+            self._case_store.list_timeline_publications,
+            snapshot.case.case_id,
+        )
+        existing_note_count = sum(
+            1
+            for publication in timeline_publications
+            if publication.kind == "case_note"
+        )
+        for chunk_index in range(max(len(note_chunks), existing_note_count)):
+            publication = await asyncio.to_thread(
+                self._case_store.ensure_timeline_publication,
+                snapshot.case.case_id,
+                kind="case_note",
+                chunk_index=chunk_index,
+            )
+            content = (
+                note_chunks[chunk_index]
+                if chunk_index < len(note_chunks)
+                else "**Case operation notes**\nNo current operation warnings."
+            )
+            await self._upsert_case_timeline_text(publication, thread, content)
+        if resolved or message_sequence is None:
+            messages = timeline.messages
+        else:
+            published_message_sequences = {
+                publication.message_sequence
+                for publication in timeline_publications
+                if publication.kind == "message"
+                and publication.chunk_index == 0
+                and publication.state == "published"
+            }
+            messages = tuple(
+                message
+                for message in timeline.messages
+                if message.sequence == message_sequence
+                or (
+                    message.sequence < message_sequence
+                    and message.sequence not in published_message_sequences
+                )
+            )
+        for message in messages:
+            batches, oversized, upload_limit = self._case_timeline_evidence_batches(
+                message, thread
+            )
+            has_pending_image_feedback = any(
+                item.message_sequence == message.sequence
+                and item.decision is None
+                for item in feedback_items
+            )
+            message_chunks = self._case_timeline_message_chunks(message)
+            existing_message_chunks = sum(
+                1
+                for publication in timeline_publications
+                if publication.kind == "message"
+                and publication.message_sequence == message.sequence
+            )
+            for chunk_index in range(
+                max(len(message_chunks), existing_message_chunks)
+            ):
+                publication = await asyncio.to_thread(
+                    self._case_store.ensure_timeline_publication,
+                    snapshot.case.case_id,
+                    kind="message",
+                    message_sequence=message.sequence,
+                    chunk_index=chunk_index,
+                )
+                content = (
+                    message_chunks[chunk_index]
+                    if chunk_index < len(message_chunks)
+                    else f"**Message {message.sequence} (continued)**\nNo additional content."
+                )
+                view = (
+                    DetectionCaseView(
+                        self,
+                        snapshot.case.case_id,
+                        has_image_feedback=has_pending_image_feedback,
+                        message_sequence=message.sequence,
+                        resolved=resolved,
+                    )
+                    if chunk_index == 0 and not batches
+                    else None
+                )
+                await self._upsert_case_timeline_text(
+                    publication, thread, content, view=view
+                )
+            limit_label = f"{upload_limit / (1024 * 1024):g} MiB"
+            for attachment in oversized:
+                await asyncio.to_thread(
+                    self._case_store.update_attachment_publication_error,
+                    snapshot.case.case_id,
+                    attachment.key.message_sequence,
+                    attachment.key.position,
+                    f"attachment exceeds the {limit_label} review destination upload limit",
+                )
+            for chunk_index, batch in enumerate(batches):
+                evidence = await asyncio.to_thread(
+                    self._case_store.ensure_timeline_publication,
+                    snapshot.case.case_id,
+                    kind="evidence",
+                    message_sequence=message.sequence,
+                    chunk_index=chunk_index,
+                )
+                content = f"Message {message.sequence} attachments"
+                view = (
+                    DetectionCaseView(
+                        self,
+                        snapshot.case.case_id,
+                        has_image_feedback=has_pending_image_feedback,
+                        message_sequence=message.sequence,
+                        resolved=resolved,
+                    )
+                    if chunk_index == 0
+                    else None
+                )
+                replace_message_id = None
+                if evidence.state == "published" and evidence.message_id is not None:
+                    try:
+                        published = await thread.fetch_message(evidence.message_id)
+                        existing_attachments = getattr(
+                            published, "attachments", None
+                        )
+                        same_batch = (
+                            getattr(published, "content", None) == content
+                            and existing_attachments is not None
+                            and len(existing_attachments) == len(batch)
+                        )
+                        if same_batch:
+                            await published.edit(view=view)
+                        else:
+                            files = [
+                                discord.File(
+                                    Path(attachment.evidence_path),
+                                    filename=attachment.filename,
+                                    spoiler=attachment.spoiler,
+                                    description=attachment.description,
+                                )
+                                for attachment in batch
+                            ]
+                            await published.edit(
+                                content=content,
+                                attachments=files,
+                                view=view,
+                            )
+                        continue
+                    except discord.NotFound:
+                        replace_message_id = evidence.message_id
+                evidence, owned = await self._acquire_case_timeline_publication(
+                    evidence, replace_message_id=replace_message_id
+                )
+                if not owned:
+                    published = await thread.fetch_message(evidence.message_id)
+                    await published.edit(view=view)
+                    continue
+                files = [
+                    discord.File(
+                        Path(attachment.evidence_path),
+                        filename=attachment.filename,
+                        spoiler=attachment.spoiler,
+                        description=attachment.description,
+                    )
+                    for attachment in batch
+                ]
+                try:
+                    published = await thread.send(
+                        content,
+                        files=files,
+                        view=view,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                        nonce=self._case_publication_nonce(evidence.logical_key),
+                    )
+                    await self._complete_case_timeline_publication(
+                        evidence, published, thread.id
+                    )
+                except BaseException:
+                    await self._release_case_timeline_publication(evidence)
+                    raise
+            existing_evidence = tuple(
+                publication
+                for publication in await asyncio.to_thread(
+                    self._case_store.list_timeline_publications,
+                    snapshot.case.case_id,
+                )
+                if publication.kind == "evidence"
+                and publication.message_sequence == message.sequence
+                and publication.chunk_index >= len(batches)
+            )
+            for obsolete in existing_evidence:
+                if obsolete.state != "published" or obsolete.message_id is None:
+                    continue
+                try:
+                    published = await thread.fetch_message(obsolete.message_id)
+                except discord.NotFound:
+                    continue
+                await published.edit(
+                    content=(
+                        f"Message {message.sequence} attachments: "
+                        "No additional attachments."
+                    ),
+                    attachments=[],
+                    view=None,
+                )
+        if resolved:
+            resolution = await asyncio.to_thread(
+                self._case_store.ensure_timeline_publication,
+                snapshot.case.case_id,
+                kind="resolution",
+            )
+            content = self._case_resolution_timeline_content(snapshot)
+            replace_message_id = None
+            if resolution.state == "published" and resolution.message_id is not None:
+                try:
+                    published = await thread.fetch_message(resolution.message_id)
+                    await published.edit(content=content)
+                    return
+                except discord.NotFound:
+                    replace_message_id = resolution.message_id
+            resolution, owned = await self._acquire_case_timeline_publication(
+                resolution, replace_message_id=replace_message_id
+            )
+            if not owned:
+                published = await thread.fetch_message(resolution.message_id)
+                await published.edit(content=content)
+                return
+            try:
+                published = await thread.send(
+                    content,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    nonce=self._case_publication_nonce(resolution.logical_key),
+                )
+                await self._complete_case_timeline_publication(
+                    resolution, published, thread.id
+                )
+            except BaseException:
+                await self._release_case_timeline_publication(resolution)
+                raise
+
+    @staticmethod
+    def _case_timeline_evidence_batches(message, thread):
+        upload_limit = getattr(thread, "filesize_limit", None)
+        if not isinstance(upload_limit, int) or upload_limit <= 0:
+            upload_limit = getattr(getattr(thread, "guild", None), "filesize_limit", None)
+        if not isinstance(upload_limit, int) or upload_limit <= 0:
+            upload_limit = math.inf
+        terminal_statuses = {
+            status.value for status in detection_runtime.CaptureStatus
+        }
+        if any(
+            attachment.capture_status not in terminal_statuses
+            for attachment in message.attachments
+        ):
+            return (), (), upload_limit
+        batches = []
+        batch = []
+        oversized = []
+        max_batch_files = 10
+        for attachment in message.attachments:
+            if attachment.capture_status != "captured" or not attachment.evidence_path:
+                continue
+            path = Path(attachment.evidence_path)
+            if not path.is_file():
+                continue
+            actual_size = path.stat().st_size
+            if actual_size > upload_limit:
+                oversized.append(attachment)
+                continue
+            if len(batch) == max_batch_files:
+                batches.append(tuple(batch))
+                batch = []
+            batch.append(attachment)
+        if batch:
+            batches.append(tuple(batch))
+        return tuple(batches), tuple(oversized), upload_limit
+
+    async def _publish_detection_case(
+        self,
+        case_id: str,
+        config: dict,
+        logs_channel: discord.TextChannel | discord.Thread | None,
+        *,
+        message_sequence: int | None = None,
+        skip_if_done: asyncio.Task | None = None,
+    ) -> bool:
+        digest = hashlib.blake2b(case_id.encode("utf-8"), digest_size=8).digest()
+        lock = self._detection_publication_locks[
+            int.from_bytes(digest, "big") % len(self._detection_publication_locks)
+        ]
+        async with lock:
+            if skip_if_done is not None and skip_if_done.done():
+                return False
+            await self._publish_detection_case_serial(
+                case_id,
+                config,
+                logs_channel,
+                message_sequence=message_sequence,
+            )
+            return True
+
+    async def _publish_detection_case_serial(
+        self,
+        case_id: str,
+        config: dict,
+        logs_channel: discord.TextChannel | discord.Thread | None,
+        *,
+        message_sequence: int | None = None,
+    ) -> None:
+        snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+        if snapshot is None:
+            return
+        guild = None
+        if config.get("review_channel") is not None or snapshot.case.review_channel_id is not None:
+            guild = self.bot.get_guild(snapshot.case.guild_id)
+        review_channel = (
+            self._get_text_channel_or_thread(guild, config.get("review_channel"))
+            if guild is not None and config.get("review_channel") is not None
+            else None
+        )
+        if review_channel is not None and not isinstance(
+            review_channel, discord.TextChannel
+        ):
+            raise RuntimeError(
+                "The configured review destination must be a text channel."
+            )
+        channel = review_channel or logs_channel
+        has_persisted_primary = bool(
+            snapshot.case.review_channel_id and snapshot.case.review_message_id
+        )
+        if channel is None and not has_persisted_primary:
+            raise RuntimeError(
+                "No configured detection case publication destination is available."
+            )
+        projection = render_case(snapshot)
+        def projection_embed():
+            page_embed = discord.Embed(
+                title=_(projection.title),
+                description=projection.description,
+                color=(
+                    discord.Color.dark_red()
+                    if projection.needs_attention
+                    else discord.Color.gold()
+                ),
+            )
+            set_thumbnail = getattr(page_embed, "set_thumbnail", None)
+            if projection.thumbnail_url and callable(set_thumbnail):
+                set_thumbnail(url=projection.thumbnail_url)
+            for field in projection.pages[0]:
+                page_embed.add_field(
+                    name=_(field.name), value=_(field.value), inline=False
+                )
+            return page_embed
+
+        embed = projection_embed()
+        resolved = snapshot.case.status.value in {"resolved", "expired"}
+        view = DetectionCaseView(
+            self,
+            case_id,
+            has_image_feedback=bool(projection.feedback_items),
+            resolved=resolved,
+            allow_individual=sum(
+                item.decision is None for item in projection.feedback_items
+            ) <= 25,
+        )
+        self._case_views[case_id] = view
+        existing = None
+        if snapshot.case.review_channel_id and snapshot.case.review_message_id and guild is not None:
+            old_channel = await self._fetch_text_channel_or_thread(
+                guild, snapshot.case.review_channel_id
+            )
+            if old_channel is not None:
+                try:
+                    existing = await old_channel.fetch_message(snapshot.case.review_message_id)
+                except discord.NotFound:
+                    cleared = await asyncio.to_thread(
+                        self._case_store.clear_review_message,
+                        case_id,
+                        snapshot.case.review_channel_id,
+                        snapshot.case.review_message_id,
+                    )
+                    if not cleared:
+                        snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+        if existing is not None:
+            await existing.edit(embed=embed, view=view)
+            thread = await self._ensure_detection_case_thread(snapshot, existing)
+            thread = await self._activate_detection_case_thread(thread)
+            await self._publish_case_timeline(
+                snapshot,
+                thread,
+                resolved=resolved,
+                message_sequence=message_sequence,
+            )
+            if resolved:
+                await self._finalize_detection_case_thread(thread)
+            return
+        if channel is None:
+            raise RuntimeError(
+                "No configured detection case publication destination is available."
+            )
+        summary_message = None
+        token = await asyncio.to_thread(
+            self._case_store.claim_publication, case_id, "primary", datetime.now(timezone.utc)
+        )
+        if token is not None:
+            heartbeat = asyncio.create_task(
+                self._renew_case_publication_claim(case_id, "primary", token)
+            )
+            try:
+                sent = await channel.send(
+                    embed=embed,
+                    view=view,
+                    nonce=UUID(case_id).int & ((1 << 63) - 1),
+                )
+                summary_message = sent
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+                completed = await asyncio.to_thread(
+                    self._case_store.complete_primary_publication,
+                    case_id, token, channel.id, sent.id,
+                )
+                if not completed:
+                    await self._compensate_case_publication(
+                        case_id, channel.id, sent
+                    )
+                    raise RuntimeError("detection case primary publication lease was lost")
+                if guild is not None:
+                    await self._increment_stat(guild, "reviewed")
+            except BaseException:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+                await asyncio.to_thread(
+                    self._case_store.release_publication_claim, case_id, "primary", token
+                )
+                raise
+        else:
+            for _attempt in range(20):
+                await asyncio.sleep(0)
+                snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+                if snapshot is not None and snapshot.case.review_message_id is not None:
+                    winner_channel = await self._fetch_text_channel_or_thread(
+                        guild, snapshot.case.review_channel_id
+                    )
+                    if winner_channel is not None:
+                        winner_message = await winner_channel.fetch_message(
+                            snapshot.case.review_message_id
+                        )
+                        await winner_message.edit(embed=embed, view=view)
+                        summary_message = winner_message
+                    break
+        snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+        if summary_message is None and snapshot.case.review_message_id is not None:
+            destination = await self._fetch_text_channel_or_thread(
+                guild, snapshot.case.review_channel_id
+            )
+            if destination is not None:
+                summary_message = await destination.fetch_message(
+                    snapshot.case.review_message_id
+                )
+        if summary_message is None:
+            raise RuntimeError("detection case summary publication is unavailable")
+        thread = await self._ensure_detection_case_thread(snapshot, summary_message)
+        thread = await self._activate_detection_case_thread(thread)
+        await self._publish_case_timeline(
+            snapshot,
+            thread,
+            resolved=resolved,
+            message_sequence=message_sequence,
+        )
+        if resolved:
+            await self._finalize_detection_case_thread(thread)
+
+
+
+
+    async def _renew_case_publication_claim(
+        self, case_id: str, slot: str, token: str
+    ) -> None:
+        while True:
+            await asyncio.sleep(self._detection_heartbeat_interval_seconds)
+            renewed = await asyncio.to_thread(
+                self._case_store.renew_publication_claim,
+                case_id,
+                slot,
+                token,
+                datetime.now(timezone.utc),
+            )
+            if not renewed:
+                return
+
+
+    @staticmethod
+    def _case_review_has_permission(interaction: discord.Interaction) -> bool:
+        permissions = getattr(getattr(interaction, "user", None), "guild_permissions", None)
+        return bool(
+            permissions
+            and (
+                getattr(permissions, "moderate_members", False)
+                or getattr(permissions, "manage_messages", False)
+                or getattr(permissions, "ban_members", False)
+            )
+        )
+
+    @staticmethod
+    def _case_review_has_action_permission(
+        interaction: discord.Interaction, action: str
+    ) -> bool:
+        permissions = getattr(getattr(interaction, "user", None), "guild_permissions", None)
+        if permissions is None:
+            return False
+        if action == "ban":
+            return bool(getattr(permissions, "ban_members", False))
+        if action == "kick":
+            return bool(getattr(permissions, "kick_members", False))
+        if action == "ignore":
+            return bool(
+                getattr(permissions, "moderate_members", False)
+                or getattr(permissions, "manage_messages", False)
+                or getattr(permissions, "ban_members", False)
+                or getattr(permissions, "kick_members", False)
+            )
+        return False
+
+    async def _case_review_error(self, interaction: discord.Interaction, message: str) -> None:
+        response = interaction.response
+        if not response.is_done():
+            await response.send_message(message, ephemeral=True)
+        else:
+            await interaction.followup.send(message, ephemeral=True)
+
+    async def _case_review_rerender(self, case_id: str) -> None:
+        snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+        if snapshot is None:
+            return
+        config = await self.config.guild_from_id(snapshot.case.guild_id).all()
+        await self._publish_detection_case(case_id, config, None)
+
+    async def _case_review_bulk_interaction(
+        self,
+        interaction: discord.Interaction,
+        case_id: str,
+        action: str,
+        *,
+        confirmed: bool = False,
+    ) -> None:
+        if not self._case_review_has_permission(interaction):
+            await self._case_review_error(interaction, _("You do not have permission to review this case."))
+            return
+        if action in {"tp", "fp"} and not confirmed:
+            await interaction.response.send_message(
+                _("Confirm this bulk image decision."),
+                view=DetectionBulkConfirmationView(self, case_id, action),
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        try:
+            resolved = await self.resolve_detection_case(
+                case_id, f"images:{action}", interaction.user.id
+            )
+            if not resolved:
+                raise ValueError("detection case is already resolved")
+        except (KeyError, ValueError) as error:
+            await self._case_review_error(interaction, str(error))
+
+    async def _case_review_message_bulk_interaction(
+        self,
+        interaction: discord.Interaction,
+        case_id: str,
+        message_sequence: int,
+        action: str,
+        *,
+        confirmed: bool = False,
+    ) -> None:
+        if not self._case_review_has_permission(interaction):
+            await self._case_review_error(
+                interaction, _("You do not have permission to review this case.")
+            )
+            return
+        if action in {"tp", "fp"} and not confirmed:
+            await interaction.response.send_message(
+                _("Confirm this message's image decision."),
+                view=DetectionBulkConfirmationView(
+                    self,
+                    case_id,
+                    action,
+                    message_sequence=message_sequence,
+                ),
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        try:
+            await self._case_review_service.apply_message(
+                case_id, message_sequence, action, interaction.user.id
+            )
+            await self._case_review_rerender(case_id)
+        except (KeyError, ValueError) as error:
+            await self._case_review_error(interaction, str(error))
+
+    async def _case_review_moderation_interaction(
+        self,
+        interaction: discord.Interaction,
+        case_id: str,
+        action: str,
+        *,
+        confirmed: bool = False,
+    ) -> None:
+        if not self._case_review_has_action_permission(interaction, action):
+            await self._case_review_error(
+                interaction, _("You do not have permission to review this case.")
+            )
+            return
+        if action in {"ban", "kick"} and not confirmed:
+            snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+            has_unreviewed_images = snapshot is not None and any(
+                is_persisted_image_attachment(attachment)
+                and (
+                    attachment.capture_status == "pending"
+                    or (
+                        attachment.capture_status == "captured"
+                        and attachment.evidence_path is not None
+                        and attachment.learning_decision is None
+                    )
+                )
+                for attachment in snapshot.attachments
+            )
+            if has_unreviewed_images:
+                await interaction.response.send_message(
+                    _(
+                        "Some images are still processing or have not been reviewed. "
+                        "Continuing will close the case without adding them to the image database."
+                    ),
+                    view=DetectionModerationConfirmationView(self, case_id, action),
+                    ephemeral=True,
+                )
+                return
+        await interaction.response.defer()
+        try:
+            if action == "ignore":
+                snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+                resolved = await self.resolve_detection_case(
+                    case_id, "ignore", interaction.user.id
+                )
+                if not resolved:
+                    current = await asyncio.to_thread(self._case_store.get_case, case_id)
+                    if current is not None and any(
+                        attachment.capture_status == "pending"
+                        for attachment in current.attachments
+                    ):
+                        raise ValueError("Attachments are still processing. Try again shortly.")
+                    raise ValueError("detection case is already resolved")
+                if snapshot is not None:
+                    self._deactivate_forward_purge(
+                        snapshot.case.guild_id, snapshot.case.user_id
+                    )
+                return
+            if action not in {"ban", "kick"}:
+                raise ValueError("unsupported detection case moderation action")
+            operation = await asyncio.to_thread(
+                self._case_store.claim_moderator_action,
+                case_id,
+                action,
+                interaction.user.id,
+                datetime.now(timezone.utc),
+            )
+            if operation is None:
+                raise ValueError("detection case is already resolving or resolved")
+            if operation.operation_type != f"moderator_{action}":
+                raise ValueError("another moderator action already owns this case")
+            now = datetime.now(timezone.utc)
+            if operation.status.value == "failed" and operation.retry_at is not None:
+                now = max(now, operation.retry_at)
+            claimed = await asyncio.to_thread(
+                self._case_store.claim_operation, operation.operation_id, now
+            )
+            if claimed is not None:
+                await self._execute_detection_case_operation(claimed, now)
+            snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+            persisted = next(
+                item
+                for item in snapshot.operations
+                if item.operation_id == operation.operation_id
+            )
+            if persisted.status.value != "succeeded":
+                raise ValueError(persisted.last_error or "moderator action failed")
+        except (KeyError, ValueError) as error:
+            await self._case_review_error(interaction, str(error))
+
+    async def _case_review_attachment_interaction(
+        self, interaction: discord.Interaction, key: AttachmentKey, action: str
+    ) -> None:
+        if not self._case_review_has_permission(interaction):
+            await self._case_review_error(interaction, _("You do not have permission to review this case."))
+            return
+        await interaction.response.defer()
+        try:
+            await self._case_review_service.apply_individual(key, action, interaction.user.id)
+            await self._case_review_rerender(key.case_id)
+        except (KeyError, ValueError) as error:
+            await self._case_review_error(interaction, str(error))
+
+    async def _case_review_individual_prompt(
+        self,
+        interaction: discord.Interaction,
+        case_id: str,
+        *,
+        message_sequence: int | None = None,
+    ) -> None:
+        if not self._case_review_has_permission(interaction):
+            await self._case_review_error(interaction, _("You do not have permission to review this case."))
+            return
+        snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+        feedback_items = tuple(
+            item
+            for item in case_feedback_items(snapshot)
+            if item.decision is None
+            and (
+                message_sequence is None
+                or item.message_sequence == message_sequence
+            )
+        )
+        if not feedback_items:
+            await self._case_review_error(
+                interaction, _("No unresolved image evidence remains.")
+            )
+            return
+        await interaction.response.send_message(
+            _("Choose an image to review."),
+            view=DetectionIndividualView(self, feedback_items),
+            ephemeral=True,
+        )
+
+    async def _record_publication_failure(self, case_id: str, error: BaseException) -> None:
+        now = datetime.now(timezone.utc)
+        snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+        latest_sequence = max(
+            (message.sequence for message in snapshot.messages), default=0
+        )
+        operation = await asyncio.to_thread(
+            self._case_store.ensure_operation,
+            case_id,
+            "review_publish",
+            f"review_publish:{case_id}:{latest_sequence}",
+            latest_sequence or None,
+        )
+        running = await asyncio.to_thread(
+            self._case_store.claim_operation,
+            operation.operation_id,
+            now,
+        )
+        if running is None or running.claim_token is None:
+            return
+        await asyncio.to_thread(
+            self._case_store.fail_operation,
+            running.operation_id,
+            running.claim_token,
+            f"{type(error).__name__}: {error}",
+            now,
+            now + timedelta(minutes=1),
+        )
+
+    async def _process_detected_message(
+        self,
+        message: discord.Message,
+        config: dict,
+        logs_channel: discord.TextChannel | discord.Thread | None,
+        signals: tuple[DetectionSignal, ...],
+        *,
+        timings: dict[str, float] | None = None,
+        admission_lock: asyncio.Lock | None = None,
+    ) -> None:
+        timings = timings if timings is not None else {}
+        role_id = config.get("mute_role")
+
+        def initial_operations(owned_signals):
+            action = effective_action(owned_signals)
+            whitelist_bypass = bool(owned_signals) and all(
+                signal.metadata.get("whitelist_bypass") for signal in owned_signals
+            )
+            publish_review = config.get("review_enabled", True) and not whitelist_bypass
+            containment = any(
+                signal.action != ActionIntent.NONE
+                or (
+                    signal.detector == "honeypot"
+                    and not signal.metadata.get("whitelist_bypass")
+                )
+                or signal.metadata.get("containment_required")
+                for signal in owned_signals
+            )
+            operations = []
+            if publish_review:
+                operations.append(
+                    ("review_publish", "review_publish:{case_id}:{sequence}")
+                )
+            if containment or message.attachments:
+                operations.append(
+                    ("message_process", "message-process:{case_id}:{sequence}")
+                )
+            if action in {ActionIntent.KICK, ActionIntent.BAN}:
+                operations.append(
+                    (
+                        "moderation_action",
+                        f"moderation_action:{{case_id}}:{{sequence}}:{action.value}",
+                    )
+                )
+            if (
+                role_id is not None
+                and action is ActionIntent.REVIEW
+                and not config.get("dry_run")
+            ):
+                operations.append(
+                    ("role_apply", f"role-apply:{{case_id}}:{int(role_id)}")
+                )
+            return tuple(operations)
+
+        tracking_firstpost = config.get("firstpost_enabled", False) or config.get(
+            "firstpost_collect_enabled", False
+        )
+        admission_started = perf_counter()
+        try:
+            append = await asyncio.to_thread(
+                self._case_store.append_message,
+                self._new_case_message(message),
+                signals,
+                initial_operations,
+                claim_firstpost=tracking_firstpost,
+            )
+        finally:
+            if admission_lock is not None:
+                admission_lock.release()
+        timings["admission_ms"] = (perf_counter() - admission_started) * 1000
+        if append is None:
+            self._firstpost_seen_authors[message.guild.id].add(message.author.id)
+            return
+        if tracking_firstpost:
+            self._firstpost_seen_authors[message.guild.id].add(message.author.id)
+            if append.firstpost_claimed:
+                self._firstpost_dirty_seen_authors[message.guild.id].add(
+                    message.author.id
+                )
+                await self._increment_stat(message.guild, "firstpost_seen")
+        admitted_snapshot = await asyncio.to_thread(
+            self._case_store.get_case, append.case.case_id
+        )
+        persisted_signals = tuple(
+            item.signal
+            for item in admitted_snapshot.signals
+            if item.message_sequence == append.message.sequence
+        )
+        if append.message_created:
+            await self._record_detection_stats(message.guild, persisted_signals)
+        if append.message_created and any(
+            signal.metadata.get("whitelist_bypass") for signal in persisted_signals
+        ):
+            await self._increment_stat(message.guild, "whitelisted")
+        durable_operations = initial_operations(persisted_signals)
+        if not append.message_created:
+            for operation_type, idempotency_key in durable_operations:
+                await asyncio.to_thread(
+                    self._case_store.ensure_operation,
+                    append.case.case_id,
+                    operation_type,
+                    idempotency_key.format(
+                        case_id=append.case.case_id,
+                        sequence=append.message.sequence,
+                    ),
+                    append.message.sequence,
+                )
+            admitted_snapshot = await asyncio.to_thread(
+                self._case_store.get_case, append.case.case_id
+            )
+        pipeline_operation = next(
+            (
+                operation
+                for operation in admitted_snapshot.operations
+                if operation.operation_type == "message_process"
+                and operation.message_sequence == append.message.sequence
+            ),
+            None,
+        )
+        pipeline_claim = (
+            await asyncio.to_thread(
+                self._case_store.claim_operation,
+                pipeline_operation.operation_id,
+                datetime.now(timezone.utc),
+            )
+            if pipeline_operation is not None
+            else None
+        )
+        if pipeline_operation is not None:
+            if pipeline_claim is None:
+                if (
+                    not append.message_created
+                    and pipeline_operation.status.value == "succeeded"
+                ):
+                    for child_type in (
+                        "moderation_action",
+                        "role_apply",
+                        "review_publish",
+                    ):
+                        await self._execute_detection_message_child(
+                            admitted_snapshot,
+                            child_type,
+                            append.message.sequence,
+                            datetime.now(timezone.utc),
+                            publication_channel=logs_channel,
+                        )
+                    if any(
+                        operation.operation_type == "review_publish"
+                        and operation.message_sequence == append.message.sequence
+                        for operation in admitted_snapshot.operations
+                    ):
+                        await self._publish_detection_case(
+                            append.case.case_id, config, logs_channel
+                        )
+                return
+            await self._execute_detection_case_operation(
+                pipeline_claim,
+                datetime.now(timezone.utc),
+                publication_channel=logs_channel,
+                live_message=message,
+                timings=timings,
+            )
+            return
+
+        review_operation = next(
+            (
+                operation
+                for operation in admitted_snapshot.operations
+                if operation.operation_type == "review_publish"
+                and operation.message_sequence == append.message.sequence
+            ),
+            None,
+        )
+        if review_operation is not None:
+            review_claim = await asyncio.to_thread(
+                self._case_store.claim_operation,
+                review_operation.operation_id,
+                datetime.now(timezone.utc),
+            )
+            if review_claim is not None:
+                await self._execute_detection_case_operation(
+                    review_claim,
+                    datetime.now(timezone.utc),
+                    publication_channel=logs_channel,
+                )
+            elif (
+                not append.message_created
+                and review_operation.status.value == "succeeded"
+            ):
+                await self._publish_detection_case(
+                    append.case.case_id, config, logs_channel
+                )
+        return
     async def _suspicion_reasons(self, message: discord.Message, config: dict) -> list[str]:
         reasons: list[str] = []
         content = message.content.lower()
@@ -2561,6 +5585,25 @@ class Honeypot(Cog):
     ) -> typing.Any | None:
         return guild.get_channel(channel_id) or guild.get_thread(channel_id)
 
+    def _count_recent_cached_user_messages(
+        self,
+        guild: discord.Guild,
+        user_id: int,
+        config: dict,
+        *,
+        exclude_message_id: int | None = None,
+    ) -> int:
+        retention_seconds = self._purge_retention_seconds(config)
+        self._prune_recent_user_messages(
+            guild.id, user_id, retention_seconds=retention_seconds
+        )
+        refs = self._recent_user_messages.get(guild.id, {}).get(user_id, ())
+        return sum(
+            1
+            for ref in refs
+            if exclude_message_id is None or ref.message_id != exclude_message_id
+        )
+
     async def _delete_cached_message_ref(
         self, guild: discord.Guild, user_id: int, ref: MessageRef
     ) -> bool:
@@ -2597,15 +5640,15 @@ class Honeypot(Cog):
             guild.id, user_id, retention_seconds=retention_seconds
         )
         refs = list(self._recent_user_messages.get(guild.id, {}).get(user_id, ()))
-        total = 0
+        deleted = 0
         for ref in refs:
             if exclude_message_id is not None and ref.message_id == exclude_message_id:
                 continue
             if await self._delete_cached_message_ref(guild, user_id, ref):
-                total += 1
-        return total
+                deleted += 1
+        return deleted
 
-    def _count_recent_cached_user_messages(
+    async def _cached_purge_user_messages(
         self,
         guild: discord.Guild,
         user_id: int,
@@ -2613,16 +5656,41 @@ class Honeypot(Cog):
         *,
         exclude_message_id: int | None = None,
     ) -> int:
-        retention_seconds = self._purge_retention_seconds(config)
-        self._prune_recent_user_messages(
-            guild.id, user_id, retention_seconds=retention_seconds
+        deleted = await self._delete_recent_cached_user_messages(
+            guild,
+            user_id,
+            exclude_message_id=exclude_message_id,
+            retention_seconds=self._purge_retention_seconds(config),
         )
-        refs = self._recent_user_messages.get(guild.id, {}).get(user_id, ())
-        return sum(
-            1
-            for ref in refs
-            if exclude_message_id is None or ref.message_id != exclude_message_id
+        self._activate_forward_purge(guild.id, user_id, config)
+        return deleted
+
+    def _schedule_post_ban_sweep(self, guild: discord.Guild, user_id: int) -> None:
+        """After a ban, delete recent cached messages that Discord may have missed."""
+        task = self.bot.loop.create_task(
+            self._post_ban_message_sweep(guild.id, user_id),
+            name=f"honeypot-post-ban-sweep-{guild.id}-{user_id}",
         )
+        self._post_ban_sweep_tasks.add(task)
+        task.add_done_callback(self._post_ban_sweep_tasks.discard)
+
+    async def _post_ban_message_sweep(self, guild_id: int, user_id: int) -> None:
+        try:
+            await asyncio.sleep(POST_BAN_SWEEP_DELAY_SECONDS)
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                return
+            config = await self.config.guild(guild).all()
+            deleted = await self._cached_purge_user_messages(guild, user_id, config)
+            if deleted:
+                await self._increment_stat(guild, "purged_messages", deleted)
+                await self._increment_stat(guild, "cached_purge_deletes", deleted)
+        except Exception:
+            log.exception(
+                "Post-ban cached message purge failed for user %s in guild %s",
+                user_id,
+                guild_id,
+            )
 
     def _dry_run_purge_label(
         self,
@@ -2651,45 +5719,60 @@ class Honeypot(Cog):
             forward=forward_seconds,
         )
 
-    async def _cached_purge_user_messages(
+    async def _purge_detection_case_cached_messages(
         self,
         guild: discord.Guild,
         user_id: int,
         config: dict,
+        case_id: str,
+        message_sequence: int,
         *,
         exclude_message_id: int | None = None,
     ) -> int:
         retention_seconds = self._purge_retention_seconds(config)
-        deleted = await self._delete_recent_cached_user_messages(
-            guild,
-            user_id,
-            exclude_message_id=exclude_message_id,
-            retention_seconds=retention_seconds,
+        self._prune_recent_user_messages(
+            guild.id, user_id, retention_seconds=retention_seconds
         )
-        self._activate_forward_purge(guild.id, user_id, config)
-        return deleted
-
-    async def _purge_after_review_action(self, guild: discord.Guild, user_id: int, config: dict) -> None:
-        deleted = await self._cached_purge_user_messages(guild, user_id, config)
-        if deleted:
-            await self._increment_stat(guild, "purged_messages", deleted)
-            await self._increment_stat(guild, "cached_purge_deletes", deleted)
-
-    async def _delete_forward_purge_message(self, message: discord.Message) -> bool:
-        try:
-            await message.delete()
-            return True
-        except discord.NotFound:
-            return False
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.debug(
-                "Failed to forward-purge message %s from user %s in guild %s: %r",
-                message.id,
-                message.author.id,
-                message.guild.id if message.guild else "unknown",
-                exc,
+        refs = tuple(self._recent_user_messages.get(guild.id, {}).get(user_id, ()))
+        deleted = 0
+        for ref in refs:
+            if exclude_message_id is not None and ref.message_id == exclude_message_id:
+                continue
+            operation = await asyncio.to_thread(
+                self._case_store.ensure_operation,
+                case_id,
+                "cached_purge",
+                f"cached_purge:{case_id}:{ref.channel_id}:{ref.message_id}",
+                message_sequence,
             )
-            return False
+            now = datetime.now(timezone.utc)
+            if operation.status.value == "failed" and operation.retry_at is not None:
+                now = max(now, operation.retry_at)
+            claimed = await asyncio.to_thread(
+                self._case_store.claim_operation, operation.operation_id, now
+            )
+            if claimed is not None:
+                if config.get("dry_run"):
+                    await asyncio.to_thread(
+                        self._case_store.complete_operation,
+                        claimed.operation_id,
+                        claimed.claim_token,
+                        now,
+                        "planned",
+                    )
+                else:
+                    await self._execute_detection_case_operation(claimed, now)
+            snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+            persisted = next(
+                item
+                for item in snapshot.operations
+                if item.operation_id == operation.operation_id
+            )
+            if persisted.result == DeleteStatus.DELETED.value:
+                deleted += 1
+        if not config.get("dry_run"):
+            self._activate_forward_purge(guild.id, user_id, config)
+        return deleted
 
     def _firstpost_suspicion_reasons(
         self, message: discord.Message, config: dict
@@ -2713,31 +5796,6 @@ class Honeypot(Cog):
                     )
                 )
         return reasons
-
-    async def _delete_firstpost_current_message(self, message: discord.Message) -> bool:
-        try:
-            await message.delete()
-            return True
-        except discord.NotFound:
-            return True
-        except discord.HTTPException:
-            log.debug("Failed to delete firstpost message from user %s", message.author.id)
-            return False
-
-    async def _finish_firstpost_response(
-        self, message: discord.Message, config: dict, *, message_deleted: bool
-    ) -> None:
-        if config.get("dry_run"):
-            return
-        purged = await self._cached_purge_user_messages(
-            message.guild,
-            message.author.id,
-            config,
-            exclude_message_id=message.id if message_deleted else None,
-        )
-        if purged:
-            await self._increment_stat(message.guild, "purged_messages", purged)
-            await self._increment_stat(message.guild, "cached_purge_deletes", purged)
 
     def _spam_suspicion_reasons(self, message: discord.Message, config: dict) -> list[str]:
         window_seconds = int(config.get("spam_window_seconds", 10) or 10)
@@ -2765,609 +5823,71 @@ class Honeypot(Cog):
             )
         ]
 
-    async def _delete_spam_current_message(self, message: discord.Message) -> bool:
-        try:
-            await message.delete()
-            return True
-        except discord.NotFound:
-            return True
-        except discord.HTTPException:
-            log.debug("Failed to delete spam message from user %s", message.author.id)
-            return False
 
-    async def _finish_spam_response(
-        self, message: discord.Message, config: dict, *, message_deleted: bool
-    ) -> None:
-        if config.get("dry_run"):
-            return
-        purged = await self._cached_purge_user_messages(
-            message.guild,
-            message.author.id,
-            config,
-            exclude_message_id=message.id if message_deleted else None,
-        )
-        if purged:
-                await self._increment_stat(message.guild, "purged_messages", purged)
-                await self._increment_stat(message.guild, "cached_purge_deletes", purged)
-
-    async def _prepare_imagescan_learning_feedback(
-        self,
-        message: discord.Message,
-        config: dict,
-        embed: discord.Embed,
-        attachment_snapshots: list[dict[str, typing.Any]],
-    ) -> ImageScanFeedbackView | None:
-        image_items = [
-            (index, attachment, attachment_snapshots[index])
-            for index, attachment in enumerate(message.attachments[: len(attachment_snapshots)])
-            if self._imagescan_is_image_attachment(attachment)
-        ]
-        if not image_items:
-            embed.add_field(
-                name=_("Image Detection:"),
-                value=_(format_image_detection_status("no_images")),
-                inline=False,
-            )
-            return None
-
-        considered = image_items
-        samples = await self._imagescan_load_samples(message.guild.id)
-        if not any(sample.decision == "true_positive" for sample in samples):
-            embed.add_field(
-                name=_("Image Detection:"),
-                value=_(format_image_detection_status("not_checked")),
-                inline=False,
-            )
-            return None
-
-        state = await self._imagescan_model_state(
-            message.guild.id,
-            int(config.get("imagescan_detector_threshold", 20)),
-        )
-        if not state["valid"]:
-            embed.add_field(
-                name=_("Image Detection:"),
-                value=_(format_image_detection_status("not_checked")),
-                inline=False,
-            )
-            return None
-
-        feedback_items: list[tuple[discord.Attachment, int, bytes]] = []
-        has_known_match = False
-        for message_index, attachment, snapshot in considered:
-            data = snapshot.get("data")
-            if data is None:
-                continue
-            try:
-                hashes = await asyncio.to_thread(image_hashes_from_bytes, data)
-            except Exception:
-                log.debug("Failed to hash imagescan learning attachment %s", attachment.filename, exc_info=True)
-                continue
-            result = match_image(hashes, samples, int(state["effective_threshold"]))
-            if result["matched"] or result.get("exact_decision") is not None:
-                has_known_match = True
-            feedback_items.append((attachment, message_index + 1, data))
-
-        status = "queued" if feedback_items else image_learning_status(
-            has_images=True,
-            has_known_match=has_known_match,
-            can_queue=False,
-        )
-        embed.add_field(
-            name=_("Image Detection:"),
-            value=_(format_image_detection_status(status)),
-            inline=False,
-        )
-        if status != "queued":
-            return None
-        return ImageScanFeedbackView(self, message, feedback_items)
-
-    async def _send_imagescan_feedback_messages(
-        self,
-        channel: discord.TextChannel | discord.Thread | None,
-        message: discord.Message,
-        view: ImageScanFeedbackView | None,
-    ) -> None:
-        if channel is None or view is None:
-            return
-        try:
-            await channel.send(
-                view.status_content(),
-                view=view,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except discord.HTTPException:
-            log.debug("Failed to send imagescan feedback message for %s", message.id)
-
-    async def _handle_imagescan_detector_message(
-        self,
-        message: discord.Message,
-        config: dict,
-        logs_channel: discord.TextChannel | discord.Thread | None,
-    ) -> bool:
-        if not config.get("imagescan_detector_enabled", False):
-            return False
-        trigger_batch, remaining_batch = imagescan_detector_batches(message.attachments)
-        if not trigger_batch:
-            return False
-
-        started_at = datetime.now(timezone.utc)
-        profile: dict[str, int] = {
-            "messages_scanned": 1,
-            "messages_with_images": 1,
-            "images_considered": len(trigger_batch),
-            "images_ignored_over_limit": len(remaining_batch),
-        }
-        samples = await self._imagescan_load_samples(message.guild.id)
-        if not any(sample.decision == "true_positive" for sample in samples):
-            await self._imagescan_increment_profile(message.guild.id, profile)
-            return False
-        state = await self._imagescan_model_state(
-            message.guild.id,
-            int(config.get("imagescan_detector_threshold", 20)),
-        )
-        if not state["valid"]:
-            await self._imagescan_increment_profile(message.guild.id, profile)
-            return False
-
-        matches: list[tuple[discord.Attachment, dict[str, typing.Any], dict[str, str]]] = []
-
-        async def scan_batch(attachments: list[discord.Attachment]) -> None:
-            for attachment in attachments:
-                download_started = datetime.now(timezone.utc)
-                try:
-                    data = await attachment.read(use_cached=True)
-                except (discord.HTTPException, discord.Forbidden, discord.NotFound, TypeError):
-                    continue
-                profile["download_ms_total"] = profile.get("download_ms_total", 0) + int(
-                    (datetime.now(timezone.utc) - download_started).total_seconds() * 1000
-                )
-                profile["download_ms_count"] = profile.get("download_ms_count", 0) + 1
-
-                hash_started = datetime.now(timezone.utc)
-                try:
-                    hashes = await asyncio.to_thread(image_hashes_from_bytes, data)
-                except Exception:
-                    log.debug("Failed to hash imagescan attachment %s", attachment.filename, exc_info=True)
-                    continue
-                profile["hash_ms_total"] = profile.get("hash_ms_total", 0) + int(
-                    (datetime.now(timezone.utc) - hash_started).total_seconds() * 1000
-                )
-                profile["hash_ms_count"] = profile.get("hash_ms_count", 0) + 1
-
-                compare_started = datetime.now(timezone.utc)
-                result = match_image(hashes, samples, int(state["effective_threshold"]))
-                profile["compare_ms_total"] = profile.get("compare_ms_total", 0) + int(
-                    (datetime.now(timezone.utc) - compare_started).total_seconds() * 1000
-                )
-                profile["compare_ms_count"] = profile.get("compare_ms_count", 0) + 1
-                if result["matched"]:
-                    matches.append((attachment, result, hashes))
-                    if result["exact_decision"] == "true_positive":
-                        profile["exact_tp_hits"] = profile.get("exact_tp_hits", 0) + 1
-                    else:
-                        profile["flagged_tp_hits"] = profile.get("flagged_tp_hits", 0) + 1
-
-        await scan_batch(trigger_batch)
-        if matches and remaining_batch:
-            await scan_batch(remaining_batch)
-            profile["images_considered"] = len(trigger_batch) + len(remaining_batch)
-            profile["images_ignored_over_limit"] = 0
-
-        profile["decision_ms_total"] = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
-        profile["decision_ms_count"] = 1
-        await self._imagescan_increment_profile(message.guild.id, profile)
-        if not matches:
-            return False
-
-        attachment_snapshots = await self._snapshot_attachments(message)
-        feedback_items = imagescan_feedback_items(message.attachments, attachment_snapshots)
-        feedback_view = ImageScanFeedbackView(self, message, feedback_items) if feedback_items else None
-        embed = discord.Embed(
-            title=_("Honeypot hit"),
-            description=f">>> {message.content}" if message.content else _("*(message with attachments only)*"),
-            color=discord.Color.red(),
-            timestamp=message.created_at,
-        )
-        embed.set_author(
-            name=f"{message.author.display_name} ({message.author.id})",
-            icon_url=message.author.display_avatar,
-        )
-        embed.set_thumbnail(url=message.author.display_avatar)
-        embed.add_field(name=_("Reason:"), value=_("Honeypot"), inline=False)
-        embed.add_field(name=_("Channel:"), value=getattr(message.channel, "mention", f"<#{message.channel.id}>"), inline=True)
-        attachment_field = _("Matched attachments:") if len(matches) != 1 else _("Matched attachment:")
-        embed.add_field(
-            name=attachment_field,
-            value=format_imagescan_matched_attachments(matches),
-            inline=False,
-        )
-        embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
-
-        action = config.get("imagescan_detector_action", "review")
-        if action not in IMAGE_SCAN_DETECTOR_ACTION_OPTIONS:
-            action = "review"
-        review_channel = self._get_text_channel_or_thread(message.guild, config.get("review_channel"))
-        message_deleted = False
-        if action == "review":
-            if review_channel is not None:
-                merged = await self._send_review(
-                    message,
-                    config,
-                    embed,
-                    review_channel,
-                    logs_channel,
-                    attachment_snapshots,
-                )
-                if not merged and feedback_view is not None:
-                    try:
-                        await review_channel.send(
-                            feedback_view.status_content(),
-                            view=feedback_view,
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                    except discord.HTTPException:
-                        log.debug("Failed to send imagescan feedback message for %s", message.id)
-            else:
-                embed.color = discord.Color.orange()
-                embed.add_field(name=_("Action:"), value=_("Review channel is not configured."), inline=False)
-                await self._send_log(logs_channel, embed, attachment_snapshots, view=feedback_view)
-            if not config.get("dry_run"):
-                message_deleted = await self._delete_spam_current_message(message)
-            await self._finish_spam_response(message, config, message_deleted=message_deleted)
-            return True
-        if action in ("kick", "ban"):
-            action_label, failed = await self._execute_action(
-                message,
-                config,
-                reason="Honeypot",
-                action=action,
-            )
-            embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
-            if failed:
-                embed.color = discord.Color.dark_red()
-            if not config.get("dry_run"):
-                message_deleted = await self._delete_spam_current_message(message)
-            await self._send_log(logs_channel, embed, attachment_snapshots, view=feedback_view)
-            await self._finish_spam_response(message, config, message_deleted=message_deleted)
-            return True
-
-        embed.add_field(name=_("Action:"), value=_("Detector matched; no punishment configured."), inline=False)
-        await self._send_log(logs_channel, embed, attachment_snapshots, view=feedback_view)
-        return True
-
-    async def _handle_spam_message(
-        self,
-        message: discord.Message,
-        config: dict,
-        logs_channel: discord.TextChannel | discord.Thread | None,
-    ) -> bool:
-        if not config.get("spam_enabled", False):
-            return False
-        suspicion_reasons = self._spam_suspicion_reasons(message, config)
-        if not suspicion_reasons:
-            return False
-        await self._increment_stat(message.guild, "spam_hits")
-        action = config.get("spam_action", "review")
-        if action not in CORE_ACTION_OPTIONS:
-            action = "review"
-        if action == "none":
-            return False
-
-        attachment_snapshots = await self._snapshot_attachments(message)
-        embed: discord.Embed = discord.Embed(
-            title=_("Spam hit"),
-            description=f">>> {message.content}" if message.content else _("*(message with attachments only)*"),
-            color=discord.Color.red(),
-            timestamp=message.created_at,
-        )
-        embed.set_author(
-            name=f"{message.author.display_name} ({message.author.id})",
-            icon_url=message.author.display_avatar,
-        )
-        embed.set_thumbnail(url=message.author.display_avatar)
-        attachment_summary = self._attachment_summary(attachment_snapshots)
-        if attachment_summary:
-            embed.add_field(
-                name=_("Attachments:"),
-                value=attachment_summary,
-                inline=False,
-            )
-        embed.add_field(
-            name=_("Trigger reasons:"),
-            value="\n".join(f"- {reason}" for reason in suspicion_reasons),
-            inline=False,
-        )
-        embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
-        feedback_views = await self._prepare_imagescan_learning_feedback(message, config, embed, attachment_snapshots)
-
-        review_channel = None
-        if config.get("review_channel") is not None:
-            review_channel = self._get_text_channel_or_thread(message.guild, config["review_channel"])
-
-        message_deleted = False
-        if action == "review":
-            if config.get("dry_run"):
-                embed.add_field(
-                    name=_("Purge:"),
-                    value=self._dry_run_purge_label(
-                        message.guild,
-                        message.author.id,
-                        config,
-                        include_current_message=True,
-                        current_message_id=message.id,
-                    ),
-                    inline=False,
-                )
-            if review_channel is not None:
-                merged = await self._send_review(
-                    message,
-                    config,
-                    embed,
-                    review_channel,
-                    logs_channel,
-                    attachment_snapshots,
-                )
-                if not merged:
-                    await self._send_imagescan_feedback_messages(review_channel, message, feedback_views)
-                await self._increment_stat(message.guild, "spam_reviews")
-                await self._increment_stat(message.guild, "spam_catches")
-            else:
-                embed.color = discord.Color.orange()
-                embed.add_field(
-                    name=_("Action:"),
-                    value=_("No action taken. Spam review needs a review channel."),
-                    inline=False,
-                )
-                await self._send_log(logs_channel, embed, attachment_snapshots)
-                await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
-            if not config.get("dry_run"):
-                message_deleted = await self._delete_spam_current_message(message)
-            await self._finish_spam_response(message, config, message_deleted=message_deleted)
-            return True
-
-        action_label, failed = await self._execute_action(
-            message,
-            config,
-            reason="Same message in multiple channels",
-            action=action,
-        )
-        embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
-        if failed:
-            embed.color = discord.Color.dark_red()
-            embed.add_field(name=_("Staff check needed:"), value=_("Spam action failed."), inline=False)
-        else:
-            await self._increment_stat(message.guild, "spam_catches")
-            if action == "kick":
-                await self._increment_stat(message.guild, "spam_kicks")
-            elif action == "ban":
-                await self._increment_stat(message.guild, "spam_bans")
-        if config.get("dry_run"):
-            embed.add_field(
-                name=_("Purge:"),
-                value=self._dry_run_purge_label(
-                    message.guild,
-                    message.author.id,
-                    config,
-                    include_current_message=True,
-                    current_message_id=message.id,
-                ),
-                inline=False,
-            )
-        else:
-            message_deleted = await self._delete_spam_current_message(message)
-        await self._send_log(logs_channel, embed, attachment_snapshots)
-        await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
-        await self._finish_spam_response(message, config, message_deleted=message_deleted)
-        return True
-
-    async def _handle_firstpost_message(
-        self,
-        message: discord.Message,
-        config: dict,
-        logs_channel: discord.TextChannel | discord.Thread | None,
-    ) -> bool:
-        firstpost_enabled = config.get("firstpost_enabled", False)
-        collect_enabled = config.get("firstpost_collect_enabled", False)
-        if not firstpost_enabled and not collect_enabled:
-            return False
-        if not await self._mark_firstpost_seen(message.guild, message.author.id):
-            return False
-        if not firstpost_enabled:
-            return False
-        suspicion_reasons = self._firstpost_suspicion_reasons(message, config)
-        if not suspicion_reasons:
-            return False
-        await self._increment_stat(message.guild, "firstpost_hits")
-        action = config.get("firstpost_action", "review")
-        if action not in CORE_ACTION_OPTIONS:
-            action = "review"
-        if action == "none":
-            return False
-
-        attachment_snapshots = await self._snapshot_attachments(message)
-        embed: discord.Embed = discord.Embed(
-            title=_("Firstpost hit"),
-            description=f">>> {message.content}" if message.content else _("*(message with attachments only)*"),
-            color=discord.Color.red(),
-            timestamp=message.created_at,
-        )
-        embed.set_author(
-            name=f"{message.author.display_name} ({message.author.id})",
-            icon_url=message.author.display_avatar,
-        )
-        embed.set_thumbnail(url=message.author.display_avatar)
-        attachment_summary = self._attachment_summary(attachment_snapshots)
-        if attachment_summary:
-            embed.add_field(
-                name=_("Attachments:"),
-                value=attachment_summary,
-                inline=False,
-            )
-        embed.add_field(
-            name=_("Trigger reasons:"),
-            value="\n".join(f"- {reason}" for reason in suspicion_reasons),
-            inline=False,
-        )
-        embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
-        feedback_views = await self._prepare_imagescan_learning_feedback(message, config, embed, attachment_snapshots)
-
-        review_channel = None
-        if config.get("review_channel") is not None:
-            review_channel = self._get_text_channel_or_thread(message.guild, config["review_channel"])
-
-        message_deleted = False
-        if action == "review":
-            if config.get("dry_run"):
-                embed.add_field(
-                    name=_("Purge:"),
-                    value=self._dry_run_purge_label(
-                        message.guild,
-                        message.author.id,
-                        config,
-                        include_current_message=True,
-                        current_message_id=message.id,
-                    ),
-                    inline=False,
-                )
-            if review_channel is not None:
-                merged = await self._send_review(
-                    message,
-                    config,
-                    embed,
-                    review_channel,
-                    logs_channel,
-                    attachment_snapshots,
-                )
-                if not merged:
-                    await self._send_imagescan_feedback_messages(review_channel, message, feedback_views)
-                await self._increment_stat(message.guild, "firstpost_reviews")
-                await self._increment_stat(message.guild, "early_catches")
-            else:
-                embed.color = discord.Color.orange()
-                embed.add_field(
-                    name=_("Action:"),
-                    value=_("No action taken. Firstpost review needs a review channel."),
-                    inline=False,
-                )
-                await self._send_log(logs_channel, embed, attachment_snapshots)
-                await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
-            if not config.get("dry_run"):
-                message_deleted = await self._delete_firstpost_current_message(message)
-            await self._finish_firstpost_response(message, config, message_deleted=message_deleted)
-            return True
-
-        action_label, failed = await self._execute_action(
-            message,
-            config,
-            reason="Suspicious first observed message.",
-            action=action,
-        )
-        embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
-        if failed:
-            embed.color = discord.Color.dark_red()
-            embed.add_field(name=_("Staff check needed:"), value=_("Firstpost action failed."), inline=False)
-        else:
-            await self._increment_stat(message.guild, "early_catches")
-            if action == "kick":
-                await self._increment_stat(message.guild, "firstpost_kicks")
-            elif action == "ban":
-                await self._increment_stat(message.guild, "firstpost_bans")
-        if config.get("dry_run"):
-            embed.add_field(
-                name=_("Purge:"),
-                value=self._dry_run_purge_label(
-                    message.guild,
-                    message.author.id,
-                    config,
-                    include_current_message=True,
-                    current_message_id=message.id,
-                ),
-                inline=False,
-            )
-        else:
-            message_deleted = await self._delete_firstpost_current_message(message)
-        await self._send_log(logs_channel, embed, attachment_snapshots)
-        await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
-        await self._finish_firstpost_response(message, config, message_deleted=message_deleted)
-        return True
-
-    def _schedule_post_ban_sweep(self, guild: discord.Guild, user_id: int) -> None:
-        """After ban: wait, then delete this user's recent cached messages."""
-        task = self.bot.loop.create_task(
-            self._post_ban_message_sweep(
-                guild.id, user_id
-            ),
-            name=f"honeypot-post-ban-sweep-{guild.id}-{user_id}",
-        )
-        self._post_ban_sweep_tasks.add(task)
-        task.add_done_callback(self._post_ban_sweep_tasks.discard)
-
-    async def _post_ban_message_sweep(self, guild_id: int, user_id: int) -> None:
-        try:
-            await asyncio.sleep(POST_BAN_SWEEP_DELAY_SECONDS)
-            guild = self.bot.get_guild(guild_id)
-            if guild is None:
-                return
-            config = await self.config.guild(guild).all()
-            deleted = await self._cached_purge_user_messages(guild, user_id, config)
-            if deleted:
-                await self._increment_stat(guild, "purged_messages", deleted)
-                await self._increment_stat(guild, "cached_purge_deletes", deleted)
-        except Exception:
-            log.exception(
-                "Post-ban cached message purge failed for user %s in guild %s",
-                user_id,
-                guild_id,
-            )
 
     async def _execute_action(
-        self, message: discord.Message, config: dict, reason: str, action: str | None = None
+        self,
+        guild: discord.Guild,
+        member: discord.Member | discord.User | discord.Object,
+        created_at: datetime,
+        config: dict,
+        reason: str,
+        action: str | None = None,
+        moderator: discord.Member | discord.User | discord.Object | None = None,
     ) -> tuple[str | None, str | None]:
-        """Execute the configured action (kick/ban) against the message author.
+        """Execute the configured action (kick/ban) against a guild member.
         Returns (action_label, failed_message) where failed_message is None on success.
         """
         action = action or config["action"]
         if action not in ("kick", "ban"):
             return (_("No action configured."), None)
         if config.get("dry_run"):
-            await self._increment_stat(message.guild, "dry_run_actions")
+            await self._increment_stat(guild, "dry_run_actions")
             return (self._dry_run_label(action), None)
-        missing_permission = self._missing_action_permission(message.guild, action)
+        missing_permission = self._missing_action_permission(guild, action)
         if missing_permission is not None:
-            await self._increment_stat(message.guild, "failed_actions")
+            await self._increment_stat(guild, "failed_actions")
             return (None, missing_permission)
         try:
             if action == "kick":
-                self._activate_forward_purge(message.guild.id, message.author.id, config)
+                self._activate_forward_purge(guild.id, member.id, config)
                 try:
-                    await message.author.kick(reason=reason)
+                    await member.kick(reason=reason)
                 except discord.NotFound:
                     if self._automated_kick_fail_warning_enabled(config):
-                        self._deactivate_forward_purge(message.guild.id, message.author.id)
-                        return await self._create_kick_fail_warning(message.guild, message.author.id)
+                        self._deactivate_forward_purge(guild.id, member.id)
+                        return await self._create_kick_fail_warning(guild, member.id)
                     raise
-                await self._increment_stat(message.guild, "kicked")
+                await self._increment_stat(guild, "kicked")
             elif action == "ban":
-                self._activate_forward_purge(message.guild.id, message.author.id, config)
-                await message.author.ban(
-                    reason=reason,
-                    delete_message_seconds=self._ban_delete_message_seconds(config),
-                )
-                self._schedule_post_ban_sweep(message.guild, message.author.id)
-                await self._increment_stat(message.guild, "banned")
+                self._activate_forward_purge(guild.id, member.id, config)
+                delete_message_seconds = self._ban_delete_message_seconds(config)
+                member_ban = getattr(member, "ban", None)
+                if callable(member_ban):
+                    await member_ban(
+                        reason=reason,
+                        delete_message_seconds=delete_message_seconds,
+                    )
+                else:
+                    await guild.ban(
+                        member,
+                        reason=reason,
+                        delete_message_seconds=delete_message_seconds,
+                    )
+                self._schedule_post_ban_sweep(guild, member.id)
+                await self._increment_stat(guild, "banned")
         except discord.HTTPException as e:
-            self._deactivate_forward_purge(message.guild.id, message.author.id)
-            await self._increment_stat(message.guild, "failed_actions")
+            self._deactivate_forward_purge(guild.id, member.id)
+            await self._increment_stat(guild, "failed_actions")
             return (None, _("**Action failed:**\n") + box(str(e), lang="py"))
         try:
             await modlog.create_case(
                 self.bot,
-                message.guild,
-                message.created_at,
+                guild,
+                created_at,
                 action_type=action,
-                user=message.author,
-                moderator=message.guild.me,
+                user=member,
+                moderator=moderator or guild.me,
                 reason=reason,
             )
         except Exception:
@@ -3375,208 +5895,14 @@ class Honeypot(Cog):
         label = _("The member has been kicked.") if action == "kick" else _("The member has been banned.")
         return (label, None)
 
-    def _format_review_channels(self, guild: discord.Guild, channel_ids: list[int]) -> str:
-        values = []
-        for channel_id in dict.fromkeys(channel_ids):
-            channel = self._get_text_channel_or_thread(guild, channel_id)
-            values.append(getattr(channel, "mention", f"<#{channel_id}>"))
-        return "\n".join(values) or _("Unknown channel")
 
-    @staticmethod
-    def _embed_field_index(embed: discord.Embed, *names: str) -> int | None:
-        for index, field in enumerate(embed.fields):
-            if field.name in names:
-                return index
-        return None
 
-    def _upsert_embed_field(
-        self,
-        embed: discord.Embed,
-        name: str,
-        value: str,
-        *,
-        inline: bool = False,
-        aliases: tuple[str, ...] = (),
-    ) -> None:
-        index = self._embed_field_index(embed, name, *aliases)
-        if index is None:
-            embed.add_field(name=name, value=value, inline=inline)
-        else:
-            embed.set_field_at(index, name=name, value=value, inline=inline)
 
-    @staticmethod
-    def _embed_trigger_reasons(embed: discord.Embed) -> list[str]:
-        index = Honeypot._embed_field_index(embed, _("Trigger reasons:"))
-        if index is None:
-            return []
-        reasons = []
-        for line in embed.fields[index].value.splitlines():
-            reason = line.strip()
-            if reason.startswith("- "):
-                reason = reason[2:].strip()
-            if reason:
-                reasons.append(reason)
-        return reasons
 
-    def _merge_embed_trigger_reasons(self, target: discord.Embed, source: discord.Embed) -> None:
-        reasons = list(dict.fromkeys(self._embed_trigger_reasons(target) + self._embed_trigger_reasons(source)))
-        if not reasons:
-            return
-        self._upsert_embed_field(
-            target,
-            _("Trigger reasons:"),
-            "\n".join(f"- {reason}" for reason in reasons),
-            inline=False,
-        )
 
-    async def _find_active_review_for_user(self, guild_id: int, user_id: int) -> ReviewView | None:
-        async with self._views_lock:
-            for view in self._active_views.values():
-                if (
-                    view.guild_id == guild_id
-                    and view.target_id == user_id
-                    and view.review_message is not None
-                    and not view._resolution_started
-                ):
-                    return view
-        return None
 
-    async def _update_pending_review_merge_data(self, guild: discord.Guild, view: ReviewView) -> None:
-        if view.active_key is None:
-            return
-        async with self.config.guild(guild).pending_reviews() as pending_reviews:
-            pending_review = pending_reviews.get(str(view.active_key))
-            if pending_review is not None:
-                pending_review["message_fingerprint"] = view.message_fingerprint
-                pending_review["channel_ids"] = view.channel_ids
 
-    async def _merge_into_active_review(
-        self,
-        view: ReviewView,
-        message: discord.Message,
-        embed: discord.Embed,
-        attachment_snapshots: list[dict[str, typing.Any]],
-    ) -> bool:
-        if view.review_message is None:
-            return False
-        active_embed = view.review_message.embeds[0] if view.review_message.embeds else None
-        if active_embed is None:
-            return False
-        merged_embed = discord.Embed.from_dict(active_embed.to_dict())
-        if message.channel.id not in view.channel_ids:
-            view.channel_ids.append(message.channel.id)
-        current_fingerprint = message_spam_fingerprint(message)
-        if view.message_fingerprint is None:
-            view.message_fingerprint = current_fingerprint
-        self._upsert_embed_field(
-            merged_embed,
-            _("Channels:"),
-            self._format_review_channels(message.guild, view.channel_ids),
-            inline=False,
-            aliases=(_("Channel:"),),
-        )
-        self._merge_embed_trigger_reasons(merged_embed, embed)
-        try:
-            await view.review_message.edit(embed=merged_embed, view=view)
-        except discord.HTTPException:
-            log.debug("Failed to merge review message %s", view.review_message.id)
-            return False
-        await self._update_pending_review_merge_data(message.guild, view)
-        return True
 
-    async def _send_review(
-        self,
-        message: discord.Message,
-        config: dict,
-        embed: discord.Embed,
-        review_channel: discord.TextChannel | discord.Thread,
-        logs_channel: discord.TextChannel | discord.Thread | None,
-        attachment_snapshots: list[dict[str, typing.Any]],
-    ) -> bool:
-        embed.color = discord.Color.gold()
-        embed.title = _("Review needed")
-        lock_key = (message.guild.id, message.author.id)
-        review_lock = self._review_creation_locks.setdefault(lock_key, asyncio.Lock())
-        await review_lock.acquire()
-        active_review = await self._find_active_review_for_user(*lock_key)
-        if active_review is not None and await self._merge_into_active_review(
-            active_review,
-            message,
-            embed,
-            attachment_snapshots,
-        ):
-            review_lock.release()
-            return True
-        self._upsert_embed_field(
-            embed,
-            _("Channels:"),
-            self._format_review_channels(message.guild, [message.channel.id]),
-            inline=False,
-            aliases=(_("Channel:"),),
-        )
-        embed.add_field(
-            name=_("Status:"),
-            value=_("Pending moderator review"),
-            inline=False,
-        )
-        pending_mute_role_id = None
-        if mute_role_id := config.get("mute_role"):
-            mute_role = message.guild.get_role(mute_role_id)
-            if mute_role is not None and mute_role not in message.author.roles:
-                try:
-                    await message.author.add_roles(
-                        mute_role,
-                        reason="Automated account status update.",
-                    )
-                    pending_mute_role_id = mute_role.id
-                    await self._increment_stat(message.guild, "pending_mutes")
-                    embed.add_field(
-                        name=_("Pending review mute:"),
-                        value=_("Mute successful :white_check_mark:"),
-                        inline=False,
-                    )
-                except discord.HTTPException:
-                    await self._increment_stat(message.guild, "pending_mute_failures")
-                    embed.add_field(
-                        name=_("Pending review mute:"),
-                        value=_("Mute failed :x:"),
-                        inline=False,
-                    )
-        attachment_urls = [a.url for a in message.attachments]
-        view = ReviewView(
-            self,
-            message.author.id,
-            message.guild.id,
-            message.content,
-            attachment_urls,
-            pending_mute_role_id=pending_mute_role_id,
-            review_timeout_minutes=config.get("review_timeout_minutes", 1440),
-            message_fingerprint=message_spam_fingerprint(message),
-            channel_ids=[message.channel.id],
-        )
-        embed.add_field(
-            name=_("Review expires in:"),
-            value=discord.utils.format_dt(view.expires_at, style="R"),
-            inline=False,
-        )
-        review_files = self._attachment_files(attachment_snapshots)
-        review_send_kwargs = {
-            "embed": embed,
-            "view": view,
-        }
-        if review_files:
-            review_send_kwargs["files"] = review_files
-        try:
-            sent = await review_channel.send(**review_send_kwargs)
-            view.review_message = sent
-            view.active_key = sent.id
-            async with self._views_lock:
-                self._active_views[sent.id] = view
-            await self._store_pending_review(message.guild, view, review_channel.id, sent.id)
-            await self._increment_stat(message.guild, "reviewed")
-            return False
-        finally:
-            review_lock.release()
 
     async def _send_log(
         self,
@@ -3607,268 +5933,57 @@ class Honeypot(Cog):
     async def on_message(self, message: discord.Message) -> None:
         if message.guild is None:
             return
-        if await self.bot.cog_disabled_in_guild(self, message.guild):
-            return
         if message.author.bot:
             return
         if message.webhook_id is not None:
             return
-        config = await self.config.guild(message.guild).all()
-        if not config["enabled"]:
-            return
-        logs_channel = self._get_text_channel_or_thread(message.guild, config.get("logs_channel"))
-        if await self._is_protected_member(message.author):
-            return
-        self._record_recent_user_message(message, config)
-        if self._is_forward_purge_active(message.guild.id, message.author.id):
-            if await self._delete_forward_purge_message(message):
-                await self._increment_stat(message.guild, "purged_messages")
-                await self._increment_stat(message.guild, "forward_purge_deletes")
-            return
-        configured_honeypot_channel_ids = self._honeypot_channel_ids_from_config(config)
-        if message.channel.id not in configured_honeypot_channel_ids:
-            if await self._handle_spam_message(message, config, logs_channel):
-                return
-            if await self._handle_firstpost_message(message, config, logs_channel):
-                return
-            if await self._handle_imagescan_detector_message(message, config, logs_channel):
-                return
-            return
-
-        attachment_snapshots = await self._snapshot_attachments(message)
-
-        if config.get("dry_run"):
-            message_deleted = False
-        else:
+        lock_index = (
+            message.guild.id * 31 + message.author.id
+        ) % len(self._detection_admission_locks)
+        batch_key = (message.guild.id, message.id)
+        pipeline_started = perf_counter()
+        admission_lock = self._detection_admission_locks[lock_index]
+        admission_lock_owned = False
+        try:
+            await admission_lock.acquire()
+            admission_lock_owned = True
             try:
-                await message.delete()
-                message_deleted = True
-            except discord.HTTPException:
-                message_deleted = False
-                log.debug("Failed to delete honeypot message from user %s", message.author.id)
-        await self._increment_stat(message.guild, "detections")
-
-        whitelisted_role_ids: list[int] = config.get("whitelisted_roles", [])
-        has_whitelist_role = any(
-            role.id in whitelisted_role_ids for role in message.author.roles
-        )
-
-        embed: discord.Embed = discord.Embed(
-            title=_("Honeypot hit"),
-            description=f">>> {message.content}" if message.content else _("*(message with attachments only)*"),
-            color=discord.Color.red(),
-            timestamp=message.created_at,
-        )
-        embed.set_author(
-            name=f"{message.author.display_name} ({message.author.id})",
-            icon_url=message.author.display_avatar,
-        )
-        embed.set_thumbnail(url=message.author.display_avatar)
-        attachment_summary = self._attachment_summary(attachment_snapshots)
-        if attachment_summary:
-            embed.add_field(
-                name=_("Attachments:"),
-                value=attachment_summary,
-                inline=False,
-            )
-        embed.add_field(
-            name=_("Channel:"),
-            value=getattr(message.channel, "mention", f"<#{message.channel.id}>"),
-            inline=True,
-        )
-        account_age = datetime.now(timezone.utc) - message.author.created_at
-        embed.add_field(
-            name=_("Account age:"),
-            value=_("{days} days").format(days=account_age.days),
-            inline=True,
-        )
-        if message.author.joined_at is not None:
-            joined_age = datetime.now(timezone.utc) - message.author.joined_at
-            embed.add_field(
-                name=_("Server age:"),
-                value=_("{days} days").format(days=joined_age.days),
-                inline=True,
-            )
-
-        if config.get("dry_run"):
-            embed.add_field(
-                name=_("Purge:"),
-                value=self._dry_run_purge_label(
-                    message.guild,
-                    message.author.id,
-                    config,
-                    include_current_message=True,
-                    current_message_id=message.id,
-                ),
-                inline=False,
-            )
-        else:
-            # Cached purge uses the configured event-retention window.
-            purged = await self._cached_purge_user_messages(
-                message.guild,
-                message.author.id,
-                config,
-                exclude_message_id=message.id if message_deleted else None,
-            )
-            if purged:
-                await self._increment_stat(message.guild, "purged_messages", purged)
-                await self._increment_stat(message.guild, "cached_purge_deletes", purged)
-                embed.add_field(
-                    name=_("Purged messages:"),
-                    value=str(purged),
-                    inline=True,
+                queue_wait_ms = (perf_counter() - pipeline_started) * 1000
+                if await self.bot.cog_disabled_in_guild(self, message.guild):
+                    return
+                config = await self.config.guild(message.guild).all()
+                if not config["enabled"]:
+                    return
+                logs_channel = self._get_text_channel_or_thread(
+                    message.guild, config.get("logs_channel")
                 )
-
-        force_review = False
-        force_fallback = False
-        if has_whitelist_role:
-            whitelist_mode = config.get("whitelist_mode", "bypass")
-            await self._increment_stat(message.guild, "whitelisted")
-            embed.add_field(
-                name=_("Whitelisted role:"),
-                value=_("Whitelist mode: `{mode}`").format(mode=whitelist_mode),
-                inline=False,
-            )
-            if whitelist_mode == "bypass":
-                feedback_views = await self._prepare_imagescan_learning_feedback(message, config, embed, attachment_snapshots)
-                embed.color = discord.Color.orange()
-                embed.add_field(name=_("Action:"), value=_("No action taken."), inline=False)
-                await self._send_log(logs_channel, embed, attachment_snapshots)
-                await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
-                return
-            if whitelist_mode == "review":
-                force_review = True
-            elif whitelist_mode == "fallback":
-                force_fallback = True
-
-        suspicion_reasons = await self._suspicion_reasons(message, config)
-        second_strike_role_ids = {
-            role_id
-            for role_id in (
-                config.get("mute_role"),
-                config.get("joinwatch_auto_role_id"),
-            )
-            if role_id
-        }
-        second_strike = bool(second_strike_role_ids) and any(
-            role.id in second_strike_role_ids for role in message.author.roles
-        )
-        if second_strike:
-            suspicion_reasons.append(_("Repeat honeypot activity"))
-        suspicious = bool(suspicion_reasons)
-        if suspicion_reasons:
-            await self._increment_stat(message.guild, "suspicious")
-            embed.add_field(
-                name=_("Trigger reasons:"),
-                value="\n".join(f"- {reason}" for reason in suspicion_reasons),
-                inline=False,
-            )
-        feedback_views = await self._prepare_imagescan_learning_feedback(message, config, embed, attachment_snapshots)
-
-        review_channel = None
-        if config.get("review_channel") is not None:
-            review_channel = self._get_text_channel_or_thread(message.guild, config["review_channel"])
-        action = config.get("action")
-        fallback_action = config.get("fallback_action", "review")
-        if second_strike and not force_review and not force_fallback:
-            action_label, failed = await self._execute_action(
-                message,
-                config,
-                reason="Suspicious Activity",
-                action="ban",
-            )
-            embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
-            if failed:
-                embed.color = discord.Color.dark_red()
-                embed.add_field(name=_("Staff check needed:"), value=_("Second strike action failed."), inline=False)
-            embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
-            await self._send_log(
-                logs_channel,
-                embed,
-                attachment_snapshots,
-            )
-            await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
-            return
-        should_review = force_review or (
-            action == "review"
-            and config["review_enabled"]
-            and review_channel is not None
-        ) or (
-            (not suspicious or force_fallback)
-            and fallback_action == "review"
-            and config["review_enabled"]
-            and review_channel is not None
-        )
-
-        if should_review and review_channel is not None:
-            if not suspicious or force_fallback:
-                embed.add_field(
-                    name=_("Review reason:"),
-                    value=_("Message posted in a honeypot channel without matching suspicious rules"),
-                    inline=False,
-                )
-            merged = await self._send_review(
-                message, config, embed, review_channel, logs_channel, attachment_snapshots
-            )
-            if not merged:
-                await self._send_imagescan_feedback_messages(review_channel, message, feedback_views)
-            return
-
-        if force_review and review_channel is None:
-            embed.color = discord.Color.orange()
-            embed.add_field(
-                name=_("Action:"),
-                value=_("No action taken. This whitelist mode needs a review channel, but none is available."),
-                inline=False,
-            )
-            await self._send_log(logs_channel, embed, attachment_snapshots)
-            await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
-            return
-
-        if suspicious and not force_fallback:
-            if action in ("review", "none"):
-                pass
-            else:
-                action_label, failed = await self._execute_action(
+                if await self._is_protected_member(message.author):
+                    return
+                self._record_recent_user_message(message, config)
+                signals_started = perf_counter()
+                signals = await self._collect_detection_signals(message, config)
+                timings = {
+                    "queue_wait_ms": queue_wait_ms,
+                    "signals_ms": (perf_counter() - signals_started) * 1000,
+                }
+                if not signals:
+                    return
+                admission_lock_owned = False
+                await self._process_detected_message(
                     message,
                     config,
-                    reason="Suspicious message in the honeypot channel.",
+                    logs_channel,
+                    signals,
+                    timings=timings,
+                    admission_lock=admission_lock,
                 )
-                embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
-                if failed:
-                    embed.color = discord.Color.dark_red()
-                    embed.add_field(name=_("Staff check needed:"), value=_("Automatic action failed."), inline=False)
+            finally:
+                if admission_lock_owned:
+                    admission_lock.release()
+        finally:
+            self._initial_image_scan_batches.pop(batch_key, None)
+        return
 
-        if not suspicious or force_fallback or suspicious and action in ("review", "none"):
-            if fallback_action == "none":
-                embed.color = discord.Color.orange()
-                embed.add_field(name=_("Action:"), value=_("No fallback action set."), inline=False)
-            elif fallback_action == "review":
-                embed.color = discord.Color.orange()
-                embed.add_field(
-                    name=_("Action:"),
-                    value=_("No fallback action taken. Review is unavailable."),
-                    inline=False,
-                )
-            else:
-                action_label, failed = await self._execute_action(
-                    message,
-                    config,
-                    reason="Message in the honeypot channel without a matching scam pattern.",
-                    action=fallback_action,
-                )
-                embed.add_field(name=_("Action:"), value=failed if failed else action_label, inline=False)
-                if failed:
-                    embed.color = discord.Color.dark_red()
-                    embed.add_field(name=_("Staff check needed:"), value=_("Fallback action failed."), inline=False)
-
-        embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
-        await self._send_log(
-            logs_channel,
-            embed,
-            attachment_snapshots,
-        )
-        await self._send_imagescan_feedback_messages(logs_channel, message, feedback_views)
 
     async def _execute_joinwatch_action(
         self,
@@ -4567,15 +6682,6 @@ class Honeypot(Cog):
         filename = (attachment.filename or "").lower()
         return filename.endswith(IMAGE_SCAN_EXTENSIONS)
 
-    def _imagescan_trigger_attachments(self, message: discord.Message) -> list[discord.Attachment]:
-        image_attachments = [
-            attachment
-            for attachment in message.attachments
-            if self._imagescan_is_image_attachment(attachment)
-        ]
-        if len(image_attachments) not in IMAGE_SCAN_COUNTS:
-            return []
-        return image_attachments
 
     @staticmethod
     def _imagescan_safe_filename(filename: str | None, index: int) -> str:
@@ -4583,197 +6689,15 @@ class Honeypot(Cog):
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or fallback).strip("._")
         return safe or fallback
 
-    @staticmethod
-    def _imagescan_image_dimensions(data: bytes) -> tuple[int | None, int | None]:
-        if Image is None:
-            return None, None
-        try:
-            with Image.open(io.BytesIO(data)) as image:
-                return image.width, image.height
-        except Exception:
-            return None, None
 
-    async def _imagescan_copy_attachments(
-        self,
-        guild_id: int,
-        event_id: str,
-        attachments: list[discord.Attachment],
-    ) -> list[dict[str, typing.Any]] | None:
-        event_dir = self._imagescan_files_path / str(guild_id) / event_id
-        event_dir.mkdir(parents=True, exist_ok=True)
-        records: list[dict[str, typing.Any]] = []
-        for index, attachment in enumerate(attachments, 1):
-            filename = self._imagescan_safe_filename(attachment.filename, index)
-            path = event_dir / f"{index:03d}-{filename}"
-            try:
-                data = await attachment.read(use_cached=True)
-            except (discord.HTTPException, discord.Forbidden, discord.NotFound, TypeError) as exc:
-                log.debug("Failed to copy imagescan attachment %s for event %s: %s", attachment.filename, event_id, exc)
-                shutil.rmtree(event_dir, ignore_errors=True)
-                return None
-            width, height = self._imagescan_image_dimensions(data)
-            path.write_bytes(data)
-            records.append(
-                {
-                    "event_id": event_id,
-                    "file_index": index,
-                    "filename": attachment.filename or filename,
-                    "path": str(path),
-                    "size": len(data),
-                    "content_type": attachment.content_type,
-                    "sha256": hashlib.sha256(data).hexdigest(),
-                    "width": width,
-                    "height": height,
-                }
-            )
-        return records
 
-    def _imagescan_event_exists_sync(self, guild_id: int, message_id: int) -> bool:
-        with sqlite3.connect(self._imagescan_db_path) as conn:
-            row = conn.execute(
-                "SELECT 1 FROM imagescan_events WHERE guild_id = ? AND message_id = ?",
-                (str(guild_id), str(message_id)),
-            ).fetchone()
-        return row is not None
 
-    async def _imagescan_event_exists(self, guild_id: int, message_id: int) -> bool:
-        async with self._imagescan_db_lock:
-            return await asyncio.to_thread(self._imagescan_event_exists_sync, guild_id, message_id)
 
-    def _imagescan_insert_event_sync(
-        self,
-        event: dict[str, typing.Any],
-        files: list[dict[str, typing.Any]],
-    ) -> None:
-        with sqlite3.connect(self._imagescan_db_path) as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO imagescan_events
-                (
-                    event_id, guild_id, user_id, channel_id, message_id, message_jump_url,
-                    review_channel_id, review_message_id, created_at, image_count, content,
-                    decision, moderator_id, decided_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event["event_id"],
-                    event["guild_id"],
-                    event["user_id"],
-                    event["channel_id"],
-                    event["message_id"],
-                    event["message_jump_url"],
-                    event.get("review_channel_id"),
-                    event.get("review_message_id"),
-                    event["created_at"],
-                    event["image_count"],
-                    event.get("content"),
-                    event.get("decision", "pending"),
-                    event.get("moderator_id"),
-                    event.get("decided_at"),
-                ),
-            )
-            conn.executemany(
-                """
-                INSERT OR REPLACE INTO imagescan_files
-                (event_id, file_index, filename, path, size, content_type, sha256, width, height)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        file_record["event_id"],
-                        file_record["file_index"],
-                        file_record["filename"],
-                        file_record["path"],
-                        file_record["size"],
-                        file_record.get("content_type"),
-                        file_record["sha256"],
-                        file_record.get("width"),
-                        file_record.get("height"),
-                    )
-                    for file_record in files
-                ],
-            )
 
-    async def _imagescan_insert_event(
-        self,
-        event: dict[str, typing.Any],
-        files: list[dict[str, typing.Any]],
-    ) -> None:
-        async with self._imagescan_db_lock:
-            await asyncio.to_thread(self._imagescan_insert_event_sync, event, files)
 
-    def _imagescan_update_review_message_sync(
-        self,
-        guild_id: int,
-        event_id: str,
-        review_channel_id: int,
-        review_message_id: int,
-    ) -> None:
-        with sqlite3.connect(self._imagescan_db_path) as conn:
-            conn.execute(
-                """
-                UPDATE imagescan_events
-                SET review_channel_id = ?, review_message_id = ?
-                WHERE guild_id = ? AND event_id = ?
-                """,
-                (str(review_channel_id), str(review_message_id), str(guild_id), event_id),
-            )
 
-    async def _imagescan_update_review_message(
-        self,
-        guild_id: int,
-        event_id: str,
-        review_channel_id: int,
-        review_message_id: int,
-    ) -> None:
-        async with self._imagescan_db_lock:
-            await asyncio.to_thread(
-                self._imagescan_update_review_message_sync,
-                guild_id,
-                event_id,
-                review_channel_id,
-                review_message_id,
-            )
 
-    def _imagescan_set_decision_sync(
-        self,
-        guild_id: int,
-        event_id: str,
-        decision: str,
-        moderator_id: int,
-    ) -> None:
-        with sqlite3.connect(self._imagescan_db_path) as conn:
-            conn.execute(
-                """
-                UPDATE imagescan_events
-                SET decision = ?, moderator_id = ?, decided_at = ?
-                WHERE guild_id = ? AND event_id = ?
-                """,
-                (
-                    decision,
-                    str(moderator_id),
-                    int(datetime.now(timezone.utc).timestamp()),
-                    str(guild_id),
-                    event_id,
-                ),
-            )
 
-    async def _imagescan_set_decision(
-        self,
-        guild_id: int,
-        event_id: str,
-        decision: str,
-        moderator_id: int,
-    ) -> None:
-        async with self._imagescan_db_lock:
-            await asyncio.to_thread(
-                self._imagescan_set_decision_sync,
-                guild_id,
-                event_id,
-                decision,
-                moderator_id,
-            )
 
     def _imagescan_counts_sync(self, guild_id: int) -> dict[str, int]:
         counts = {"pending": 0, "true_positive": 0, "false_positive": 0, "ignored": 0}
@@ -4832,106 +6756,8 @@ class Honeypot(Cog):
         async with self._imagescan_db_lock:
             return await asyncio.to_thread(self._imagescan_export_rows_sync, guild_id)
 
-    def _imagescan_review_files(self, file_records: list[dict[str, typing.Any]]) -> list[discord.File]:
-        files: list[discord.File] = []
-        for record in file_records[:10]:
-            path = Path(record["path"])
-            if not path.exists():
-                continue
-            files.append(discord.File(path, filename=path.name))
-        return files
 
-    async def _imagescan_send_review(
-        self,
-        message: discord.Message,
-        event_id: str,
-        review_channel: discord.TextChannel | discord.Thread,
-        file_records: list[dict[str, typing.Any]],
-    ) -> discord.Message | None:
-        embed = discord.Embed(
-            title=_("Image scan shadow review"),
-            description=f">>> {message.content}" if message.content else _("*(message with images only)*"),
-            color=discord.Color.blurple(),
-            timestamp=message.created_at,
-        )
-        embed.set_author(
-            name=f"{message.author.display_name} ({message.author.id})",
-            icon_url=message.author.display_avatar,
-        )
-        embed.add_field(
-            name=_("User:"),
-            value=f"{message.author.mention} (`{message.author.id}`)",
-            inline=False,
-        )
-        embed.add_field(
-            name=_("Channel:"),
-            value=getattr(message.channel, "mention", f"<#{message.channel.id}>"),
-            inline=True,
-        )
-        embed.add_field(name=_("Message:"), value=message.jump_url, inline=False)
-        embed.add_field(name=_("Image count:"), value=str(len(file_records)), inline=True)
-        embed.add_field(
-            name=_("Scan reason:"),
-            value=_("Exactly {count} image attachments").format(count=len(file_records)),
-            inline=False,
-        )
-        embed.add_field(name=_("Status:"), value=_("Pending classification"), inline=False)
-        embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
-        view = ImageScanReviewView(self, event_id, message.guild.id)
-        kwargs: dict[str, typing.Any] = {
-            "embed": embed,
-            "view": view,
-            "allowed_mentions": discord.AllowedMentions.none(),
-        }
-        files = self._imagescan_review_files(file_records)
-        if files:
-            kwargs["files"] = files
-        try:
-            sent = await review_channel.send(**kwargs)
-        except discord.HTTPException as exc:
-            log.warning("Failed to send imagescan review for message %s: %s", message.id, exc)
-            return None
-        view.review_message = sent
-        return sent
 
-    async def _handle_imagescan_message(self, message: discord.Message, config: dict) -> None:
-        if not config.get("imagescan_enabled", False):
-            return
-        review_channel_id = config.get("imagescan_channel")
-        if review_channel_id is None:
-            return
-        review_channel = self._get_text_channel_or_thread(message.guild, review_channel_id)
-        if review_channel is None:
-            return
-        attachments = self._imagescan_trigger_attachments(message)
-        if not attachments:
-            return
-        if await self._imagescan_event_exists(message.guild.id, message.id):
-            return
-        event_id = str(message.id)
-        file_records = await self._imagescan_copy_attachments(message.guild.id, event_id, attachments)
-        if file_records is None:
-            return
-        event = {
-            "event_id": event_id,
-            "guild_id": str(message.guild.id),
-            "user_id": str(message.author.id),
-            "channel_id": str(message.channel.id),
-            "message_id": str(message.id),
-            "message_jump_url": message.jump_url,
-            "review_channel_id": None,
-            "review_message_id": None,
-            "created_at": int(message.created_at.timestamp()),
-            "image_count": len(file_records),
-            "content": message.content or None,
-            "decision": "pending",
-            "moderator_id": None,
-            "decided_at": None,
-        }
-        await self._imagescan_insert_event(event, file_records)
-        sent = await self._imagescan_send_review(message, event_id, review_channel, file_records)
-        if sent is not None:
-            await self._imagescan_update_review_message(message.guild.id, event_id, review_channel.id, sent.id)
 
     async def _imagescan_create_dump_archives(self, guild_id: int) -> tuple[Path, list[Path]]:
         temp_root = Path(tempfile.mkdtemp(prefix="honeypot-imagescan-dump-"))
@@ -5966,29 +7792,32 @@ class Honeypot(Cog):
             await ctx.send(_("✅ Review enabled set to {value}").format(value=value))
 
     @review.command(name="channel")
-    async def review_channel(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread = None) -> None:
+    async def review_channel(
+        self, ctx: commands.Context, target: discord.TextChannel = None
+    ) -> None:
         """Set the channel for moderator review requests."""
         if target is None:
             v = await self.config.guild(ctx.guild).review_channel()
             await ctx.send(_("Review channel: {channel}").format(channel=ctx.guild.get_channel(v) if v else _("not set")))
         else:
-            missing = self._missing_channel_permissions(ctx.guild, target)
+            if not isinstance(target, discord.TextChannel):
+                raise commands.UserFeedbackCheckFailure(
+                    _("The review destination must be a normal text channel.")
+                )
+            missing = self._missing_channel_permissions(
+                ctx.guild,
+                target,
+                read_history=True,
+                create_public_threads=True,
+                send_in_threads=True,
+                embed_links=True,
+                attach_files=True,
+                manage_threads=True,
+            )
             if missing is not None:
                 raise commands.UserFeedbackCheckFailure(missing)
             await self.config.guild(ctx.guild).review_channel.set(target.id)
             await ctx.send(_("✅ Review channel set to {channel.mention}").format(channel=target))
-
-    @review.command()
-    async def timeout(self, ctx: commands.Context, minutes: int = None) -> None:
-        """Set how long pending reviews stay active."""
-        if minutes is None:
-            v = await self.config.guild(ctx.guild).review_timeout_minutes()
-            await ctx.send(_("Review timeout: {value} minutes").format(value=v))
-        elif minutes < 1 or minutes > 10080:
-            await ctx.send(_("Timeout must be between 1 and 10080 minutes."))
-        else:
-            await self.config.guild(ctx.guild).review_timeout_minutes.set(minutes)
-            await ctx.send(_("✅ Review timeout set to {value} minutes").format(value=minutes))
 
     @review.command(name="kick_fail_warn")
     async def review_kick_fail_warn(self, ctx: commands.Context, value: str = None) -> None:
@@ -6581,9 +8410,8 @@ class Honeypot(Cog):
             [
                 (_("Enabled"), self._format_bool_setting(config.get("review_enabled", False))),
                 (_("Channel"), self._format_channel_setting(ctx.guild, config.get("review_channel"))),
-                (_("Timeout"), _("{minutes} minutes").format(minutes=config.get("review_timeout_minutes"))),
+                (_("Case lifetime"), _("24 hours (fixed)")),
                 (_("Kick fail warning"), config.get("review_kick_fail_warning", "false")),
-                (_("Pending reviews"), len(config.get("pending_reviews", {}))),
             ],
         )
 
@@ -6660,14 +8488,27 @@ class Honeypot(Cog):
         config = await self.config.guild(ctx.guild).all()
         stats = DEFAULT_STATS.copy()
         stats.update(config.get("stats", {}))
+        now = datetime.now(timezone.utc)
+        case_counts = await asyncio.to_thread(
+            self._case_store.operational_counts,
+            ctx.guild.id,
+            now,
+            now - timedelta(minutes=5),
+        )
         await self._send_config_dump(
             ctx,
             _("Stats config"),
             [
                 (_("Stored stats"), len(stats)),
-                (_("Pending reviews"), len(config.get("pending_reviews", {}))),
                 (_("Pending joinwatch role applications"), len(config.get("joinwatch_pending_role_assignments", {}))),
                 (_("Active joinwatch auto-role timers"), len(config.get("joinwatch_pending_roles", {}))),
+                (_("Active detection cases"), case_counts["active_cases"]),
+                (_("Due detection cases"), case_counts["due_cases"]),
+                (_("Stale resolving cases"), case_counts["stale_resolving_cases"]),
+                (_("Failed containment cases"), case_counts["failed_containment"]),
+                (_("Forbidden message deletes"), case_counts["forbidden_deletes"]),
+                (_("Outstanding durable operations"), case_counts["outstanding_operations"]),
+                (_("Queued privacy deletions"), case_counts["privacy_deletion_jobs"]),
             ],
         )
 
@@ -6688,7 +8529,6 @@ class Honeypot(Cog):
                 (_("Joinwatch"), self._format_bool_setting(config.get("joinwatch_enabled", False))),
                 (_("Joinwatch auto-role"), self._format_bool_setting(config.get("joinwatch_auto_role_enabled", False))),
                 (_("Bait role"), self._format_bool_setting(config.get("baitrole_enabled", False))),
-                (_("Pending reviews"), len(config.get("pending_reviews", {}))),
                 (_("Pending joinwatch role applications"), len(config.get("joinwatch_pending_role_assignments", {}))),
                 (_("Active joinwatch auto-role timers"), len(config.get("joinwatch_pending_roles", {}))),
             ],
@@ -6701,9 +8541,15 @@ class Honeypot(Cog):
         """Show detailed moderation statistics."""
         stats = DEFAULT_STATS.copy()
         stats.update(await self.config.guild(ctx.guild).stats())
-        pending_reviews = await self.config.guild(ctx.guild).pending_reviews()
         pending_joinwatch_assignments = await self.config.guild(ctx.guild).joinwatch_pending_role_assignments()
         pending_joinwatch_roles = await self.config.guild(ctx.guild).joinwatch_pending_roles()
+        now = datetime.now(timezone.utc)
+        case_counts = await asyncio.to_thread(
+            self._case_store.operational_counts,
+            ctx.guild.id,
+            now,
+            now - timedelta(minutes=5),
+        )
         total_joins = stats["joinwatch_total_joins"]
         young_joins = stats["joinwatch_young_joins"]
         young_join_rate = (young_joins / total_joins * 100) if total_joins else 0
@@ -6715,6 +8561,15 @@ class Honeypot(Cog):
                 "Purged messages": stats["purged_messages"],
                 "Cached purge deletes": stats["cached_purge_deletes"],
                 "Forward purge deletes": stats["forward_purge_deletes"],
+                "Forward purge delete failures": stats["forward_purge_delete_failures"],
+                "Evidence capture failures": stats["evidence_capture_failures"],
+                "Active detection cases": case_counts["active_cases"],
+                "Due detection cases": case_counts["due_cases"],
+                "Stale resolving cases": case_counts["stale_resolving_cases"],
+                "Failed containment cases": case_counts["failed_containment"],
+                "Forbidden message deletes": case_counts["forbidden_deletes"],
+                "Outstanding durable operations": case_counts["outstanding_operations"],
+                "Queued privacy deletions": case_counts["privacy_deletion_jobs"],
             },
             "Firstpost": {
                 "Firstpost seen": stats["firstpost_seen"],
@@ -6733,7 +8588,6 @@ class Honeypot(Cog):
             },
             "Review": {
                 "Reviews sent": stats["reviewed"],
-                "Active pending reviews": len(pending_reviews),
                 "Expired reviews": stats["review_expired"],
                 "Ignored reviews": stats["ignored"],
                 "Applied temporary mutes": stats["pending_mutes"],
@@ -6789,11 +8643,105 @@ class Honeypot(Cog):
         await self.config.guild(ctx.guild).stats.set(DEFAULT_STATS.copy())
         await ctx.send(_("✅ Stats reset."))
 
+    def _verify_detection_case_evidence_directory(self) -> None:
+        probe_path: Path | None = None
+        probe_error: OSError | None = None
+        try:
+            self._detection_case_files_path.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                dir=self._detection_case_files_path,
+                prefix=".doctor-",
+                delete=False,
+            ) as probe:
+                probe_path = Path(probe.name)
+                probe.write(b"ok")
+            if probe_path.read_bytes() != b"ok":
+                raise OSError("evidence directory read/write check failed")
+        except OSError as error:
+            probe_error = error
+        finally:
+            if probe_path is not None:
+                try:
+                    probe_path.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    if probe_error is None:
+                        probe_error = cleanup_error
+        if probe_error is not None:
+            raise probe_error
+
     @honeypot.command(name="doctor")
     async def honeypot_doctor(self, ctx: commands.Context) -> None:
         """Check honeypot configuration and required permissions."""
         config = await self.config.guild(ctx.guild).all()
         checks: list[tuple[str, bool, str]] = []
+        case_database_ok = True
+        try:
+            await asyncio.to_thread(self._case_store.verify_read_write)
+        except (OSError, sqlite3.Error) as error:
+            case_database_ok = False
+            checks.append(
+                ("Detection case database", False, f"Read/write check failed: {error}")
+            )
+        else:
+            checks.append(("Detection case database", True, "Read/write check passed."))
+        try:
+            await asyncio.to_thread(self._verify_detection_case_evidence_directory)
+        except OSError as error:
+            checks.append(
+                (
+                    "Detection case evidence directory",
+                    False,
+                    f"Read/write check failed: {error}",
+                )
+            )
+        else:
+            checks.append(
+                ("Detection case evidence directory", True, "Read/write check passed.")
+            )
+        if case_database_ok:
+            now = datetime.now(timezone.utc)
+            case_counts = await asyncio.to_thread(
+                self._case_store.operational_counts,
+                ctx.guild.id,
+                now,
+                now - timedelta(minutes=5),
+            )
+            checks.extend(
+                (
+                    (
+                        f"Active detection cases: {case_counts['active_cases']}",
+                        True,
+                        "SQLite owns the active case count.",
+                    ),
+                    (
+                        f"Due detection cases: {case_counts['due_cases']}",
+                        case_counts["due_cases"] == 0,
+                        "Run detection case reconciliation.",
+                    ),
+                    (
+                        f"Stale resolving cases: {case_counts['stale_resolving_cases']}",
+                        case_counts["stale_resolving_cases"] == 0,
+                        "Run detection case reconciliation.",
+                    ),
+                    (
+                        f"Failed containment cases: {case_counts['failed_containment']}",
+                        case_counts["failed_containment"] == 0,
+                        "Inspect moderation case delete failures.",
+                    ),
+                    (
+                        "Outstanding durable operations: "
+                        f"{case_counts['outstanding_operations']}",
+                        case_counts["outstanding_operations"] == 0,
+                        "Inspect or retry durable detection operations.",
+                    ),
+                    (
+                        "Queued privacy deletions: "
+                        f"{case_counts['privacy_deletion_jobs']}",
+                        case_counts["privacy_deletion_jobs"] == 0,
+                        "Restore Discord permissions so privacy cleanup can retry.",
+                    ),
+                )
+            )
         me = ctx.guild.me
         if me is None:
             await ctx.send(_("**Honeypot doctor:**\n❌ I couldn't find my server member."))
@@ -6867,14 +8815,11 @@ class Honeypot(Cog):
             if not perms.manage_messages:
                 skipped_channels.append(channel.mention)
         if skipped_channels:
-            shown_channels = ", ".join(skipped_channels[:8])
-            if len(skipped_channels) > 8:
-                shown_channels += " ..."
             checks.append(
                 (
                     "Cached purge can delete visible message channels",
                     False,
-                    "\nManage - " + shown_channels,
+                    "\nManage - " + ", ".join(skipped_channels),
                 )
             )
         else:
@@ -6890,7 +8835,30 @@ class Honeypot(Cog):
             checks.append(("Can send logs", perms.send_messages, "Grant Send Messages."))
         if review_channel is not None:
             perms = review_channel.permissions_for(me)
-            checks.append(("Can send review messages", perms.send_messages, "Grant Send Messages."))
+            required = (
+                ("view_channel", "View Channel"),
+                ("send_messages", "Send Messages"),
+                ("create_public_threads", "Create Public Threads"),
+                ("send_messages_in_threads", "Send Messages in Threads"),
+                ("read_message_history", "Read Message History"),
+                ("embed_links", "Embed Links"),
+                ("attach_files", "Attach Files"),
+                ("manage_threads", "Manage Threads"),
+            )
+            missing = [
+                label for attribute, label in required if not getattr(perms, attribute, False)
+            ]
+            checks.append(
+                (
+                    "Review channel supports case threads",
+                    isinstance(review_channel, discord.TextChannel) and not missing,
+                    (
+                        "Use a normal text channel."
+                        if not isinstance(review_channel, discord.TextChannel)
+                        else "Grant: " + ", ".join(missing)
+                    ),
+                )
+            )
         guild_perms = me.guild_permissions
         checks.append(("Can kick members", guild_perms.kick_members, "Grant Kick Members."))
         checks.append(("Can ban members", guild_perms.ban_members, "Grant Ban Members."))
@@ -6901,4 +8869,7 @@ class Honeypot(Cog):
             if not ok
         ]
         passed = [f"✅ {name}" for name, ok, _hint in checks if ok]
-        await ctx.send(_("**Honeypot doctor:**\n{body}").format(body="\n".join(passed + failed)))
+        header = _("**Honeypot doctor:**\n")
+        body = "\n".join(passed + failed)
+        for page in pagify(body, page_length=2000 - len(header)):
+            await ctx.send(header + page)
