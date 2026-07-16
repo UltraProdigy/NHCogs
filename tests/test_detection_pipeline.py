@@ -8070,7 +8070,7 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                     [False, True],
                 )
 
-    async def test_case_ban_control_requires_ban_members_permission(self):
+    async def test_manage_messages_can_use_case_ban_control(self):
         with TemporaryDirectory() as directory:
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
                 cog = honeypot.Honeypot(_Bot())
@@ -8095,15 +8095,15 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                     followup=SimpleNamespace(send=mock.AsyncMock()),
                 )
 
+                cog._execute_detection_case_operation = mock.AsyncMock()
                 await cog._case_review_moderation_interaction(
-                    interaction, appended.case.case_id, "ban"
+                    interaction, appended.case.case_id, "ban", confirmed=True
                 )
 
                 snapshot = cog._case_store.get_case(appended.case.case_id)
-                response.defer.assert_not_awaited()
-                response.send_message.assert_awaited_once()
-                self.assertEqual(snapshot.case.status.value, "pending")
-                self.assertEqual(snapshot.operations, ())
+                response.defer.assert_awaited_once()
+                self.assertEqual(snapshot.case.status.value, "resolving")
+                self.assertEqual(snapshot.operations[0].operation_type, "moderator_ban")
 
     async def test_moderate_members_can_ignore_and_classify_case_evidence(self):
         with TemporaryDirectory() as directory:

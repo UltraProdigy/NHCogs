@@ -5078,21 +5078,9 @@ class Honeypot(Cog):
     def _case_review_has_action_permission(
         interaction: discord.Interaction, action: str
     ) -> bool:
-        permissions = getattr(getattr(interaction, "user", None), "guild_permissions", None)
-        if permissions is None:
-            return False
-        if action == "ban":
-            return bool(getattr(permissions, "ban_members", False))
-        if action == "kick":
-            return bool(getattr(permissions, "kick_members", False))
-        if action == "ignore":
-            return bool(
-                getattr(permissions, "moderate_members", False)
-                or getattr(permissions, "manage_messages", False)
-                or getattr(permissions, "ban_members", False)
-                or getattr(permissions, "kick_members", False)
-            )
-        return False
+        return action in {"ban", "kick", "ignore"} and Honeypot._case_review_has_permission(
+            interaction
+        )
 
     async def _case_review_error(self, interaction: discord.Interaction, message: str) -> None:
         response = interaction.response
