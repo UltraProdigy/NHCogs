@@ -2908,7 +2908,7 @@ class Honeypot(Cog):
                     if not effect_confirmed:
                         if member is None:
                             raise RuntimeError("detection case member is unavailable")
-                        reasons = "\n".join(signal.reason for signal in signals)
+                        public_reason = self._public_moderation_reason(signals, action)
                         started = await asyncio.to_thread(
                             self._case_store.start_operation_effect,
                             operation.operation_id,
@@ -2922,7 +2922,7 @@ class Honeypot(Cog):
                             member,
                             source.created_at,
                             config,
-                            reason=reasons,
+                            reason=public_reason,
                             action=action.value,
                         )
                         if failed is not None:
@@ -3006,7 +3006,7 @@ class Honeypot(Cog):
                             member,
                             snapshot.case.created_at,
                             config,
-                            reason=f"Moderator selected {action} for detection case {operation.case_id}.",
+                            reason=f"Honeypot review: {action.title()}",
                             action=action,
                             moderator=moderator,
                         )
@@ -3488,6 +3488,32 @@ class Honeypot(Cog):
             if image is not None:
                 signals.append(image)
         return tuple(signals)
+
+    @staticmethod
+    def _public_moderation_reason(
+        signals: tuple[DetectionSignal, ...], action: ActionIntent
+    ) -> str:
+        owning_signal = next(
+            (signal for signal in signals if signal.action is action),
+            next((signal for signal in signals if signal.decisive), None),
+        )
+        if owning_signal is None:
+            return "Honeypot"
+        if owning_signal.detector == "spam":
+            return "Same message in multiple channels"
+        if owning_signal.detector == "firstpost":
+            return "Suspicious first observed message."
+        if owning_signal.detector == "image":
+            return "Honeypot"
+        if owning_signal.detector == "honeypot":
+            if owning_signal.metadata.get("second_strike"):
+                return "Suspicious Activity"
+            if owning_signal.metadata.get("reasons") and not owning_signal.metadata.get(
+                "force_fallback"
+            ):
+                return "Suspicious message in the honeypot channel."
+            return "Message in the honeypot channel without a matching scam pattern."
+        return "Honeypot"
 
     @staticmethod
     def _new_case_message(message: discord.Message) -> NewMessage:
