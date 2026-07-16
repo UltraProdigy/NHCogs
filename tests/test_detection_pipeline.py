@@ -2078,7 +2078,7 @@ class ThreadBackedCasePublicationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 first = published[evidence_receipts[0].message_id]
                 obsolete = published[evidence_receipts[1].message_id]
-                self.assertEqual(thread.send.await_count, first_send_count + 1)
+                self.assertEqual(thread.send.await_count, first_send_count)
                 self.assertEqual(len(first.attachments), 10)
                 self.assertIsInstance(first.view, honeypot.DetectionCaseView)
                 self.assertEqual(first.view.message_sequence, 1)
@@ -2153,7 +2153,7 @@ class ThreadBackedCasePublicationTests(unittest.IsolatedAsyncioTestCase):
                     reason="Honeypot detection case resolved",
                 )
 
-    async def test_terminal_timeline_has_one_durable_human_resolution_event(self):
+    async def test_terminal_timeline_does_not_duplicate_resolution_from_summary(self):
         with TemporaryDirectory() as directory:
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
                 cog = honeypot.Honeypot(_Bot())
@@ -2216,21 +2216,18 @@ class ThreadBackedCasePublicationTests(unittest.IsolatedAsyncioTestCase):
                     )
                     await cog._publish_case_timeline(snapshot, thread, resolved=True)
 
-                self.assertEqual(thread.send.await_count, 3)
+                self.assertEqual(thread.send.await_count, 2)
                 resolution_messages = [
                     message
                     for message in sent_messages.values()
                     if "Resolved" in message.content
                 ]
-                self.assertEqual(len(resolution_messages), 1)
-                self.assertIn("Ignored", resolution_messages[0].content)
-                self.assertIn("<@99>", resolution_messages[0].content)
-                self.assertIn("<t:", resolution_messages[0].content)
+                self.assertEqual(resolution_messages, [])
                 publications = cog._case_store.list_timeline_publications(
                     appended.case.case_id
                 )
                 self.assertEqual(
-                    [item.kind for item in publications].count("resolution"), 1
+                    [item.kind for item in publications].count("resolution"), 0
                 )
 
 
@@ -7712,22 +7709,6 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                     "- 1. `[proof](https://evil.test).png`\n  captured; False positive",
                 )
                 self.assertNotIn("decision:", line)
-
-    def test_automatic_resolution_copy_is_grammatical(self):
-        with TemporaryDirectory() as directory:
-            with _isolated_honeypot_modules(Path(directory)) as honeypot:
-                snapshot = SimpleNamespace(
-                    case=SimpleNamespace(
-                        resolution="expired",
-                        moderator_id=None,
-                        resolved_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
-                    )
-                )
-
-                content = honeypot.Honeypot._case_resolution_timeline_content(snapshot)
-
-                self.assertIn("Resolved automatically", content)
-                self.assertNotIn("by automatically", content)
 
     async def test_individual_image_action_opens_dropdown_and_routes_selected_image(self):
         with TemporaryDirectory() as directory:

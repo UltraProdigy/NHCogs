@@ -4360,33 +4360,6 @@ class Honeypot(Cog):
             chunks.append("**Case operation notes**\nNo current operation warnings.")
         return tuple(chunks)
 
-    @staticmethod
-    def _case_resolution_timeline_content(snapshot) -> str:
-        resolution = snapshot.case.resolution or "resolved"
-        labels = {
-            "ban": "Banned",
-            "kick": "Kicked",
-            "ignore": "Ignored",
-            "expired": "Expired",
-            "images:tp": "Images marked as true positives",
-            "images:fp": "Images marked as false positives",
-            "images:ignore": "Images ignored",
-        }
-        label = labels.get(
-            resolution,
-            "Image review completed" if resolution.startswith("images:") else "Resolved",
-        )
-        timestamp = (
-            f" <t:{int(snapshot.case.resolved_at.timestamp())}:F>"
-            if snapshot.case.resolved_at is not None
-            else ""
-        )
-        if snapshot.case.moderator_id is None:
-            return f"**Resolved automatically: {label}**{timestamp}."
-        return (
-            f"**Resolved: {label}** by <@{snapshot.case.moderator_id}>{timestamp}."
-        )
-
     async def _ensure_detection_case_thread(self, snapshot, summary_message):
         fetch_thread = getattr(summary_message, "fetch_thread", None)
         thread = None
@@ -4662,41 +4635,6 @@ class Honeypot(Cog):
                     attachments=[],
                     view=None,
                 )
-        if resolved:
-            resolution = await asyncio.to_thread(
-                self._case_store.ensure_timeline_publication,
-                snapshot.case.case_id,
-                kind="resolution",
-            )
-            content = self._case_resolution_timeline_content(snapshot)
-            replace_message_id = None
-            if resolution.state == "published" and resolution.message_id is not None:
-                try:
-                    published = await thread.fetch_message(resolution.message_id)
-                    await published.edit(content=content)
-                    return
-                except discord.NotFound:
-                    replace_message_id = resolution.message_id
-            resolution, owned = await self._acquire_case_timeline_publication(
-                resolution, replace_message_id=replace_message_id
-            )
-            if not owned:
-                published = await thread.fetch_message(resolution.message_id)
-                await published.edit(content=content)
-                return
-            try:
-                published = await thread.send(
-                    content,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                    nonce=self._case_publication_nonce(resolution.logical_key),
-                )
-                await self._complete_case_timeline_publication(
-                    resolution, published, thread.id
-                )
-            except BaseException:
-                await self._release_case_timeline_publication(resolution)
-                raise
-
     @staticmethod
     def _case_timeline_evidence_batches(message, thread):
         upload_limit = getattr(thread, "filesize_limit", None)
