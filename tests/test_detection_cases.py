@@ -1601,6 +1601,45 @@ class DetectionCaseStoreTests(unittest.TestCase):
         self.assertEqual(tuple(operation.idempotency_key for operation in retried), ("retry",))
         self.assertEqual(retried[0].attempts, 2)
 
+    def test_operational_failures_remain_visible_until_acknowledged(self):
+        created_at = datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
+        case_id = self.store.append_message(self.message(40, created_at), ()).case.case_id
+
+        first = self.store.record_operational_failure(
+            guild_id=10,
+            source="review_publish",
+            summary="Could not create the case thread",
+            occurred_at=created_at,
+            case_id=case_id,
+            operation_id="op-1",
+        )
+        repeated = self.store.record_operational_failure(
+            guild_id=10,
+            source="review_publish",
+            summary="Could not create the case thread",
+            occurred_at=created_at + timedelta(seconds=10),
+            case_id=case_id,
+            operation_id="op-1",
+        )
+
+        self.assertEqual(first.failure_id, repeated.failure_id)
+        self.assertEqual(repeated.occurrences, 2)
+        self.assertEqual(len(self.store.list_operational_failures(10)), 1)
+        self.assertTrue(self.store.resolve_operational_failure("op-1", created_at))
+        self.assertEqual(self.store.list_operational_failures(10), ())
+        self.assertEqual(self.store.clear_operational_failures(10, created_at), 1)
+
+        recurring = self.store.record_operational_failure(
+            guild_id=10,
+            source="review_publish",
+            summary="Thread creation failed again",
+            occurred_at=created_at + timedelta(minutes=1),
+            case_id=case_id,
+            operation_id="op-1",
+        )
+        self.assertEqual(recurring.occurrences, 1)
+        self.assertEqual(len(self.store.list_operational_failures(10)), 1)
+
     def test_stale_operation_worker_cannot_complete_reclaimed_work(self):
         now = datetime(2026, 7, 13, tzinfo=timezone.utc)
         case_id = self.store.append_message(self.message(40, now), ()).case.case_id

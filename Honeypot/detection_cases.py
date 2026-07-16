@@ -179,6 +179,21 @@ class OperationRecord:
 
 
 @dataclass(frozen=True)
+class OperationalFailureRecord:
+    failure_id: str
+    guild_id: int
+    source: str
+    summary: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    occurrences: int
+    case_id: str | None
+    operation_id: str | None
+    resolved_at: datetime | None
+    acknowledged_at: datetime | None
+
+
+@dataclass(frozen=True)
 class EvidencePublicationRecord:
     case_id: str
     batch_index: int
@@ -488,6 +503,26 @@ class DetectionCaseStore:
                     FOREIGN KEY(case_id, message_sequence)
                         REFERENCES detection_messages(case_id, sequence) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS operational_failures (
+                    failure_id TEXT PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    first_seen_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    occurrences INTEGER NOT NULL DEFAULT 1,
+                    case_id TEXT,
+                    operation_id TEXT,
+                    resolved_at INTEGER,
+                    acknowledged_at INTEGER
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS one_active_operational_failure
+                    ON operational_failures(guild_id, source, COALESCE(operation_id, ''),
+                                            COALESCE(case_id, ''))
+                    WHERE resolved_at IS NULL;
+                CREATE INDEX IF NOT EXISTS operational_failures_visible
+                    ON operational_failures(guild_id, acknowledged_at, resolved_at, last_seen_at);
 
                 CREATE TABLE IF NOT EXISTS detection_evidence_reservations (
                     case_id TEXT NOT NULL,
@@ -2986,6 +3021,97 @@ class DetectionCaseStore:
             )
             return result.rowcount == 1
 
+    def record_operational_failure(
+        self,
+        *,
+        guild_id: int,
+        source: str,
+        summary: str,
+        occurred_at: datetime,
+        case_id: str | None = None,
+        operation_id: str | None = None,
+    ) -> OperationalFailureRecord:
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT * FROM operational_failures
+                   WHERE guild_id = ? AND source = ?
+                     AND COALESCE(operation_id, '') = COALESCE(?, '')
+                     AND COALESCE(case_id, '') = COALESCE(?, '')
+                     AND resolved_at IS NULL""",
+                (guild_id, source, operation_id, case_id),
+            ).fetchone()
+            timestamp = _to_timestamp(occurred_at)
+            if row is None:
+                failure_id = str(uuid4())
+                connection.execute(
+                    """INSERT INTO operational_failures
+                       (failure_id, guild_id, source, summary, first_seen_at,
+                        last_seen_at, occurrences, case_id, operation_id)
+                       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                    (
+                        failure_id,
+                        guild_id,
+                        source,
+                        summary[:1000],
+                        timestamp,
+                        timestamp,
+                        case_id,
+                        operation_id,
+                    ),
+                )
+            else:
+                failure_id = row["failure_id"]
+                connection.execute(
+                    """UPDATE operational_failures
+                       SET summary = ?, last_seen_at = ?, occurrences = occurrences + 1,
+                           acknowledged_at = NULL
+                       WHERE failure_id = ?""",
+                    (summary[:1000], timestamp, failure_id),
+                )
+            return self._operational_failure_from_row(
+                connection.execute(
+                    "SELECT * FROM operational_failures WHERE failure_id = ?",
+                    (failure_id,),
+                ).fetchone()
+            )
+
+    def resolve_operational_failure(
+        self, operation_id: str, resolved_at: datetime
+    ) -> bool:
+        with closing(self._connect()) as connection, connection:
+            result = connection.execute(
+                """UPDATE operational_failures SET resolved_at = ?
+                   WHERE operation_id = ? AND resolved_at IS NULL""",
+                (_to_timestamp(resolved_at), operation_id),
+            )
+            return result.rowcount > 0
+
+    def list_operational_failures(
+        self, guild_id: int, *, include_resolved: bool = False, limit: int = 100
+    ) -> tuple[OperationalFailureRecord, ...]:
+        where = "guild_id = ? AND acknowledged_at IS NULL"
+        if not include_resolved:
+            where += " AND resolved_at IS NULL"
+        with closing(self._connect()) as connection:
+            return tuple(
+                self._operational_failure_from_row(row)
+                for row in connection.execute(
+                    f"""SELECT * FROM operational_failures WHERE {where}
+                        ORDER BY last_seen_at DESC LIMIT ?""",
+                    (guild_id, limit),
+                )
+            )
+
+    def clear_operational_failures(self, guild_id: int, acknowledged_at: datetime) -> int:
+        with closing(self._connect()) as connection, connection:
+            result = connection.execute(
+                """UPDATE operational_failures SET acknowledged_at = ?
+                   WHERE guild_id = ? AND acknowledged_at IS NULL""",
+                (_to_timestamp(acknowledged_at), guild_id),
+            )
+            return result.rowcount
+
     def _snapshot(self, connection: sqlite3.Connection, case_row: sqlite3.Row) -> CaseSnapshot:
         messages = tuple(
             self._message_from_row(row)
@@ -3157,4 +3283,13 @@ class DetectionCaseStore:
             _from_timestamp(row["retry_at"]), row["last_error"], row["result"],
             row["actor_id"], row["idempotency_key"],
             row["claim_token"], _from_timestamp(row["claimed_at"]),
+        )
+
+    @staticmethod
+    def _operational_failure_from_row(row: sqlite3.Row) -> OperationalFailureRecord:
+        return OperationalFailureRecord(
+            row["failure_id"], row["guild_id"], row["source"], row["summary"],
+            _from_timestamp(row["first_seen_at"]), _from_timestamp(row["last_seen_at"]),
+            row["occurrences"], row["case_id"], row["operation_id"],
+            _from_timestamp(row["resolved_at"]), _from_timestamp(row["acknowledged_at"]),
         )

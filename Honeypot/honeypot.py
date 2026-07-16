@@ -59,6 +59,9 @@ from .image_detector import (
 _ = Translator("Honeypot", __file__)
 log = logging.getLogger("red.Honeypot")
 _TIMELINE_VIEW_UNSET = object()
+DETECTION_FAST_RETRY_SECONDS = 10
+DETECTION_FAST_RETRY_LIMIT = 5
+DETECTION_SLOW_RETRY_MINUTES = 5
 
 try:
     from PIL import Image
@@ -815,6 +818,12 @@ class Honeypot(Cog):
                         case_id,
                         error=str(error),
                     )
+                    await self._record_operational_failure(
+                        guild_id,
+                        "case_publication_deletion",
+                        f"{type(error).__name__}: {error}",
+                        case_id=case_id,
+                    )
                     errors.append(error)
             local_deleted = job.local_deleted
             if not local_deleted:
@@ -828,6 +837,12 @@ class Honeypot(Cog):
                     )
                     local_deleted = True
                 except Exception as error:
+                    await self._record_operational_failure(
+                        guild_id,
+                        "case_evidence_deletion",
+                        f"{type(error).__name__}: {error}",
+                        case_id=case_id,
+                    )
                     errors.append(error)
             if not job.rows_deleted and local_deleted:
                 inflight = await asyncio.to_thread(
@@ -1783,7 +1798,14 @@ class Honeypot(Cog):
             return
         try:
             message = await channel.fetch_message(int(message_id))
-        except (discord.HTTPException, discord.NotFound, discord.Forbidden, TypeError, ValueError):
+        except (discord.NotFound, TypeError, ValueError):
+            return
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            await self._record_operational_failure(
+                guild.id,
+                "joinwatch_alert_update",
+                f"Could not fetch joinwatch alert {message_id}: {exc}",
+            )
             return
         if not message.embeds:
             return
@@ -1798,8 +1820,13 @@ class Honeypot(Cog):
             embed.add_field(name=field_name, value=value, inline=False)
         try:
             await message.edit(embed=embed)
-        except discord.HTTPException:
+        except discord.HTTPException as exc:
             log.debug("Failed to edit joinwatch alert message %s in guild %s", message_id, guild.id)
+            await self._record_operational_failure(
+                guild.id,
+                "joinwatch_alert_update",
+                f"Could not update joinwatch alert {message_id}: {exc}",
+            )
 
     def _joinwatch_next_retry(self, data: dict) -> int | None:
         try:
@@ -1817,6 +1844,13 @@ class Honeypot(Cog):
         failure: str,
     ) -> bool:
         retry_count = self._joinwatch_next_retry(data)
+        await self._record_operational_failure(
+            guild.id,
+            "joinwatch_role_assignment",
+            failure,
+            attempts=JOINWATCH_MAX_RETRIES + 1 if retry_count is None else retry_count,
+            terminal=retry_count is None,
+        )
         if retry_count is None:
             await self._edit_joinwatch_alert_auto_role(
                 guild,
@@ -1854,6 +1888,13 @@ class Honeypot(Cog):
         failure: str,
     ) -> bool:
         retry_count = self._joinwatch_next_retry(data)
+        await self._record_operational_failure(
+            guild.id,
+            "joinwatch_role_action",
+            failure,
+            attempts=JOINWATCH_MAX_RETRIES + 1 if retry_count is None else retry_count,
+            terminal=retry_count is None,
+        )
         if retry_count is None:
             await self._edit_joinwatch_alert_auto_role(
                 guild,
@@ -2232,7 +2273,7 @@ class Honeypot(Cog):
     async def before_detection_case_loop(self) -> None:
         await self.bot.wait_until_red_ready()
 
-    @tasks.loop(minutes=5)
+    @tasks.loop(seconds=DETECTION_FAST_RETRY_SECONDS)
     async def detection_reconciliation_loop(self) -> None:
         await self._run_detection_reconciliation()
 
@@ -2245,6 +2286,54 @@ class Honeypot(Cog):
         due_cases = await asyncio.to_thread(self._case_store.list_due_cases, now)
         for case in due_cases:
             await self.resolve_detection_case(case.case_id, "expired", now=now)
+
+    async def _send_operational_alert(self, guild_id: int, content: str) -> None:
+        try:
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                return
+            config = await self.config.guild_from_id(guild_id).all()
+            channel = self._get_text_channel_or_thread(guild, config.get("logs_channel"))
+            if channel is None:
+                return
+            await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+        except Exception:
+            log.warning("Could not publish Honeypot operational alert", exc_info=True)
+
+    async def _record_operational_failure(
+        self,
+        guild_id: int,
+        source: str,
+        summary: str,
+        *,
+        case_id: str | None = None,
+        operation_id: str | None = None,
+        attempts: int = 1,
+        terminal: bool = False,
+    ) -> None:
+        try:
+            failure = await asyncio.to_thread(
+                self._case_store.record_operational_failure,
+                guild_id=guild_id,
+                source=source,
+                summary=summary,
+                occurred_at=datetime.now(timezone.utc),
+                case_id=case_id,
+                operation_id=operation_id,
+            )
+        except Exception:
+            log.exception("Could not persist Honeypot operational failure")
+            return
+        exhausted_fast_retries = (
+            terminal and attempts == DETECTION_FAST_RETRY_LIMIT + 1
+        )
+        if failure.occurrences == 1 or exhausted_fast_retries:
+            state = "fast retries exhausted" if exhausted_fast_retries else "will retry"
+            await self._send_operational_alert(
+                guild_id,
+                f"⚠️ Honeypot operation failed ({source}, attempt {attempts}, {state}): "
+                f"{summary[:500]}",
+            )
 
     async def _run_detection_reconciliation(
         self, *, now: datetime | None = None
@@ -3153,7 +3242,11 @@ class Honeypot(Cog):
         except Exception as error:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
-            retry_at = now + timedelta(minutes=5)
+            retry_at = now + (
+                timedelta(seconds=DETECTION_FAST_RETRY_SECONDS)
+                if operation.attempts <= DETECTION_FAST_RETRY_LIMIT
+                else timedelta(minutes=DETECTION_SLOW_RETRY_MINUTES)
+            )
             cached_purge_exhausted = (
                 operation.operation_type == "cached_purge"
                 and operation_result == DeleteStatus.TRANSIENT_FAILURE.value
@@ -3169,7 +3262,7 @@ class Honeypot(Cog):
                 await asyncio.to_thread(
                     self._case_store.mark_case_needs_attention, operation.case_id
                 )
-            await asyncio.to_thread(
+            failure = await asyncio.to_thread(
                 self._case_store.fail_operation,
                 operation.operation_id,
                 operation.claim_token,
@@ -3178,6 +3271,19 @@ class Honeypot(Cog):
                 retry_at,
                 operation_result,
             )
+            if failure and snapshot is not None:
+                await self._record_operational_failure(
+                    snapshot.case.guild_id,
+                    operation.operation_type,
+                    f"{type(error).__name__}: {error}",
+                    case_id=operation.case_id,
+                    operation_id=operation.operation_id,
+                    attempts=operation.attempts,
+                    terminal=(
+                        retry_at is None
+                        or operation.attempts > DETECTION_FAST_RETRY_LIMIT
+                    ),
+                )
             if operation.operation_type == "role_apply" and snapshot is not None:
                 failed_guild = self.bot.get_guild(snapshot.case.guild_id)
                 if failed_guild is not None:
@@ -3217,6 +3323,18 @@ class Honeypot(Cog):
             if current_case is not None:
                 raise RuntimeError(
                     "detection case operation lease was lost before completion"
+                )
+        elif snapshot is not None and operation.attempts > 1:
+            recovered = await asyncio.to_thread(
+                self._case_store.resolve_operational_failure,
+                operation.operation_id,
+                now,
+            )
+            if recovered:
+                await self._send_operational_alert(
+                    snapshot.case.guild_id,
+                    f"✅ Recovered: {operation.operation_type} succeeded after "
+                    f"{operation.attempts} attempts.",
                 )
         elif role_was_added and snapshot is not None:
             guild = self.bot.get_guild(snapshot.case.guild_id)
@@ -3855,6 +3973,30 @@ class Honeypot(Cog):
                     "evidence capture claim is no longer owned",
                 )
             )
+        failed_captures = tuple(
+            capture
+            for capture in persisted_captures
+            if capture.status in {
+                detection_runtime.CaptureStatus.FAILED,
+                detection_runtime.CaptureStatus.TIMEOUT,
+            }
+            and capture.error not in {
+                "detection case deletion is in progress",
+                "evidence capture claim is no longer owned",
+            }
+        )
+        if failed_captures:
+            details = "; ".join(
+                f"attachment {capture.position + 1}: "
+                f"{capture.error or capture.status.value}"
+                for capture in failed_captures[:3]
+            )
+            await self._record_operational_failure(
+                message.guild.id,
+                "evidence_capture",
+                f"Failed to capture {len(failed_captures)} attachment(s): {details}"[:512],
+                case_id=case_id,
+            )
         return tuple(persisted_captures)
 
     async def _scan_image_attachments(
@@ -4009,6 +4151,12 @@ class Honeypot(Cog):
                         self._case_store.update_attachment_scan,
                         case_id, sequence, position, None, None, {}, bounded,
                     )
+            await self._record_operational_failure(
+                guild_id,
+                "image_scan_setup",
+                bounded,
+                case_id=case_id,
+            )
             return
         reused_scans = ()
         if initial_scan_key is not None:
@@ -4028,6 +4176,17 @@ class Honeypot(Cog):
             skip_positions=reused_positions,
         )
         scans = tuple(sorted(reused_scans + new_scans, key=lambda item: item["position"]))
+        unavailable_capture_positions = {
+            capture.position
+            for capture in capture_results
+            if capture.status is not detection_runtime.CaptureStatus.CAPTURED
+        }
+        failed_scans = tuple(
+            scan
+            for scan in scans
+            if scan["error"] is not None
+            and scan["position"] not in unavailable_capture_positions
+        )
         for scan in scans:
             position = scan["position"]
             if scan["error"] is None:
@@ -4053,6 +4212,17 @@ class Honeypot(Cog):
                     {},
                     scan["error"],
                 )
+        if failed_scans:
+            details = "; ".join(
+                f"attachment {scan['position'] + 1}: {scan['error']}"
+                for scan in failed_scans[:3]
+            )
+            await self._record_operational_failure(
+                guild_id,
+                "image_scan",
+                f"Failed to scan {len(failed_scans)} attachment(s): {details}"[:512],
+                case_id=case_id,
+            )
 
     @staticmethod
     def _case_timeline_attachment_line(attachment) -> str:
@@ -4254,7 +4424,13 @@ class Honeypot(Cog):
                 await message.delete()
             except discord.NotFound:
                 pass
-            except discord.HTTPException:
+            except discord.HTTPException as error:
+                await self._record_operational_failure(
+                    guild_id,
+                    "orphan_publication_deletion",
+                    f"{type(error).__name__}: {error}",
+                    case_id=case_id,
+                )
                 continue
             await asyncio.to_thread(
                 self._case_store.complete_orphan_publication,
@@ -5470,6 +5646,11 @@ class Honeypot(Cog):
         except discord.NotFound:
             return False
         except (discord.Forbidden, discord.HTTPException) as exc:
+            await self._record_operational_failure(
+                guild.id,
+                "cached_message_deletion",
+                f"{type(exc).__name__}: {exc}",
+            )
             log.debug(
                 "Failed to delete cached message %s for user %s in channel %s: %r",
                 ref.message_id,
@@ -5536,7 +5717,12 @@ class Honeypot(Cog):
             if deleted:
                 await self._increment_stat(guild, "purged_messages", deleted)
                 await self._increment_stat(guild, "cached_purge_deletes", deleted)
-        except Exception:
+        except Exception as error:
+            await self._record_operational_failure(
+                guild_id,
+                "post_ban_cached_purge",
+                f"{type(error).__name__}: {error}",
+            )
             log.exception(
                 "Post-ban cached message purge failed for user %s in guild %s",
                 user_id,
@@ -5919,11 +6105,16 @@ class Honeypot(Cog):
                             )
                             try:
                                 await joinwatch_channel.send(embed=embed)
-                            except discord.HTTPException:
+                            except discord.HTTPException as exc:
                                 log.debug(
                                     "Failed to send joinwatch missing-member log for user %s in guild %s",
                                     member_id,
                                     guild.id,
+                                )
+                                await self._record_operational_failure(
+                                    guild.id,
+                                    "joinwatch_timer_alert",
+                                    f"Could not publish timer result for user {member_id}: {exc}",
                                 )
                         continue
                     if role is None:
@@ -6040,11 +6231,16 @@ class Honeypot(Cog):
                             )
                             try:
                                 await joinwatch_channel.send(embed=embed)
-                            except discord.HTTPException:
+                            except discord.HTTPException as exc:
                                 log.debug(
                                     "Failed to send joinwatch missing-member log for user %s in guild %s",
                                     member_id,
                                     guild.id,
+                                )
+                                await self._record_operational_failure(
+                                    guild.id,
+                                    "joinwatch_timer_alert",
+                                    f"Could not publish timer result for user {member_id}: {exc}",
                                 )
                         continue
                     if role is None:
@@ -6107,10 +6303,20 @@ class Honeypot(Cog):
                         )
                         try:
                             await joinwatch_channel.send(embed=embed)
-                        except discord.HTTPException:
+                        except discord.HTTPException as exc:
                             log.debug("Failed to send joinwatch auto-role log for user %s in guild %s", member.id, guild.id)
-            except Exception:
+                            await self._record_operational_failure(
+                                guild.id,
+                                "joinwatch_timer_alert",
+                                f"Could not publish timer result for user {member.id}: {exc}",
+                            )
+            except Exception as exc:
                 log.exception("Failed to process joinwatch auto-role timers for guild %s", guild.id)
+                await self._record_operational_failure(
+                    guild.id,
+                    "joinwatch_timer_processing",
+                    f"Could not process joinwatch timers: {exc}",
+                )
 
     @joinwatch_auto_role_loop.before_loop
     async def before_joinwatch_auto_role(self) -> None:
@@ -6151,6 +6357,12 @@ class Honeypot(Cog):
                     role_permission_error = self._missing_role_assignment_permission(member.guild, role)
                     if role_permission_error is not None:
                         await self._increment_stat(member.guild, "joinwatch_auto_role_failures")
+                        await self._record_operational_failure(
+                            member.guild.id,
+                            "joinwatch_role_assignment",
+                            role_permission_error,
+                            terminal=True,
+                        )
                         embed.add_field(
                             name=_("Auto-role:"),
                             value=role_permission_error,
@@ -6196,8 +6408,14 @@ class Honeypot(Cog):
                                     ),
                                     inline=False,
                                 )
-                            except discord.HTTPException:
+                            except discord.HTTPException as exc:
                                 await self._increment_stat(member.guild, "joinwatch_auto_role_failures")
+                                await self._record_operational_failure(
+                                    member.guild.id,
+                                    "joinwatch_role_assignment",
+                                    f"Could not apply auto-role to user {member.id}: {exc}",
+                                    terminal=True,
+                                )
                                 embed.add_field(
                                     name=_("Auto-role:"),
                                     value=_("I couldn't apply the configured joinwatch auto-role."),
@@ -6220,8 +6438,14 @@ class Honeypot(Cog):
                             alert_message.channel.id,
                             alert_message.id,
                         )
-                except discord.HTTPException:
+                except discord.HTTPException as exc:
                     log.debug("Failed to send joinwatch alert for user %s in guild %s", member.id, member.guild.id)
+                    await self._record_operational_failure(
+                        member.guild.id,
+                        "joinwatch_alert_publish",
+                        f"Could not publish joinwatch alert for user {member.id}: {exc}",
+                        terminal=True,
+                    )
 
     # ─── Baited role trap ─────────────────────────────────────────────
 
@@ -6272,8 +6496,14 @@ class Honeypot(Cog):
                 elif action == "kick":
                     await after.kick(reason=reason)
                     await self._increment_stat(after.guild, "kicked")
-            except discord.HTTPException:
+            except discord.HTTPException as exc:
                 log.warning("Failed to %s bait-role target %s in guild %s", action, after.id, after.guild.id)
+                await self._record_operational_failure(
+                    after.guild.id,
+                    "bait_role_action",
+                    f"Could not {action} bait-role target {after.id}: {exc}",
+                    terminal=True,
+                )
             logs_channel_id = config.get("logs_channel")
             logs_channel = self._get_text_channel_or_thread(after.guild, logs_channel_id)
             if logs_channel is not None:
@@ -6288,8 +6518,14 @@ class Honeypot(Cog):
                 embed.set_thumbnail(url=after.display_avatar)
                 try:
                     await logs_channel.send(embed=embed)
-                except discord.HTTPException:
+                except discord.HTTPException as exc:
                     log.debug("Failed to send bait role log for user %s in guild %s", after.id, after.guild.id)
+                    await self._record_operational_failure(
+                        after.guild.id,
+                        "bait_role_alert",
+                        f"Could not publish bait-role alert for user {after.id}: {exc}",
+                        terminal=True,
+                    )
 
     @staticmethod
     def _review_dump_field_map(embed: discord.Embed) -> dict[str, str]:
@@ -8316,6 +8552,40 @@ class Honeypot(Cog):
             ],
         )
 
+    @honeypot.group(name="errors", invoke_without_command=True)
+    async def honeypot_errors(self, ctx: commands.Context) -> None:
+        """Show unacknowledged Honeypot operational failures."""
+        failures = await asyncio.to_thread(
+            self._case_store.list_operational_failures,
+            ctx.guild.id,
+            include_resolved=True,
+        )
+        if not failures:
+            await ctx.send(_("No unacknowledged Honeypot errors."))
+            return
+        lines = []
+        for failure in failures:
+            state = "recovered" if failure.resolved_at is not None else "active"
+            lines.append(
+                f"- <t:{int(failure.last_seen_at.timestamp())}:R> "
+                f"`{failure.source}` ({state}, x{failure.occurrences}): "
+                f"{failure.summary[:500]}"
+            )
+        body = "\n".join(lines)
+        header = _("**Honeypot operational errors:**\n")
+        for page in pagify(body, page_length=2000 - len(header)):
+            await ctx.send(header + page)
+
+    @honeypot_errors.command(name="clear")
+    async def honeypot_errors_clear(self, ctx: commands.Context) -> None:
+        """Acknowledge all currently visible Honeypot operational failures."""
+        count = await asyncio.to_thread(
+            self._case_store.clear_operational_failures,
+            ctx.guild.id,
+            datetime.now(timezone.utc),
+        )
+        await ctx.send(_("Acknowledged {count} Honeypot errors.").format(count=count))
+
     # ─── stats ────────────────────────────────────────────────────────
 
     @honeypot.command(name="modstats")
@@ -8494,6 +8764,20 @@ class Honeypot(Cog):
             )
         if case_database_ok:
             now = datetime.now(timezone.utc)
+            operational_failures = await asyncio.to_thread(
+                self._case_store.list_operational_failures,
+                ctx.guild.id,
+            )
+            if operational_failures:
+                oldest = min(item.first_seen_at for item in operational_failures)
+                checks.append(
+                    (
+                        f"Active operational failures: {len(operational_failures)}",
+                        False,
+                        f"Oldest: <t:{int(oldest.timestamp())}:R>. "
+                        "Run `honeypot errors`.",
+                    )
+                )
             case_counts = await asyncio.to_thread(
                 self._case_store.operational_counts,
                 ctx.guild.id,

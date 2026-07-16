@@ -463,7 +463,7 @@ class DetectionPipelineLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     self.assertTrue(getattr(cog, loop_name).started, loop_name)
                 self.assertEqual(cog.detection_case_loop.options, {"minutes": 1})
-                self.assertEqual(cog.detection_reconciliation_loop.options, {"minutes": 5})
+                self.assertEqual(cog.detection_reconciliation_loop.options, {"seconds": 10})
 
                 await cog.cog_unload()
 
@@ -2246,6 +2246,8 @@ class JoinwatchRetryTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
                 cog = honeypot.Honeypot(_Bot())
+                cog._case_store = honeypot.DetectionCaseStore(Path(directory) / "joinwatch.sqlite")
+                await asyncio.to_thread(cog._case_store.initialize)
                 guild = SimpleNamespace(id=100)
                 assignments = {"200": {"retry_count": 0}}
                 roles = {"200": {"retry_count": 0}}
@@ -2280,11 +2282,20 @@ class JoinwatchRetryTests(unittest.IsolatedAsyncioTestCase):
                     datetime.fromisoformat(roles["200"]["expires_at"]),
                     now + timedelta(minutes=1),
                 )
+                failures = await asyncio.to_thread(
+                    cog._case_store.list_operational_failures, guild.id
+                )
+                self.assertEqual(
+                    {failure.source for failure in failures},
+                    {"joinwatch_role_assignment", "joinwatch_role_action"},
+                )
 
     async def test_fifth_retry_is_the_last_and_a_sixth_is_not_scheduled(self):
         with TemporaryDirectory() as directory:
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
                 cog = honeypot.Honeypot(_Bot())
+                cog._case_store = honeypot.DetectionCaseStore(Path(directory) / "joinwatch.sqlite")
+                await asyncio.to_thread(cog._case_store.initialize)
                 guild = SimpleNamespace(id=100)
                 assignments = {"200": {"retry_count": 5}}
                 guild_config = SimpleNamespace(
@@ -2303,6 +2314,11 @@ class JoinwatchRetryTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertFalse(scheduled)
                 self.assertNotIn("200", assignments)
+                failures = await asyncio.to_thread(
+                    cog._case_store.list_operational_failures, guild.id
+                )
+                self.assertEqual(len(failures), 1)
+                self.assertEqual(failures[0].source, "joinwatch_role_assignment")
 
 
 class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
@@ -3036,6 +3052,12 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 self.assertEqual(len(failure_calls), 1)
                 self.assertEqual(failure_calls[0].args[2], 3)
+                operational_failures = await asyncio.to_thread(
+                    cog._case_store.list_operational_failures, message.guild.id
+                )
+                self.assertEqual(len(operational_failures), 1)
+                self.assertEqual(operational_failures[0].source, "evidence_capture")
+                self.assertIn("Failed to capture 2 attachment(s)", operational_failures[0].summary)
 
     async def test_two_cogs_do_not_apply_an_aggregate_case_byte_limit(self):
         with TemporaryDirectory() as directory:
@@ -3715,9 +3737,37 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     item for item in snapshot.operations if item.operation_type == "review_publish"
                 )
                 self.assertEqual(operation.status.value, "failed")
-                self.assertIsNotNone(operation.retry_at)
+                self.assertEqual(
+                    operation.retry_at - operation.updated_at,
+                    timedelta(seconds=10),
+                )
                 self.assertIn("review unavailable", operation.last_error)
                 message.delete.assert_awaited_once()
+
+    async def test_reconciliation_checks_due_retries_every_ten_seconds(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                self.assertEqual(
+                    honeypot.Honeypot.detection_reconciliation_loop.options,
+                    {"seconds": 10},
+                )
+
+    async def test_operational_logger_failure_does_not_escape(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                cog = honeypot.Honeypot(_Bot())
+                cog._case_store.record_operational_failure = mock.Mock(
+                    side_effect=sqlite3.OperationalError("disk unavailable")
+                )
+                cog._send_operational_alert = mock.AsyncMock()
+
+                await cog._record_operational_failure(
+                    10,
+                    "review_publish",
+                    "Could not create the case thread",
+                )
+
+                cog._send_operational_alert.assert_not_awaited()
 
     async def test_missing_publication_destination_is_durable_after_delete(self):
         with TemporaryDirectory() as directory:
@@ -4270,6 +4320,12 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(snapshot.messages[0].delete_status.value, "deleted")
                 self.assertIn("model unavailable", snapshot.attachments[0].error)
                 self.assertEqual(cog._publish_detection_case.await_count, 2)
+                operational_failures = await asyncio.to_thread(
+                    cog._case_store.list_operational_failures, message.guild.id
+                )
+                self.assertEqual(len(operational_failures), 1)
+                self.assertEqual(operational_failures[0].source, "image_scan_setup")
+                self.assertIn("model unavailable", operational_failures[0].summary)
 
     async def test_missing_saved_review_message_is_replaced(self):
         with TemporaryDirectory() as directory:
@@ -5250,6 +5306,187 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(completed.status.value, "succeeded")
                 self.assertEqual(completed.result, "ban")
 
+    async def test_review_retry_restores_thread_evidence_after_ban_without_repeating_ban(self):
+        with TemporaryDirectory() as directory:
+            data_path = Path(directory)
+            with _isolated_honeypot_modules(data_path) as honeypot:
+                now = datetime.now(timezone.utc)
+                member = SimpleNamespace(id=20)
+                guild = SimpleNamespace(
+                    id=10,
+                    get_member=lambda user_id: member,
+                    filesize_limit=8 * 1024 * 1024,
+                )
+                bot = _Bot()
+                bot.get_guild = lambda guild_id: guild
+                cog = honeypot.Honeypot(bot)
+                await asyncio.to_thread(cog._case_store.initialize)
+                cog._execute_action = mock.AsyncMock(return_value=("banned", None))
+                cog._send_operational_alert = mock.AsyncMock()
+                config_values = {
+                    "dry_run": False,
+                    "review_channel": 50,
+                    "logs_channel": None,
+                }
+                cog.config = SimpleNamespace(
+                    guild_from_id=lambda guild_id: SimpleNamespace(
+                        all=mock.AsyncMock(return_value=config_values)
+                    )
+                )
+                appended = await asyncio.to_thread(
+                    cog._case_store.append_message,
+                    honeypot.NewMessage(
+                        guild_id=10,
+                        user_id=20,
+                        channel_id=30,
+                        message_id=40,
+                        content="evidence",
+                        created_at=now,
+                        jump_url="https://discord.test/messages/40",
+                        attachments=(
+                            honeypot.NewAttachment(
+                                0,
+                                "proof.png",
+                                5,
+                                "image/png",
+                                None,
+                                None,
+                                "https://cdn.test/proof.png",
+                                spoiler=False,
+                            ),
+                        ),
+                    ),
+                    (
+                        honeypot.DetectionSignal(
+                            "honeypot", "matched", honeypot.ActionIntent.BAN, True, {}
+                        ),
+                    ),
+                )
+                evidence_path = data_path / "proof.png"
+                evidence_path.write_bytes(b"image")
+                await asyncio.to_thread(
+                    capture_attachment,
+                    cog._case_store,
+                    appended.case.case_id,
+                    appended.message.sequence,
+                    0,
+                    evidence_path,
+                )
+                await asyncio.to_thread(
+                    publish_primary,
+                    cog._case_store,
+                    appended.case.case_id,
+                    50,
+                    60,
+                )
+                moderation = await asyncio.to_thread(
+                    cog._case_store.ensure_operation,
+                    appended.case.case_id,
+                    "moderation_action",
+                    f"moderation_action:{appended.case.case_id}:1:ban",
+                    appended.message.sequence,
+                )
+                review = await asyncio.to_thread(
+                    cog._case_store.ensure_operation,
+                    appended.case.case_id,
+                    "review_publish",
+                    f"review-publish:{appended.case.case_id}:1",
+                    appended.message.sequence,
+                )
+                claimed_moderation = await asyncio.to_thread(
+                    cog._case_store.claim_operation, moderation.operation_id, now
+                )
+                await cog._execute_detection_case_operation(claimed_moderation, now)
+
+                thread_messages = {}
+                next_message_id = 70
+
+                async def thread_send(*args, **kwargs):
+                    nonlocal next_message_id
+                    sent = SimpleNamespace(id=next_message_id, edit=mock.AsyncMock())
+                    thread_messages[next_message_id] = sent
+                    next_message_id += 1
+                    return sent
+
+                thread = SimpleNamespace(
+                    id=60,
+                    archived=False,
+                    locked=False,
+                    guild=guild,
+                    edit=mock.AsyncMock(),
+                    send=mock.AsyncMock(side_effect=thread_send),
+                    fetch_message=mock.AsyncMock(
+                        side_effect=lambda message_id: thread_messages[message_id]
+                    ),
+                )
+                summary = SimpleNamespace(
+                    id=60,
+                    edit=mock.AsyncMock(),
+                    fetch_thread=mock.AsyncMock(
+                        side_effect=[
+                            honeypot.discord.NotFound("missing"),
+                            honeypot.discord.NotFound("missing"),
+                            thread,
+                        ]
+                    ),
+                    create_thread=mock.AsyncMock(
+                        side_effect=honeypot.discord.HTTPException("temporary")
+                    ),
+                )
+                channel = SimpleNamespace(
+                    id=50,
+                    fetch_message=mock.AsyncMock(return_value=summary),
+                    send=mock.AsyncMock(),
+                )
+                summary.channel = channel
+                cog._get_text_channel_or_thread = mock.Mock(return_value=channel)
+                embed = SimpleNamespace(add_field=mock.Mock())
+                with (
+                    mock.patch.object(
+                        honeypot.discord, "Color",
+                        SimpleNamespace(dark_red=lambda: 1, gold=lambda: 2),
+                    ),
+                    mock.patch.object(honeypot.discord, "Embed", return_value=embed),
+                    mock.patch.object(honeypot.discord, "File", return_value=object()),
+                    mock.patch.object(
+                        honeypot.discord, "AllowedMentions",
+                        SimpleNamespace(none=lambda: None),
+                    ),
+                ):
+                    first_review = await asyncio.to_thread(
+                        cog._case_store.claim_operation, review.operation_id, now
+                    )
+                    await cog._execute_detection_case_operation(first_review, now)
+                    failed = await asyncio.to_thread(
+                        cog._case_store.get_case, appended.case.case_id
+                    )
+                    failed_review = next(
+                        item for item in failed.operations
+                        if item.operation_id == review.operation_id
+                    )
+                    retry = await asyncio.to_thread(
+                        cog._case_store.claim_operation,
+                        review.operation_id,
+                        failed_review.retry_at,
+                    )
+                    await cog._execute_detection_case_operation(
+                        retry, failed_review.retry_at
+                    )
+
+                completed = await asyncio.to_thread(
+                    cog._case_store.get_case, appended.case.case_id
+                )
+                completed_review = next(
+                    item for item in completed.operations
+                    if item.operation_id == review.operation_id
+                )
+                self.assertEqual(completed_review.status.value, "succeeded")
+                self.assertEqual(completed_review.attempts, 2)
+                self.assertTrue(
+                    any(call.kwargs.get("files") for call in thread.send.await_args_list)
+                )
+                cog._execute_action.assert_awaited_once()
+
     async def test_moderation_starts_after_containment_without_waiting_for_capture(self):
         with TemporaryDirectory() as directory:
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
@@ -5939,6 +6176,38 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
                         message.attachments[0].read.assert_not_awaited()
                         self.assertIn("capture unavailable", scans[0]["error"])
+
+    async def test_image_processing_failure_is_recorded_for_moderators(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                cog = honeypot.Honeypot(_Bot())
+                message = self._message(honeypot, attachment_count=1)
+                message.attachments[0].read = mock.AsyncMock(return_value=b"broken image")
+                case_id = "case-image-processing-failure"
+                cog._imagescan_load_samples = mock.AsyncMock(return_value=())
+                cog._imagescan_model_state = mock.AsyncMock(
+                    return_value={"effective_threshold": 20}
+                )
+                cog._record_operational_failure = mock.AsyncMock()
+                cog._case_store.update_attachment_scan = mock.Mock()
+
+                with mock.patch.object(
+                    honeypot, "image_hashes_from_bytes", side_effect=ValueError("invalid image")
+                ):
+                    await cog._scan_case_message_images(
+                        message.guild.id,
+                        tuple(message.attachments),
+                        {"imagescan_detector_threshold": 20},
+                        case_id,
+                        1,
+                        (),
+                    )
+
+                cog._record_operational_failure.assert_awaited_once()
+                failure_call = cog._record_operational_failure.await_args
+                self.assertEqual(failure_call.args[:2], (message.guild.id, "image_scan"))
+                self.assertIn("invalid image", failure_call.args[2])
+                self.assertEqual(failure_call.kwargs["case_id"], case_id)
 
     async def test_concurrent_firstpost_messages_have_one_action_owner(self):
         with TemporaryDirectory() as directory:
@@ -8837,6 +9106,37 @@ class DetectionDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("Stale resolving cases: 0", report)
                 self.assertNotIn("Failed containment cases: 0", report)
                 self.assertNotIn("Outstanding durable operations", report)
+
+    async def test_doctor_reports_active_operational_failures(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                cog = honeypot.Honeypot(_Bot())
+                cog._case_store.initialize()
+                cog._case_store.record_operational_failure(
+                    guild_id=10,
+                    source="review_publish",
+                    summary="Could not create the case thread",
+                    occurred_at=datetime.now(timezone.utc),
+                )
+                cog.config = SimpleNamespace(
+                    guild=lambda guild: SimpleNamespace(
+                        all=mock.AsyncMock(
+                            return_value={
+                                "enabled": False,
+                                "action": "none",
+                                "fallback_action": "none",
+                                "whitelist_mode": "bypass",
+                            }
+                        )
+                    )
+                )
+                ctx = self._doctor_context()
+
+                await cog.honeypot_doctor(ctx)
+
+                report = "\n".join(call.args[0] for call in ctx.send.await_args_list)
+                self.assertIn("Active operational failures: 1", report)
+                self.assertIn("honeypot errors", report)
 
     async def test_doctor_checks_evidence_directory_off_event_loop_thread(self):
         with TemporaryDirectory() as directory:
