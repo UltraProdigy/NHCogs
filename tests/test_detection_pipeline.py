@@ -8829,7 +8829,7 @@ class DetectionDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(row_count, 0)
                 self.assertEqual(canonical.read_bytes(), b"pre-existing canonical")
 
-    async def test_doctor_reports_case_database_and_evidence_directory(self):
+    async def test_doctor_hides_healthy_operational_details(self):
         with TemporaryDirectory() as directory:
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
                 cog = honeypot.Honeypot(_Bot())
@@ -8850,13 +8850,12 @@ class DetectionDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 await cog.honeypot_doctor(ctx)
 
                 report = ctx.send.await_args.args[0]
-                self.assertIn("Detection case database", report)
-                self.assertIn("Detection case evidence directory", report)
-                self.assertIn("Active detection cases: 0", report)
-                self.assertIn("Due detection cases: 0", report)
-                self.assertIn("Stale resolving cases: 0", report)
-                self.assertIn("Failed containment cases: 0", report)
-                self.assertIn("Outstanding durable operations: 0", report)
+                self.assertIn("⚠️ Honeypot is disabled", report)
+                self.assertNotIn("Active detection cases", report)
+                self.assertNotIn("Due detection cases: 0", report)
+                self.assertNotIn("Stale resolving cases: 0", report)
+                self.assertNotIn("Failed containment cases: 0", report)
+                self.assertNotIn("Outstanding durable operations", report)
 
     async def test_doctor_checks_evidence_directory_off_event_loop_thread(self):
         with TemporaryDirectory() as directory:

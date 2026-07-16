@@ -101,6 +101,16 @@ DEFAULT_STATS = {
     "spam_kicks": 0,
     "spam_bans": 0,
     "spam_catches": 0,
+    "honeypot_hits": 0,
+    "honeypot_reviews": 0,
+    "honeypot_kicks": 0,
+    "honeypot_bans": 0,
+    "honeypot_catches": 0,
+    "image_hits": 0,
+    "image_reviews": 0,
+    "image_kicks": 0,
+    "image_bans": 0,
+    "image_catches": 0,
     "joinwatch_total_joins": 0,
     "joinwatch_young_joins": 0,
     "joinwatch_auto_roles_scheduled": 0,
@@ -971,8 +981,10 @@ class Honeypot(Cog):
         if any(signal.decisive for signal in signals):
             await self._increment_stat(guild, "suspicious")
         for detector, prefix, catch_key in (
+            ("honeypot", "honeypot", "honeypot_catches"),
             ("firstpost", "firstpost", "early_catches"),
             ("spam", "spam", "spam_catches"),
+            ("image", "image", "image_catches"),
         ):
             detector_signals = tuple(
                 signal for signal in signals if signal.detector == detector
@@ -2993,18 +3005,19 @@ class Honeypot(Cog):
                         moderator = guild.get_member(operation.actor_id)
                         if moderator is None:
                             moderator = await self._get_user_or_object(operation.actor_id)
+                        effect_started_at = datetime.now(timezone.utc)
                         started = await asyncio.to_thread(
                             self._case_store.start_operation_effect,
                             operation.operation_id,
                             operation.claim_token,
-                            datetime.now(timezone.utc),
+                            effect_started_at,
                         )
                         if not started:
                             raise RuntimeError("moderator action operation lease was lost")
                         _, failed = await self._execute_action(
                             guild,
                             member,
-                            snapshot.case.created_at,
+                            effect_started_at,
                             config,
                             reason=f"Honeypot review: {action.title()}",
                             action=action,
@@ -3506,6 +3519,8 @@ class Honeypot(Cog):
         if owning_signal.detector == "image":
             return "Honeypot"
         if owning_signal.detector == "honeypot":
+            if owning_signal.metadata.get("review_fallback"):
+                return "Message in the honeypot channel without a matching scam pattern."
             if owning_signal.metadata.get("second_strike"):
                 return "Suspicious Activity"
             if owning_signal.metadata.get("reasons") and not owning_signal.metadata.get(
@@ -3514,6 +3529,46 @@ class Honeypot(Cog):
                 return "Suspicious message in the honeypot channel."
             return "Message in the honeypot channel without a matching scam pattern."
         return "Honeypot"
+
+    @classmethod
+    def _resolve_unavailable_review_signals(
+        cls, config: dict, signals: tuple[DetectionSignal, ...]
+    ) -> tuple[DetectionSignal, ...]:
+        review_available = bool(
+            config.get("review_enabled", True)
+            and (
+                config.get("review_channel") is not None
+                or config.get("logs_channel") is not None
+            )
+        )
+        if review_available:
+            return signals
+        fallback = cls._signal_action(
+            config.get("fallback_action", "review"), FALLBACK_ACTION_OPTIONS
+        )
+        if fallback is ActionIntent.REVIEW:
+            fallback = ActionIntent.NONE
+        return tuple(
+            DetectionSignal(
+                signal.detector,
+                signal.reason,
+                (
+                    fallback
+                    if signal.detector == "honeypot"
+                    and signal.action is ActionIntent.REVIEW
+                    and not signal.metadata.get("containment_required")
+                    else signal.action
+                ),
+                signal.decisive,
+                (
+                    {**signal.metadata, "review_fallback": True}
+                    if signal.detector == "honeypot"
+                    and signal.action is ActionIntent.REVIEW
+                    else signal.metadata
+                ),
+            )
+            for signal in signals
+        )
 
     @staticmethod
     def _new_case_message(message: discord.Message) -> NewMessage:
@@ -5147,6 +5202,7 @@ class Honeypot(Cog):
         admission_lock: asyncio.Lock | None = None,
     ) -> None:
         timings = timings if timings is not None else {}
+        signals = self._resolve_unavailable_review_signals(config, signals)
         role_id = config.get("mute_role")
 
         def initial_operations(owned_signals):
@@ -8367,12 +8423,26 @@ class Honeypot(Cog):
                 "Firstpost bans": stats["firstpost_bans"],
                 "Early catches": stats["early_catches"],
             },
+            "Honeypot": {
+                "Honeypot hits": stats["honeypot_hits"],
+                "Honeypot reviews": stats["honeypot_reviews"],
+                "Honeypot kicks": stats["honeypot_kicks"],
+                "Honeypot bans": stats["honeypot_bans"],
+                "Honeypot catches": stats["honeypot_catches"],
+            },
             "Spam": {
                 "Spam hits": stats["spam_hits"],
                 "Spam reviews": stats["spam_reviews"],
                 "Spam kicks": stats["spam_kicks"],
                 "Spam bans": stats["spam_bans"],
                 "Spam catches": stats["spam_catches"],
+            },
+            "Image detection": {
+                "Image hits": stats["image_hits"],
+                "Image reviews": stats["image_reviews"],
+                "Image kicks": stats["image_kicks"],
+                "Image bans": stats["image_bans"],
+                "Image catches": stats["image_catches"],
             },
             "Review": {
                 "Reviews sent": stats["reviewed"],
@@ -8413,14 +8483,17 @@ class Honeypot(Cog):
         """Show public server safety statistics."""
         stats = DEFAULT_STATS.copy()
         stats.update(await self.config.guild(ctx.guild).stats())
+        detected_activity = stats["detections"]
+        moderation_actions = stats["kicked"] + stats["banned"]
+        automated_protections = (
+            stats["joinwatch_auto_roles"]
+            + stats["joinwatch_auto_role_punishments"]
+        )
         lines = [
-            f"  {_('Messages')}: {stats['detections']}",
-            f"  {_('Bans')}: {stats['banned']}",
-            f"  {_('Sent for Review')}: {stats['reviewed']}",
-            f"  {_('Early catches')}: {stats['early_catches']}",
-            f"  {_('Spam catches')}: {stats['spam_catches']}",
-            f"  {_('Auto roles applied')}: {stats['joinwatch_auto_roles']}",
-            f"  {_('Auto role punishments')}: {stats['joinwatch_auto_role_punishments']}",
+            f"  {_('Detected activity')}: {detected_activity}",
+            f"  {_('Moderation actions')}: {moderation_actions}",
+            f"  {_('Sent for review')}: {stats['reviewed']}",
+            f"  {_('Automated protections')}: {automated_protections}",
         ]
         await ctx.send(_("**Server safety stats:**\n") + box("\n".join(lines)))
 
@@ -8462,6 +8535,7 @@ class Honeypot(Cog):
         """Check honeypot configuration and required permissions."""
         config = await self.config.guild(ctx.guild).all()
         checks: list[tuple[str, bool, str]] = []
+        warnings: list[str] = []
         case_database_ok = True
         try:
             await asyncio.to_thread(self._case_store.verify_read_write)
@@ -8470,8 +8544,6 @@ class Honeypot(Cog):
             checks.append(
                 ("Detection case database", False, f"Read/write check failed: {error}")
             )
-        else:
-            checks.append(("Detection case database", True, "Read/write check passed."))
         try:
             await asyncio.to_thread(self._verify_detection_case_evidence_directory)
         except OSError as error:
@@ -8482,10 +8554,6 @@ class Honeypot(Cog):
                     f"Read/write check failed: {error}",
                 )
             )
-        else:
-            checks.append(
-                ("Detection case evidence directory", True, "Read/write check passed.")
-            )
         if case_database_ok:
             now = datetime.now(timezone.utc)
             case_counts = await asyncio.to_thread(
@@ -8495,12 +8563,8 @@ class Honeypot(Cog):
                 now - timedelta(minutes=5),
             )
             checks.extend(
-                (
-                    (
-                        f"Active detection cases: {case_counts['active_cases']}",
-                        True,
-                        "SQLite owns the active case count.",
-                    ),
+                check
+                for check in (
                     (
                         f"Due detection cases: {case_counts['due_cases']}",
                         case_counts["due_cases"] == 0,
@@ -8516,19 +8580,8 @@ class Honeypot(Cog):
                         case_counts["failed_containment"] == 0,
                         "Inspect moderation case delete failures.",
                     ),
-                    (
-                        "Outstanding durable operations: "
-                        f"{case_counts['outstanding_operations']}",
-                        case_counts["outstanding_operations"] == 0,
-                        "Inspect or retry durable detection operations.",
-                    ),
-                    (
-                        "Queued privacy deletions: "
-                        f"{case_counts['privacy_deletion_jobs']}",
-                        case_counts["privacy_deletion_jobs"] == 0,
-                        "Restore Discord permissions so privacy cleanup can retry.",
-                    ),
                 )
+                if not check[1]
             )
         me = ctx.guild.me
         if me is None:
@@ -8541,12 +8594,18 @@ class Honeypot(Cog):
         ]
         logs_channel = self._get_text_channel_or_thread(ctx.guild, config.get("logs_channel"))
         review_channel = self._get_text_channel_or_thread(ctx.guild, config.get("review_channel"))
-        checks.append(("Honeypot enabled", bool(config.get("enabled")), "Run `honeypot honeypot toggle true`."))
-        checks.append(("Action configured", config.get("action") in ("kick", "ban", "review", "none"), "Run `honeypot honeypot action`."))
-        checks.append(("Firstpost action configured", config.get("firstpost_action", "review") in CORE_ACTION_OPTIONS, "Run `honeypot firstpost action`."))
-        checks.append(("Spam action configured", config.get("spam_action", "review") in CORE_ACTION_OPTIONS, "Run `honeypot spam action`."))
-        checks.append(("Honeypot channel exists", bool(honeypot_channels), "Run `honeypot channel add`."))
-        checks.append(("Logs channel exists", logs_channel is not None, "Run `honeypot channel logs`."))
+        if not config.get("enabled"):
+            warnings.append("⚠️ Honeypot is disabled.")
+        if config.get("action") not in CORE_ACTION_OPTIONS:
+            checks.append(("Honeypot action is invalid", False, "Run `honeypot honeypot action`."))
+        if config.get("firstpost_action", "review") not in CORE_ACTION_OPTIONS:
+            checks.append(("Firstpost action is invalid", False, "Run `honeypot firstpost action`."))
+        if config.get("spam_action", "review") not in CORE_ACTION_OPTIONS:
+            checks.append(("Spam action is invalid", False, "Run `honeypot spam action`."))
+        if config.get("enabled") and not honeypot_channels:
+            checks.append(("No honeypot channel exists", False, "Run `honeypot channel add`."))
+        if config.get("enabled") and logs_channel is None:
+            checks.append(("Logs channel is missing", False, "Run `honeypot channel logs`."))
         if (
             config.get("fallback_action") == "review"
             or config.get("review_enabled")
@@ -8560,36 +8619,42 @@ class Honeypot(Cog):
                 and config.get("spam_action", "review") == "review"
             )
         ):
-            checks.append(("Review channel exists", review_channel is not None, "Run `honeypot review channel`."))
+            if review_channel is None:
+                checks.append(("Review channel is missing", False, "Run `honeypot review channel`."))
         if config.get("mute_role"):
             mute_role = ctx.guild.get_role(config["mute_role"])
-            checks.append(("Mute role exists", mute_role is not None, "Run `honeypot punishment mute_role`."))
+            if mute_role is None:
+                checks.append(("Mute role is missing", False, "Run `honeypot punishment mute_role`."))
             if mute_role is not None:
-                checks.append(("Bot above mute role", me.top_role > mute_role, "Move bot role above mute role."))
+                if not me.top_role > mute_role:
+                    checks.append(("Bot is not above mute role", False, "Move bot role above mute role."))
         if config.get("joinwatch_auto_role_enabled"):
             auto_role_id = config.get("joinwatch_auto_role_id")
             auto_role = ctx.guild.get_role(auto_role_id) if auto_role_id else None
-            checks.append(("Joinwatch auto-role exists", auto_role is not None, "Run `honeypot joinwatch autorole role`."))
+            if auto_role is None:
+                checks.append(("Joinwatch auto-role is missing", False, "Run `honeypot joinwatch autorole role`."))
             if auto_role is not None:
-                checks.append(("Bot above joinwatch auto-role", me.top_role > auto_role, "Move bot role above the joinwatch auto-role."))
+                if not me.top_role > auto_role:
+                    checks.append(("Bot is not above joinwatch auto-role", False, "Move bot role above the joinwatch auto-role."))
         if config.get("joinwatch_enabled") and config.get("joinwatch_alert_enabled", True):
             joinwatch_channel = self._get_text_channel_or_thread(ctx.guild, config.get("joinwatch_channel"))
-            checks.append(("Joinwatch alert channel exists", joinwatch_channel is not None, "Run `honeypot joinwatch channel`."))
+            if joinwatch_channel is None:
+                checks.append(("Joinwatch alert channel is missing", False, "Run `honeypot joinwatch channel`."))
             if joinwatch_channel is not None:
                 perms = joinwatch_channel.permissions_for(me)
-                checks.append(("Can send joinwatch alerts", perms.send_messages, "Grant Send Messages."))
+                if not perms.send_messages:
+                    checks.append(("Cannot send joinwatch alerts", False, "Grant Send Messages."))
         for honeypot_channel in honeypot_channels:
             perms = honeypot_channel.permissions_for(me)
             missing_permissions = missing_purge_permissions(perms)
-            checks.append(
-                (
-                    f"Honeypot permissions in {honeypot_channel}",
-                    not missing_permissions,
-                    "Missing: {permissions}".format(
-                        permissions=", ".join(missing_permissions) if missing_permissions else "None",
-                    ),
+            if missing_permissions:
+                checks.append(
+                    (
+                        f"{honeypot_channel} permissions",
+                        False,
+                        "Missing: " + ", ".join(missing_permissions),
+                    )
                 )
-            )
         skipped_channels = []
         purgeable_channels = [
             channel
@@ -8610,17 +8675,10 @@ class Honeypot(Cog):
                     "\nManage - " + ", ".join(skipped_channels),
                 )
             )
-        else:
-            checks.append(
-                (
-                    "Cached purge can delete visible message channels",
-                    True,
-                    "Grant Manage Messages in visible channels where cached purge should delete messages.",
-                )
-            )
         if logs_channel is not None:
             perms = logs_channel.permissions_for(me)
-            checks.append(("Can send logs", perms.send_messages, "Grant Send Messages."))
+            if not perms.send_messages:
+                checks.append(("Cannot send logs", False, "Grant Send Messages."))
         if review_channel is not None:
             perms = review_channel.permissions_for(me)
             required = (
@@ -8636,28 +8694,39 @@ class Honeypot(Cog):
             missing = [
                 label for attribute, label in required if not getattr(perms, attribute, False)
             ]
-            checks.append(
-                (
-                    "Review channel supports case threads",
-                    isinstance(review_channel, discord.TextChannel) and not missing,
+            if not isinstance(review_channel, discord.TextChannel) or missing:
+                checks.append(
                     (
-                        "Use a normal text channel."
-                        if not isinstance(review_channel, discord.TextChannel)
-                        else "Grant: " + ", ".join(missing)
-                    ),
+                        "Review channel cannot host case threads",
+                        False,
+                        (
+                            "Use a normal text channel."
+                            if not isinstance(review_channel, discord.TextChannel)
+                            else "Grant: " + ", ".join(missing)
+                        ),
+                    )
                 )
-            )
         guild_perms = me.guild_permissions
-        checks.append(("Can kick members", guild_perms.kick_members, "Grant Kick Members."))
-        checks.append(("Can ban members", guild_perms.ban_members, "Grant Ban Members."))
-        checks.append(("Can manage roles", guild_perms.manage_roles, "Grant Manage Roles for mute or joinwatch auto-role."))
+        configured_actions = {
+            config.get("action"),
+            config.get("fallback_action"),
+            config.get("firstpost_action"),
+            config.get("spam_action"),
+            config.get("imagescan_detector_action"),
+        }
+        if "kick" in configured_actions and not guild_perms.kick_members:
+            checks.append(("Cannot kick members", False, "Grant Kick Members."))
+        if "ban" in configured_actions and not guild_perms.ban_members:
+            checks.append(("Cannot ban members", False, "Grant Ban Members."))
+        if (config.get("mute_role") or config.get("joinwatch_auto_role_enabled")) and not guild_perms.manage_roles:
+            checks.append(("Cannot manage configured roles", False, "Grant Manage Roles."))
         failed = [
             f"❌ {name}{hint}" if hint.startswith("\n") else f"❌ {name} - {hint}"
             for name, ok, hint in checks
             if not ok
         ]
-        passed = [f"✅ {name}" for name, ok, _hint in checks if ok]
         header = _("**Honeypot doctor:**\n")
-        body = "\n".join(passed + failed)
+        findings = failed + warnings
+        body = "\n".join(findings) if findings else "✅ No configuration or runtime problems found."
         for page in pagify(body, page_length=2000 - len(header)):
             await ctx.send(header + page)
