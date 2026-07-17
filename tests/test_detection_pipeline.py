@@ -2487,6 +2487,69 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         cog._increment_stat = mock.AsyncMock()
         cog._purge_detection_case_cached_messages = mock.AsyncMock(return_value=0)
 
+    async def test_guild_message_from_departed_user_reaches_detection_pipeline(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                bot = _Bot()
+                bot.owner_ids = set()
+                bot.is_mod = mock.AsyncMock(return_value=False)
+                bot.is_admin = mock.AsyncMock(return_value=False)
+                cog = honeypot.Honeypot(bot)
+                message = self._message(honeypot, attachment_count=0)
+                message.guild.get_member = lambda user_id: None
+                message.guild.fetch_member = mock.AsyncMock(
+                    side_effect=honeypot.discord.NotFound("member was banned")
+                )
+                self._configure_public_boundary(
+                    cog,
+                    {
+                        "enabled": True,
+                        "logs_channel": None,
+                    },
+                )
+                del cog._is_protected_member
+                cog._collect_detection_signals = mock.AsyncMock(return_value=())
+
+                await cog.on_message(message)
+
+                message.guild.fetch_member.assert_awaited_once_with(message.author.id)
+                cog._collect_detection_signals.assert_awaited_once()
+
+    async def test_uncached_protected_member_is_still_excluded(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                bot = _Bot()
+                bot.owner_ids = set()
+                bot.is_mod = mock.AsyncMock(return_value=False)
+                bot.is_admin = mock.AsyncMock(return_value=False)
+                cog = honeypot.Honeypot(bot)
+                message = self._message(honeypot, attachment_count=0)
+                message.guild.me = SimpleNamespace(top_role=10)
+                resolved_member = SimpleNamespace(
+                    id=message.author.id,
+                    guild=message.guild,
+                    guild_permissions=SimpleNamespace(manage_guild=True),
+                    top_role=1,
+                )
+                message.guild.get_member = lambda user_id: None
+                message.guild.fetch_member = mock.AsyncMock(
+                    return_value=resolved_member
+                )
+                self._configure_public_boundary(
+                    cog,
+                    {
+                        "enabled": True,
+                        "logs_channel": None,
+                    },
+                )
+                del cog._is_protected_member
+                cog._collect_detection_signals = mock.AsyncMock(return_value=())
+
+                await cog.on_message(message)
+
+                message.guild.fetch_member.assert_awaited_once_with(message.author.id)
+                cog._collect_detection_signals.assert_not_awaited()
+
     async def test_whitelist_bypass_records_case_without_deleting_honeypot_message(self):
         with TemporaryDirectory() as directory:
             with _isolated_honeypot_modules(Path(directory)) as honeypot:

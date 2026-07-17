@@ -2228,13 +2228,45 @@ class Honeypot(Cog):
             return _("My top role must be above the joinwatch auto-role.")
         return None
 
-    async def _is_protected_member(self, member: discord.Member) -> bool:
-        me = member.guild.me
+    async def _is_protected_member(
+        self,
+        member: discord.Member | discord.User,
+        guild: discord.Guild | None = None,
+    ) -> bool:
+        if member.id in getattr(self.bot, "owner_ids", ()):
+            return True
+        member_guild = getattr(member, "guild", None)
+        guild = member_guild or guild
+        if guild is None:
+            return True
+        if member_guild is None or not hasattr(member, "guild_permissions"):
+            resolved_member = guild.get_member(member.id)
+            if resolved_member is None:
+                fetch_member = getattr(guild, "fetch_member", None)
+                if not callable(fetch_member):
+                    await self._record_operational_failure(
+                        guild.id,
+                        "member_resolution",
+                        f"Could not resolve guild member {member.id}: lookup unavailable",
+                    )
+                    return True
+                try:
+                    resolved_member = await fetch_member(member.id)
+                except discord.NotFound:
+                    return False
+                except discord.HTTPException as error:
+                    await self._record_operational_failure(
+                        guild.id,
+                        "member_resolution",
+                        f"Could not resolve guild member {member.id}: {error}",
+                    )
+                    return True
+            member = resolved_member
+        me = guild.me
         if me is None:
             return True
         return (
-            member.id in self.bot.owner_ids
-            or await self.bot.is_mod(member)
+            await self.bot.is_mod(member)
             or await self.bot.is_admin(member)
             or member.guild_permissions.manage_guild
             or member.top_role >= me.top_role
@@ -6259,7 +6291,7 @@ class Honeypot(Cog):
                 logs_channel = self._get_text_channel_or_thread(
                     message.guild, config.get("logs_channel")
                 )
-                if await self._is_protected_member(message.author):
+                if await self._is_protected_member(message.author, message.guild):
                     return
                 self._record_recent_user_message(message, config)
                 signals_started = perf_counter()
