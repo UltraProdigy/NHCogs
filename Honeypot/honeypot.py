@@ -389,6 +389,7 @@ class DetectionCaseView(discord.ui.View):
         message_sequence: int | None = None,
         resolved: bool = False,
         allow_individual: bool = True,
+        moderation_actions: tuple[str, ...] = ("ban", "kick", "ignore"),
     ) -> None:
         super().__init__()
         self.timeout = None
@@ -399,12 +400,14 @@ class DetectionCaseView(discord.ui.View):
         add_item = getattr(self, "add_item", None)
         if not callable(add_item):
             return
-        if self.message_sequence is None:
+        if self.message_sequence is None and not resolved:
             for label, action, style, emoji in (
                 ("Ban", "ban", discord.ButtonStyle.danger, "🔨"),
                 ("Kick", "kick", discord.ButtonStyle.secondary, "👢"),
                 ("Ignore", "ignore", discord.ButtonStyle.success, "✅"),
             ):
+                if action not in moderation_actions:
+                    continue
                 button = discord.ui.Button(
                     label=label,
                     style=style,
@@ -421,7 +424,7 @@ class DetectionCaseView(discord.ui.View):
 
                 button.callback = moderation_callback
                 add_item(button)
-        if not has_image_feedback:
+        if resolved or not has_image_feedback:
             return
         for label, action, style in (
             ("All TP", "tp", discord.ButtonStyle.success),
@@ -3371,7 +3374,10 @@ class Honeypot(Cog):
             view = DetectionCaseView(
                 self,
                 snapshot.case.case_id,
-                has_image_feedback=bool(case_feedback_items(snapshot)),
+                has_image_feedback=any(
+                    item.decision is None for item in case_feedback_items(snapshot)
+                ),
+                moderation_actions=self._case_available_moderation_actions(snapshot),
             )
             self._case_views[snapshot.case.case_id] = view
             self.bot.add_view(view, message_id=message_id)
@@ -4688,6 +4694,7 @@ class Honeypot(Cog):
                         has_image_feedback=has_pending_image_feedback,
                         message_sequence=message.sequence,
                         resolved=resolved,
+                        moderation_actions=(),
                     )
                     if chunk_index == 0 and not batches
                     else None
@@ -4720,6 +4727,7 @@ class Honeypot(Cog):
                         has_image_feedback=has_pending_image_feedback,
                         message_sequence=message.sequence,
                         resolved=resolved,
+                        moderation_actions=(),
                     )
                     if chunk_index == 0
                     else None
@@ -4872,6 +4880,21 @@ class Honeypot(Cog):
             )
             return True
 
+    @staticmethod
+    def _case_available_moderation_actions(snapshot) -> tuple[str, ...]:
+        completed = {
+            operation.result
+            for operation in snapshot.operations
+            if operation.operation_type
+            in {"moderation_action", "moderator_ban", "moderator_kick"}
+            and operation.status.value == "succeeded"
+        }
+        if "ban" in completed:
+            return ("ignore",)
+        if "kick" in completed:
+            return ("ban", "ignore")
+        return ("ban", "kick", "ignore")
+
     async def _publish_detection_case_serial(
         self,
         case_id: str,
@@ -4927,14 +4950,19 @@ class Honeypot(Cog):
 
         embed = projection_embed()
         resolved = snapshot.case.status.value in {"resolved", "expired"}
+        moderation_actions = self._case_available_moderation_actions(snapshot)
+        has_pending_image_feedback = any(
+            item.decision is None for item in projection.feedback_items
+        )
         view = DetectionCaseView(
             self,
             case_id,
-            has_image_feedback=bool(projection.feedback_items),
+            has_image_feedback=has_pending_image_feedback,
             resolved=resolved,
             allow_individual=sum(
                 item.decision is None for item in projection.feedback_items
             ) <= 25,
+            moderation_actions=moderation_actions,
         )
         self._case_views[case_id] = view
         existing = None
@@ -5071,6 +5099,7 @@ class Honeypot(Cog):
                 getattr(permissions, "moderate_members", False)
                 or getattr(permissions, "manage_messages", False)
                 or getattr(permissions, "ban_members", False)
+                or getattr(permissions, "kick_members", False)
             )
         )
 

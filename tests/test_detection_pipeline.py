@@ -7839,6 +7839,27 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                         "Individual",
                     ],
                 )
+
+                after_ban = honeypot.DetectionCaseView(
+                    honeypot.Honeypot(_Bot()),
+                    "case-1",
+                    has_image_feedback=True,
+                    moderation_actions=("ignore",),
+                )
+                self.assertEqual(
+                    [item.label for item in after_ban.children],
+                    ["Ignore", "All TP", "All FP", "Ignore", "Individual"],
+                )
+
+                after_classification = honeypot.DetectionCaseView(
+                    honeypot.Honeypot(_Bot()),
+                    "case-1",
+                    has_image_feedback=False,
+                )
+                self.assertEqual(
+                    [item.label for item in after_classification.children],
+                    ["Ban", "Kick", "Ignore"],
+                )
                 self.assertEqual(
                     [item.custom_id for item in view.children[:3]],
                     [
