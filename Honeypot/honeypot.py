@@ -1752,6 +1752,8 @@ class Honeypot(Cog):
             return True
         try:
             await member.remove_roles(role, reason=reason)
+        except discord.NotFound:
+            return True
         except discord.HTTPException:
             return False
         return True
@@ -2557,7 +2559,7 @@ class Honeypot(Cog):
         now: datetime,
         *,
         publication_channel=None,
-    ) -> None:
+    ) -> bool:
         operation = next(
             (
                 item
@@ -2568,7 +2570,7 @@ class Honeypot(Cog):
             None,
         )
         if operation is None:
-            return
+            return False
         claim_time = now
         if operation.status.value == "failed" and operation.retry_at is not None:
             claim_time = max(claim_time, operation.retry_at)
@@ -2581,6 +2583,25 @@ class Honeypot(Cog):
                 claim_time,
                 publication_channel=publication_channel,
             )
+            return True
+        return False
+
+    async def _release_detection_case_roles(
+        self, case_id: str, now: datetime
+    ) -> None:
+        role_ids = await asyncio.to_thread(self._case_store.owned_role_ids, case_id)
+        for role_id in role_ids:
+            operation = await asyncio.to_thread(
+                self._case_store.ensure_operation,
+                case_id,
+                "role_release",
+                f"role-release:{case_id}:{int(role_id)}",
+            )
+            claimed = await asyncio.to_thread(
+                self._case_store.claim_operation, operation.operation_id, now
+            )
+            if claimed is not None:
+                await self._execute_detection_case_operation(claimed, now)
 
     @staticmethod
     def _persisted_capture_results(snapshot, sequence: int):
@@ -2904,13 +2925,20 @@ class Honeypot(Cog):
                 self._case_store.get_case, operation.case_id
             )
             refresh_started = perf_counter()
-            await self._execute_detection_message_child(
+            review_executed = await self._execute_detection_message_child(
                 refreshed,
                 "review_publish",
                 source.sequence,
                 now,
                 publication_channel=publication_channel,
             )
+            if has_review_publication and not review_executed:
+                await self._publish_detection_case(
+                    operation.case_id,
+                    config,
+                    logs_channel,
+                    message_sequence=source.sequence,
+                )
             timings["refresh_ms"] = (perf_counter() - refresh_started) * 1000
             await asyncio.to_thread(
                 self._case_store.reconcile_moderator_actions,
@@ -3299,12 +3327,6 @@ class Honeypot(Cog):
                 if guild is None:
                     raise RuntimeError("detection case guild is unavailable")
                 role_id = int(operation.idempotency_key.rsplit(":", 1)[1])
-                member = guild.get_member(snapshot.case.user_id)
-                role = guild.get_role(role_id)
-                if member is None:
-                    raise RuntimeError("detection case member is unavailable")
-                if role is None:
-                    raise RuntimeError("detection case role is unavailable")
                 owned_role_ids = await asyncio.to_thread(
                     self._case_store.owned_role_ids, operation.case_id
                 )
@@ -3331,7 +3353,25 @@ class Honeypot(Cog):
                         else:
                             raise RuntimeError("detection operation lease was lost")
                     if operation_result != "ownership_transferred":
-                        if role in member.roles:
+                        role = guild.get_role(role_id)
+                        member = None
+                        if role is not None:
+                            member = guild.get_member(snapshot.case.user_id)
+                            if member is None:
+                                fetch_member = getattr(guild, "fetch_member", None)
+                                if not callable(fetch_member):
+                                    raise RuntimeError(
+                                        "detection case member lookup is unavailable"
+                                    )
+                                try:
+                                    member = await fetch_member(snapshot.case.user_id)
+                                except discord.NotFound:
+                                    member = None
+                                except discord.HTTPException as error:
+                                    raise RuntimeError(
+                                        "detection case member lookup failed"
+                                    ) from error
+                        if member is not None and role in member.roles:
                             removed = await self._remove_review_mute_role(
                                 member,
                                 role,
@@ -3528,6 +3568,16 @@ class Honeypot(Cog):
             await asyncio.to_thread(
                 self._case_store.compact_terminal_case, operation.case_id
             )
+        elif completed and operation.operation_type in {
+            "moderation_action",
+            "moderator_ban",
+            "moderator_kick",
+        }:
+            await self._finish_case_review_if_ready(
+                operation.case_id,
+                operation.actor_id,
+            )
+            await self._case_review_rerender_safely(operation.case_id)
         elif completed and operation.operation_type == "message_process":
             await self._finish_case_review_if_ready(operation.case_id, None)
 
@@ -3550,15 +3600,16 @@ class Honeypot(Cog):
             message_id = snapshot.case.review_message_id
             if message_id is None:
                 continue
+            projection = render_case(snapshot)
             pending_feedback = self._pending_feedback_items(
-                case_feedback_items(snapshot)
+                projection.feedback_items
             )
             view = DetectionCaseView(
                 self,
                 snapshot.case.case_id,
                 has_image_feedback=bool(pending_feedback),
                 feedback_items=pending_feedback,
-                moderation_actions=self._case_available_moderation_actions(snapshot),
+                moderation_actions=projection.moderation_actions,
             )
             self._case_views[snapshot.case.case_id] = view
             self.bot.add_view(view, message_id=message_id)
@@ -5077,24 +5128,6 @@ class Honeypot(Cog):
             )
         )
 
-    @staticmethod
-    def _case_available_moderation_actions(snapshot) -> tuple[str, ...]:
-        completed = {
-            operation.result
-            for operation in snapshot.operations
-            if operation.operation_type
-            in {
-                "moderation_action",
-                "moderator_ban",
-                "moderator_kick",
-                "moderator_ignore",
-            }
-            and operation.status.value == "succeeded"
-        }
-        if completed & {"ban", "kick", "kick_missing", "ignore"}:
-            return ()
-        return ("ban", "kick", "ignore")
-
     async def _publish_detection_case_serial(
         self,
         case_id: str,
@@ -5152,7 +5185,7 @@ class Honeypot(Cog):
 
         embed = projection_embed()
         resolved = snapshot.case.status.value in {"resolved", "expired"}
-        moderation_actions = self._case_available_moderation_actions(snapshot)
+        moderation_actions = projection.moderation_actions
         pending_feedback = self._pending_feedback_items(
             projection.feedback_items
         )
@@ -5335,6 +5368,17 @@ class Honeypot(Cog):
         ):
             return
         await self._case_review_rerender(case_id)
+
+    async def _case_review_rerender_safely(self, case_id: str) -> None:
+        try:
+            await self._case_review_rerender_if_open(case_id)
+        except Exception as error:
+            log.warning(
+                "Detection case moderation state could not be published "
+                "case=%s error=%s",
+                case_id,
+                error,
+            )
 
     async def _finish_case_review_if_ready(
         self, case_id: str, moderator_id: int | None
@@ -5550,11 +5594,12 @@ class Honeypot(Cog):
         try:
             if action == "ignore":
                 snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+                moderated_at = datetime.now(timezone.utc)
                 operation = await asyncio.to_thread(
                     self._case_store.record_moderator_ignore,
                     case_id,
                     interaction.user.id,
-                    datetime.now(timezone.utc),
+                    moderated_at,
                 )
                 if operation is None:
                     raise ValueError("detection case is already resolving or resolved")
@@ -5565,6 +5610,7 @@ class Honeypot(Cog):
                     guild = self.bot.get_guild(snapshot.case.guild_id)
                     if guild is not None:
                         await self._increment_stat(guild, "ignored")
+                await self._release_detection_case_roles(case_id, moderated_at)
                 await self._finish_case_review_if_ready(case_id, interaction.user.id)
                 await self._case_review_rerender_if_open(case_id)
                 return
@@ -5581,6 +5627,7 @@ class Honeypot(Cog):
                 raise ValueError("detection case is already resolving or resolved")
             if operation.operation_type != f"moderator_{action}":
                 raise ValueError("another moderator action already owns this case")
+            await self._case_review_rerender_safely(case_id)
             now = datetime.now(timezone.utc)
             if operation.status.value == "failed" and operation.retry_at is not None:
                 now = max(now, operation.retry_at)
@@ -5591,14 +5638,20 @@ class Honeypot(Cog):
                 await self._execute_detection_case_operation(claimed, now)
             snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
             persisted = next(
-                item
-                for item in snapshot.operations
-                if item.operation_id == operation.operation_id
+                (
+                    item
+                    for item in snapshot.operations
+                    if item.operation_id == operation.operation_id
+                ),
+                None,
             )
+            if persisted is None:
+                if snapshot.case.status.value in {"resolved", "expired"}:
+                    return
+                raise ValueError("moderator action result is unavailable")
             if persisted.status.value != "succeeded":
+                await self._case_review_rerender_safely(case_id)
                 raise ValueError(persisted.last_error or "moderator action failed")
-            await self._finish_case_review_if_ready(case_id, interaction.user.id)
-            await self._case_review_rerender_if_open(case_id)
         except (KeyError, ValueError) as error:
             await self._case_review_error(interaction, str(error))
 

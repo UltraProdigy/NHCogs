@@ -503,6 +503,144 @@ class CaseReviewProjectionTests(unittest.TestCase):
             ("<#20>: Posted in honeypot channel",),
         )
 
+    def test_honeypot_signal_preserves_specific_detection_reason(self):
+        snapshot = self.snapshot(channels=(20,))
+        snapshot = cases.CaseSnapshot(
+            snapshot.case,
+            snapshot.messages,
+            snapshot.attachments,
+            (
+                cases.SignalRecord(
+                    "case-1",
+                    1,
+                    cases.DetectionSignal(
+                        "honeypot",
+                        "Matched suspicious content rule",
+                        cases.ActionIntent.BAN,
+                        True,
+                        {},
+                    ),
+                ),
+            ),
+            snapshot.operations,
+        )
+
+        projection = case_review.render_case(snapshot)
+
+        self.assertIn("Matched suspicious content rule", projection.signal_lines[0])
+
+    def test_pending_automatic_action_owns_moderation_controls(self):
+        snapshot = self.snapshot(channels=(20,))
+        now = snapshot.case.created_at
+        operation = cases.OperationRecord(
+            "op-ban",
+            snapshot.case.case_id,
+            1,
+            "moderation_action",
+            cases.OperationStatus.RUNNING,
+            1,
+            now,
+            now,
+            None,
+            None,
+            None,
+            None,
+            "moderation:case-1:ban",
+            "claim",
+            now,
+        )
+        snapshot = cases.CaseSnapshot(
+            snapshot.case,
+            snapshot.messages,
+            snapshot.attachments,
+            snapshot.signals,
+            (operation,),
+        )
+
+        projection = case_review.render_case(snapshot)
+
+        self.assertEqual(projection.moderation_status, "Action pending")
+        self.assertEqual(projection.moderation_actions, ())
+
+    def test_failed_action_controls_match_persisted_ownership(self):
+        snapshot = self.snapshot(channels=(20,))
+        now = snapshot.case.created_at
+
+        def projection(
+            operation_type,
+            status,
+            retry_at=None,
+            case_status=cases.CaseStatus.PENDING,
+        ):
+            case = cases.CaseRecord(
+                **{**snapshot.case.__dict__, "status": case_status}
+            )
+            operation = cases.OperationRecord(
+                f"op-{operation_type}-{status.value}",
+                snapshot.case.case_id,
+                1,
+                operation_type,
+                status,
+                1,
+                now,
+                now,
+                retry_at,
+                "failure",
+                None,
+                99 if operation_type.startswith("moderator_") else None,
+                f"moderation:{operation_type}:{status.value}",
+                None,
+                None,
+            )
+            return case_review.render_case(
+                cases.CaseSnapshot(
+                    case,
+                    snapshot.messages,
+                    snapshot.attachments,
+                    snapshot.signals,
+                    (operation,),
+                )
+            )
+
+        self.assertEqual(
+            projection(
+                "moderator_ban",
+                cases.OperationStatus.FAILED,
+                now + timedelta(seconds=10),
+            ).moderation_actions,
+            ("ban",),
+        )
+        self.assertEqual(
+            projection(
+                "moderation_action",
+                cases.OperationStatus.FAILED,
+                now + timedelta(seconds=10),
+            ).moderation_actions,
+            (),
+        )
+        self.assertEqual(
+            projection(
+                "moderation_action",
+                cases.OperationStatus.ABANDONED,
+            ).moderation_actions,
+            ("ban", "kick", "ignore"),
+        )
+        self.assertEqual(
+            projection(
+                "moderator_kick",
+                cases.OperationStatus.ABANDONED,
+            ).moderation_actions,
+            ("ban", "kick", "ignore"),
+        )
+        self.assertEqual(
+            projection(
+                "moderator_kick",
+                cases.OperationStatus.ABANDONED,
+                case_status=cases.CaseStatus.RESOLVING,
+            ).moderation_actions,
+            (),
+        )
+
     def test_cached_purge_lists_each_message_with_human_status(self):
         snapshot = self.snapshot()
 

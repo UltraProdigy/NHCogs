@@ -9,6 +9,7 @@ from .detection_cases import (
     AttachmentKey,
     AttachmentRecord,
     CaseSnapshot,
+    CaseStatus,
     DeleteStatus,
     DetectionCaseStore,
     MessageRecord,
@@ -130,6 +131,7 @@ class CaseReviewProjection:
     message_count: int
     expires_at: datetime
     moderation_status: str
+    moderation_actions: tuple[str, ...]
     incomplete_evidence: bool
     message_lines: tuple[str, ...]
     signal_lines: tuple[str, ...]
@@ -339,7 +341,12 @@ def case_feedback_items(snapshot: CaseSnapshot) -> tuple[CaseFeedbackItem, ...]:
 
 
 def _signal_reason(detector: str, reason: str) -> str:
-    return "Posted in honeypot channel" if detector == "honeypot" else reason
+    if (
+        detector == "honeypot"
+        and reason == "Message posted in a configured honeypot channel"
+    ):
+        return "Posted in honeypot channel"
+    return reason
 
 
 def render_timeline(snapshot: CaseSnapshot) -> CaseTimelineProjection:
@@ -478,6 +485,7 @@ def render_case(snapshot: CaseSnapshot) -> CaseReviewProjection:
         or operation.operation_type
         in {"moderator_ban", "moderator_kick", "moderator_ignore"}
     )
+    moderation_actions = ("ban", "kick", "ignore")
     if moderation_operations:
         moderation = moderation_operations[-1]
         action = moderation.result
@@ -490,10 +498,24 @@ def render_case(snapshot: CaseSnapshot) -> CaseReviewProjection:
             )
         elif moderation.status is OperationStatus.SUCCEEDED:
             moderation_status = (action or "action").replace("_", " ").capitalize()
+            moderation_actions = ()
         elif moderation.status in {OperationStatus.FAILED, OperationStatus.ABANDONED}:
             moderation_status = "Action failed. See bot logs"
+            if (
+                moderation.status is OperationStatus.FAILED
+                and moderation.operation_type in {"moderator_ban", "moderator_kick"}
+            ):
+                moderation_actions = (
+                    moderation.operation_type.removeprefix("moderator_"),
+                )
+            elif not (
+                moderation.status is OperationStatus.ABANDONED
+                and snapshot.case.status is CaseStatus.PENDING
+            ):
+                moderation_actions = ()
         else:
             moderation_status = "Action pending"
+            moderation_actions = ()
     else:
         moderation_status = "none"
     incomplete_evidence = any(
@@ -624,6 +646,7 @@ def render_case(snapshot: CaseSnapshot) -> CaseReviewProjection:
         message_count=len(snapshot.messages),
         expires_at=snapshot.case.expires_at,
         moderation_status=moderation_status,
+        moderation_actions=moderation_actions,
         incomplete_evidence=incomplete_evidence,
         message_lines=message_lines,
         signal_lines=signal_lines,
