@@ -71,6 +71,7 @@ class CaseFeedbackItem:
     key: AttachmentKey
     filename: str
     decision: str | None
+    detector_matched: bool
 
     @property
     def message_sequence(self) -> int:
@@ -155,6 +156,32 @@ class CaseReviewService:
     def __init__(self, store: DetectionCaseStore) -> None:
         self._store = store
 
+    async def apply_bulk(
+        self, case_id: str, action: str, moderator_id: int
+    ) -> CaseSnapshot:
+        decision = self._decision(action)
+        snapshot = await self._snapshot(case_id)
+        feedback_items = case_feedback_items(snapshot)
+        decisions = {
+            item.key: decision
+            for item in feedback_items
+            if item.decision is None
+        }
+        if not decisions:
+            if feedback_items and all(
+                item.decision == decision for item in feedback_items
+            ):
+                return snapshot
+            raise ValueError("case has no unresolved image evidence")
+        await asyncio.to_thread(
+            self._store.apply_attachment_decisions,
+            case_id,
+            decisions,
+            moderator_id,
+            datetime.now(timezone.utc),
+        )
+        return await self._snapshot(case_id)
+
 
     async def apply_message(
         self,
@@ -165,13 +192,22 @@ class CaseReviewService:
     ) -> CaseSnapshot:
         decision = self._decision(action)
         snapshot = await self._snapshot(case_id)
-        decisions = {
-            item.key: decision
+        feedback_items = tuple(
+            item
             for item in case_feedback_items(snapshot)
             if item.message_sequence == message_sequence
+        )
+        decisions = {
+            item.key: decision
+            for item in feedback_items
+            if item.decision is None
         }
         if not decisions:
-            raise ValueError("message has no captured image evidence")
+            if feedback_items and all(
+                item.decision == decision for item in feedback_items
+            ):
+                return snapshot
+            raise ValueError("message has no unresolved image evidence")
         await asyncio.to_thread(
             self._store.apply_attachment_decisions,
             case_id,
@@ -221,7 +257,12 @@ def case_feedback_items(snapshot: CaseSnapshot) -> tuple[CaseFeedbackItem, ...]:
     """Return captured image evidence in stable case/message/position order."""
 
     return tuple(
-        CaseFeedbackItem(attachment.key, attachment.filename, attachment.learning_decision)
+        CaseFeedbackItem(
+            attachment.key,
+            attachment.filename,
+            attachment.learning_decision,
+            bool(attachment.match_metadata.get("matched")),
+        )
         for attachment in sorted(
             (
                 attachment

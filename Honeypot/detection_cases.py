@@ -2502,6 +2502,44 @@ class DetectionCaseStore:
             self._finalize_moderator_action_locked(connection, case_id, now_value)
             return True
 
+    def record_moderator_ignore(
+        self, case_id: str, actor_id: int, now: datetime
+    ) -> OperationRecord | None:
+        now_value = _to_timestamp(now)
+        operation_id = str(uuid4())
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            claimed = connection.execute(
+                """UPDATE detection_cases
+                   SET status = 'resolving', resolving_since = ?, resolving_token = ?
+                   WHERE case_id = ? AND status = 'pending'""",
+                (now_value, operation_id, case_id),
+            )
+            if claimed.rowcount != 1:
+                return None
+            connection.execute(
+                """INSERT INTO detection_operations
+                   (operation_id, case_id, message_sequence, operation_type, status,
+                    attempts, created_at, updated_at, retry_at, last_error, result,
+                    actor_id, idempotency_key)
+                   VALUES (?, ?, NULL, 'moderator_ignore', 'succeeded', 1,
+                           ?, ?, NULL, NULL, 'ignore', ?, ?)""",
+                (
+                    operation_id,
+                    case_id,
+                    now_value,
+                    now_value,
+                    actor_id,
+                    f"moderator-ignore:{case_id}",
+                ),
+            )
+            self._finalize_moderator_action_locked(connection, case_id, now_value)
+            row = connection.execute(
+                "SELECT * FROM detection_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            return self._operation_from_row(row)
+
     def reconcile_moderator_actions(self, now: datetime) -> tuple[str, ...]:
         now_value = _to_timestamp(now)
         with closing(self._connect()) as connection, connection:
@@ -2515,7 +2553,7 @@ class DetectionCaseStore:
                          ON detection_operations.operation_id = detection_cases.resolving_token
                        WHERE detection_cases.status = 'resolving'
                          AND detection_operations.operation_type IN (
-                           'moderator_ban', 'moderator_kick'
+                           'moderator_ban', 'moderator_kick', 'moderator_ignore'
                          )
                          AND detection_operations.status = 'succeeded'
                        ORDER BY detection_cases.created_at, detection_cases.case_id"""
@@ -2537,7 +2575,9 @@ class DetectionCaseStore:
                  ON detection_operations.operation_id = detection_cases.resolving_token
                WHERE detection_cases.case_id = ?
                  AND detection_cases.status = 'resolving'
-                 AND detection_operations.operation_type IN ('moderator_ban', 'moderator_kick')
+                 AND detection_operations.operation_type IN (
+                   'moderator_ban', 'moderator_kick', 'moderator_ignore'
+                 )
                  AND detection_operations.status = 'succeeded'""",
             (case_id,),
         ).fetchone()
@@ -2546,6 +2586,22 @@ class DetectionCaseStore:
         if connection.execute(
             """SELECT 1 FROM detection_attachments
                WHERE case_id = ? AND capture_status = 'pending' LIMIT 1""",
+            (case_id,),
+        ).fetchone() is not None:
+            return False
+        if connection.execute(
+            """SELECT 1 FROM detection_attachments
+               WHERE case_id = ? AND capture_status = 'captured'
+                 AND evidence_path IS NOT NULL AND learning_decision IS NULL
+                 AND (
+                   lower(COALESCE(content_type, '')) LIKE 'image/%'
+                   OR lower(filename) LIKE '%.jpg'
+                   OR lower(filename) LIKE '%.jpeg'
+                   OR lower(filename) LIKE '%.png'
+                   OR lower(filename) LIKE '%.webp'
+                   OR lower(filename) LIKE '%.gif'
+                 )
+               LIMIT 1""",
             (case_id,),
         ).fetchone() is not None:
             return False

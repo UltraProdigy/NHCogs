@@ -386,6 +386,7 @@ class DetectionCaseView(discord.ui.View):
         case_id: str,
         *,
         has_image_feedback: bool,
+        feedback_items: tuple[CaseFeedbackItem, ...] = (),
         message_sequence: int | None = None,
         resolved: bool = False,
         allow_individual: bool = True,
@@ -426,9 +427,15 @@ class DetectionCaseView(discord.ui.View):
                 add_item(button)
         if resolved or not has_image_feedback:
             return
-        for label, action, style in (
-            ("All TP", "tp", discord.ButtonStyle.success),
-            ("All FP", "fp", discord.ButtonStyle.danger),
+        bulk_actions = (
+            (
+                ("All TP", "tp", discord.ButtonStyle.success),
+                ("All FP", "fp", discord.ButtonStyle.danger),
+            )
+            if all(item.detector_matched for item in feedback_items)
+            else (("Add all", "tp", discord.ButtonStyle.success),)
+        )
+        for label, action, style in bulk_actions + (
             ("Ignore", "ignore", discord.ButtonStyle.secondary),
         ):
             button = discord.ui.Button(
@@ -496,6 +503,7 @@ class DetectionBulkConfirmationView(discord.ui.View):
         action: str,
         *,
         message_sequence: int | None = None,
+        confirm_label: str | None = None,
     ) -> None:
         super().__init__()
         self.timeout = 60
@@ -506,7 +514,9 @@ class DetectionBulkConfirmationView(discord.ui.View):
         add_item = getattr(self, "add_item", None)
         if not callable(add_item):
             return
-        label = "Confirm All TP" if action == "tp" else "Confirm All FP"
+        label = confirm_label or (
+            "Confirm All TP" if action == "tp" else "Confirm All FP"
+        )
         style = (
             discord.ButtonStyle.success
             if action == "tp"
@@ -575,7 +585,7 @@ class DetectionIndividualView(discord.ui.View):
         if not callable(add_item):
             return
         choices = feedback_items[:25]
-        keys = {str(index): item.key for index, item in enumerate(choices)}
+        items = {str(index): item for index, item in enumerate(choices)}
         selector = discord.ui.Select(
             placeholder="Choose an image",
             min_values=1,
@@ -594,41 +604,58 @@ class DetectionIndividualView(discord.ui.View):
         )
         action_buttons = []
 
+        def replace_action_buttons(item: CaseFeedbackItem) -> None:
+            remove_item = getattr(self, "remove_item", None)
+            for button in action_buttons:
+                if callable(remove_item):
+                    remove_item(button)
+                elif hasattr(self, "children") and button in self.children:
+                    self.children.remove(button)
+            action_buttons.clear()
+            actions = (
+                (
+                    ("TP", "tp", discord.ButtonStyle.success),
+                    ("FP", "fp", discord.ButtonStyle.danger),
+                    ("Ignore", "ignore", discord.ButtonStyle.secondary),
+                )
+                if item.detector_matched
+                else (
+                    ("Add", "tp", discord.ButtonStyle.success),
+                    ("Ignore", "ignore", discord.ButtonStyle.secondary),
+                )
+            )
+            for label, action, style in actions:
+                button = discord.ui.Button(
+                    label=label,
+                    style=style,
+                    disabled=False,
+                    row=1,
+                )
+
+                async def callback(interaction, selected=action):
+                    if self.selected_key is None:
+                        return
+                    await self.cog._case_review_attachment_interaction(
+                        interaction, self.selected_key, selected
+                    )
+
+                button.callback = callback
+                action_buttons.append(button)
+                add_item(button)
+
         async def select_callback(interaction):
             selected_value = selector.values[0]
-            self.selected_key = keys[selected_value]
+            selected_item = items[selected_value]
+            self.selected_key = selected_item.key
             for option in selector.options:
                 option.default = option.value == selected_value
-            for button in action_buttons:
-                button.disabled = False
+            replace_action_buttons(selected_item)
             await interaction.response.edit_message(
                 content=_("Choose the result for the selected image."), view=self
             )
 
         selector.callback = select_callback
         add_item(selector)
-        for label, action, style in (
-            ("TP", "tp", discord.ButtonStyle.success),
-            ("FP", "fp", discord.ButtonStyle.danger),
-            ("Ignore", "ignore", discord.ButtonStyle.secondary),
-        ):
-            button = discord.ui.Button(
-                label=label,
-                style=style,
-                disabled=True,
-                row=1,
-            )
-
-            async def callback(interaction, selected=action):
-                if self.selected_key is None:
-                    return
-                await self.cog._case_review_attachment_interaction(
-                    interaction, self.selected_key, selected
-                )
-
-            button.callback = callback
-            action_buttons.append(button)
-            add_item(button)
 
 
 
@@ -2046,6 +2073,28 @@ class Honeypot(Cog):
             return channel
         return None
 
+    async def _fetch_message_channel(
+        self, guild: discord.Guild, channel_id: int | None
+    ) -> typing.Any | None:
+        if channel_id is None:
+            return None
+        channel = guild.get_channel(channel_id)
+        if channel is None and hasattr(guild, "get_thread"):
+            channel = guild.get_thread(channel_id)
+        if channel is None:
+            channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            fetch_channel = getattr(guild, "fetch_channel", None)
+            if not callable(fetch_channel):
+                raise RuntimeError("detection source channel cannot be fetched")
+            try:
+                channel = await fetch_channel(channel_id)
+            except discord.NotFound:
+                return None
+        if not callable(getattr(channel, "fetch_message", None)):
+            raise RuntimeError("detection source channel cannot resolve messages")
+        return channel
+
     def _missing_channel_permissions(
         self,
         guild: discord.Guild,
@@ -2558,7 +2607,7 @@ class Honeypot(Cog):
         direct_message = live_message is not None
         channel = None
         if live_message is None:
-            channel = self._get_text_channel_or_thread(guild, source.channel_id)
+            channel = await self._fetch_message_channel(guild, source.channel_id)
         if channel is not None:
             fetch_message = getattr(channel, "fetch_message", None)
             if callable(fetch_message):
@@ -3371,12 +3420,14 @@ class Honeypot(Cog):
             message_id = snapshot.case.review_message_id
             if message_id is None:
                 continue
+            pending_feedback = self._pending_feedback_items(
+                case_feedback_items(snapshot)
+            )
             view = DetectionCaseView(
                 self,
                 snapshot.case.case_id,
-                has_image_feedback=any(
-                    item.decision is None for item in case_feedback_items(snapshot)
-                ),
+                has_image_feedback=bool(pending_feedback),
+                feedback_items=pending_feedback,
                 moderation_actions=self._case_available_moderation_actions(snapshot),
             )
             self._case_views[snapshot.case.case_id] = view
@@ -4660,11 +4711,10 @@ class Honeypot(Cog):
             batches, oversized, upload_limit = self._case_timeline_evidence_batches(
                 message, thread
             )
-            has_pending_image_feedback = any(
-                item.message_sequence == message.sequence
-                and item.decision is None
-                for item in feedback_items
+            pending_message_feedback = self._pending_feedback_items(
+                feedback_items, message.sequence
             )
+            has_pending_image_feedback = bool(pending_message_feedback)
             message_chunks = self._case_timeline_message_chunks(message)
             existing_message_chunks = sum(
                 1
@@ -4692,6 +4742,7 @@ class Honeypot(Cog):
                         self,
                         snapshot.case.case_id,
                         has_image_feedback=has_pending_image_feedback,
+                        feedback_items=pending_message_feedback,
                         message_sequence=message.sequence,
                         resolved=resolved,
                         moderation_actions=(),
@@ -4725,6 +4776,7 @@ class Honeypot(Cog):
                         self,
                         snapshot.case.case_id,
                         has_image_feedback=has_pending_image_feedback,
+                        feedback_items=pending_message_feedback,
                         message_sequence=message.sequence,
                         resolved=resolved,
                         moderation_actions=(),
@@ -4881,15 +4933,35 @@ class Honeypot(Cog):
             return True
 
     @staticmethod
+    def _pending_feedback_items(
+        feedback_items: tuple[CaseFeedbackItem, ...],
+        message_sequence: int | None = None,
+    ) -> tuple[CaseFeedbackItem, ...]:
+        return tuple(
+            item
+            for item in feedback_items
+            if item.decision is None
+            and (
+                message_sequence is None
+                or item.message_sequence == message_sequence
+            )
+        )
+
+    @staticmethod
     def _case_available_moderation_actions(snapshot) -> tuple[str, ...]:
         completed = {
             operation.result
             for operation in snapshot.operations
             if operation.operation_type
-            in {"moderation_action", "moderator_ban", "moderator_kick"}
+            in {
+                "moderation_action",
+                "moderator_ban",
+                "moderator_kick",
+                "moderator_ignore",
+            }
             and operation.status.value == "succeeded"
         }
-        if completed & {"ban", "kick", "kick_missing"}:
+        if completed & {"ban", "kick", "kick_missing", "ignore"}:
             return ()
         return ("ban", "kick", "ignore")
 
@@ -4949,17 +5021,16 @@ class Honeypot(Cog):
         embed = projection_embed()
         resolved = snapshot.case.status.value in {"resolved", "expired"}
         moderation_actions = self._case_available_moderation_actions(snapshot)
-        has_pending_image_feedback = any(
-            item.decision is None for item in projection.feedback_items
+        pending_feedback = self._pending_feedback_items(
+            projection.feedback_items
         )
         view = DetectionCaseView(
             self,
             case_id,
-            has_image_feedback=has_pending_image_feedback,
+            has_image_feedback=bool(pending_feedback),
+            feedback_items=pending_feedback,
             resolved=resolved,
-            allow_individual=sum(
-                item.decision is None for item in projection.feedback_items
-            ) <= 25,
+            allow_individual=len(pending_feedback) <= 25,
             moderation_actions=moderation_actions,
         )
         self._case_views[case_id] = view
@@ -5123,6 +5194,57 @@ class Honeypot(Cog):
         config = await self.config.guild_from_id(snapshot.case.guild_id).all()
         await self._publish_detection_case(case_id, config, None)
 
+    async def _case_review_rerender_if_open(self, case_id: str) -> None:
+        snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+        if (
+            snapshot is None
+            or snapshot.case.status.value in {"resolved", "expired"}
+            or snapshot.case.review_message_id is None
+        ):
+            return
+        await self._case_review_rerender(case_id)
+
+    async def _finish_case_review_if_ready(
+        self, case_id: str, moderator_id: int
+    ) -> bool:
+        snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+        if snapshot is None or any(
+            item.decision is None for item in case_feedback_items(snapshot)
+        ):
+            return False
+        completed = next(
+            (
+                operation
+                for operation in reversed(snapshot.operations)
+                if operation.operation_type
+                in {
+                    "moderation_action",
+                    "moderator_ban",
+                    "moderator_kick",
+                    "moderator_ignore",
+                }
+                and operation.status.value == "succeeded"
+                and operation.result
+                in {"ban", "kick", "kick_missing", "ignore"}
+            ),
+            None,
+        )
+        if completed is None:
+            return False
+        if snapshot.case.status.value in {"resolving", "resolved"}:
+            await self._run_detection_reconciliation()
+            refreshed = await asyncio.to_thread(self._case_store.get_case, case_id)
+            return bool(
+                refreshed is not None
+                and refreshed.case.status.value in {"resolved", "expired"}
+            )
+        resolution = "kick" if completed.result == "kick_missing" else completed.result
+        return await self.resolve_detection_case(
+            case_id,
+            resolution,
+            completed.actor_id or moderator_id,
+        )
+
     async def _case_review_bulk_interaction(
         self,
         interaction: discord.Interaction,
@@ -5134,20 +5256,42 @@ class Honeypot(Cog):
         if not self._case_review_has_permission(interaction):
             await self._case_review_error(interaction, _("You do not have permission to review this case."))
             return
+        snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+        pending_feedback = self._pending_feedback_items(
+            case_feedback_items(snapshot) if snapshot is not None else ()
+        )
+        all_detector_matched = bool(pending_feedback) and all(
+            item.detector_matched for item in pending_feedback
+        )
+        if action == "fp" and not all_detector_matched:
+            await self._case_review_error(
+                interaction,
+                _("FP is only available for images flagged by the detector."),
+            )
+            return
         if action in {"tp", "fp"} and not confirmed:
             await interaction.response.send_message(
                 _("Confirm this bulk image decision."),
-                view=DetectionBulkConfirmationView(self, case_id, action),
+                view=DetectionBulkConfirmationView(
+                    self,
+                    case_id,
+                    action,
+                    confirm_label=(
+                        "Confirm All TP"
+                        if all_detector_matched
+                        else "Confirm Add all"
+                    ),
+                ),
                 ephemeral=True,
             )
             return
         await interaction.response.defer()
         try:
-            resolved = await self.resolve_detection_case(
-                case_id, f"images:{action}", interaction.user.id
+            await self._case_review_service.apply_bulk(
+                case_id, action, interaction.user.id
             )
-            if not resolved:
-                raise ValueError("detection case is already resolved")
+            await self._finish_case_review_if_ready(case_id, interaction.user.id)
+            await self._case_review_rerender_if_open(case_id)
         except (KeyError, ValueError) as error:
             await self._case_review_error(interaction, str(error))
 
@@ -5165,6 +5309,20 @@ class Honeypot(Cog):
                 interaction, _("You do not have permission to review this case.")
             )
             return
+        snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
+        pending_feedback = self._pending_feedback_items(
+            case_feedback_items(snapshot) if snapshot is not None else (),
+            message_sequence,
+        )
+        all_detector_matched = bool(pending_feedback) and all(
+            item.detector_matched for item in pending_feedback
+        )
+        if action == "fp" and not all_detector_matched:
+            await self._case_review_error(
+                interaction,
+                _("FP is only available for images flagged by the detector."),
+            )
+            return
         if action in {"tp", "fp"} and not confirmed:
             await interaction.response.send_message(
                 _("Confirm this message's image decision."),
@@ -5173,6 +5331,11 @@ class Honeypot(Cog):
                     case_id,
                     action,
                     message_sequence=message_sequence,
+                    confirm_label=(
+                        "Confirm All TP"
+                        if all_detector_matched
+                        else "Confirm Add all"
+                    ),
                 ),
                 ephemeral=True,
             )
@@ -5182,7 +5345,8 @@ class Honeypot(Cog):
             await self._case_review_service.apply_message(
                 case_id, message_sequence, action, interaction.user.id
             )
-            await self._case_review_rerender(case_id)
+            await self._finish_case_review_if_ready(case_id, interaction.user.id)
+            await self._case_review_rerender_if_open(case_id)
         except (KeyError, ValueError) as error:
             await self._case_review_error(interaction, str(error))
 
@@ -5217,7 +5381,7 @@ class Honeypot(Cog):
                 await interaction.response.send_message(
                     _(
                         "Some images are still processing or have not been reviewed. "
-                        "Continuing will close the case without adding them to the image database."
+                        "Continue with moderation now?"
                     ),
                     view=DetectionModerationConfirmationView(self, case_id, action),
                     ephemeral=True,
@@ -5227,21 +5391,20 @@ class Honeypot(Cog):
         try:
             if action == "ignore":
                 snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
-                resolved = await self.resolve_detection_case(
-                    case_id, "ignore", interaction.user.id
+                operation = await asyncio.to_thread(
+                    self._case_store.record_moderator_ignore,
+                    case_id,
+                    interaction.user.id,
+                    datetime.now(timezone.utc),
                 )
-                if not resolved:
-                    current = await asyncio.to_thread(self._case_store.get_case, case_id)
-                    if current is not None and any(
-                        attachment.capture_status == "pending"
-                        for attachment in current.attachments
-                    ):
-                        raise ValueError("Attachments are still processing. Try again shortly.")
-                    raise ValueError("detection case is already resolved")
+                if operation is None:
+                    raise ValueError("detection case is already resolving or resolved")
                 if snapshot is not None:
                     self._deactivate_forward_purge(
                         snapshot.case.guild_id, snapshot.case.user_id
                     )
+                await self._finish_case_review_if_ready(case_id, interaction.user.id)
+                await self._case_review_rerender_if_open(case_id)
                 return
             if action not in {"ban", "kick"}:
                 raise ValueError("unsupported detection case moderation action")
@@ -5272,6 +5435,8 @@ class Honeypot(Cog):
             )
             if persisted.status.value != "succeeded":
                 raise ValueError(persisted.last_error or "moderator action failed")
+            await self._finish_case_review_if_ready(case_id, interaction.user.id)
+            await self._case_review_rerender_if_open(case_id)
         except (KeyError, ValueError) as error:
             await self._case_review_error(interaction, str(error))
 
@@ -5284,7 +5449,8 @@ class Honeypot(Cog):
         await interaction.response.defer()
         try:
             await self._case_review_service.apply_individual(key, action, interaction.user.id)
-            await self._case_review_rerender(key.case_id)
+            await self._finish_case_review_if_ready(key.case_id, interaction.user.id)
+            await self._case_review_rerender_if_open(key.case_id)
         except (KeyError, ValueError) as error:
             await self._case_review_error(interaction, str(error))
 

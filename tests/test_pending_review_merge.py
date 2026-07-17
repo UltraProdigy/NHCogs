@@ -107,12 +107,12 @@ class CaseReviewProjectionTests(unittest.TestCase):
         return cases.CaseSnapshot(case, messages, attachments, (), ())
 
     @staticmethod
-    def attachment(message_sequence, position, filename):
+    def attachment(message_sequence, position, filename, *, detector_matched=False):
         return cases.AttachmentRecord(
             cases.AttachmentKey("case-1", message_sequence, position), filename, 10,
             "image/png", None, None, "https://example.invalid/image",
             f"case/{message_sequence}/{position}-{filename}", "captured",
-            None, None, {}, None, {}, None,
+            None, None, {"matched": detector_matched}, None, {}, None,
         )
 
     def test_review_lists_channels_in_first_occurrence_order(self):
@@ -501,6 +501,26 @@ class CaseReviewProjectionTests(unittest.TestCase):
             [(1, 0), (1, 1), (2, 0)],
         )
 
+    def test_feedback_items_preserve_detector_match_result(self):
+        snapshot = self.snapshot()
+        snapshot = cases.CaseSnapshot(
+            snapshot.case,
+            snapshot.messages,
+            (
+                self.attachment(1, 0, "matched.png", detector_matched=True),
+                self.attachment(1, 1, "context.png"),
+            ),
+            snapshot.signals,
+            snapshot.operations,
+        )
+
+        items = case_review.case_feedback_items(snapshot)
+
+        self.assertEqual(
+            [item.detector_matched for item in items],
+            [True, False],
+        )
+
     def test_feedback_items_include_only_captured_image_evidence(self):
         snapshot = self.snapshot()
         pdf = cases.AttachmentRecord(
@@ -734,6 +754,20 @@ class CaseReviewServiceTests(unittest.IsolatedAsyncioTestCase):
             [None, None, "false_positive"],
         )
         self.assertEqual(snapshot.case.status, cases.CaseStatus.PENDING)
+
+    async def test_bulk_action_updates_only_unresolved_images(self):
+        case_id = self.create_case()
+        service = case_review.CaseReviewService(self.store)
+        await service.apply_individual(
+            cases.AttachmentKey(case_id, 1, 0), "fp", moderator_id=7
+        )
+
+        snapshot = await service.apply_bulk(case_id, "tp", moderator_id=7)
+
+        self.assertEqual(
+            [item.learning_decision for item in snapshot.attachments],
+            ["false_positive", "true_positive"],
+        )
 
     async def test_individual_action_uses_stable_attachment_key(self):
         case_id = self.create_case()
