@@ -4889,10 +4889,8 @@ class Honeypot(Cog):
             in {"moderation_action", "moderator_ban", "moderator_kick"}
             and operation.status.value == "succeeded"
         }
-        if "ban" in completed:
-            return ("ignore",)
-        if "kick" in completed:
-            return ("ban", "ignore")
+        if completed & {"ban", "kick", "kick_missing"}:
+            return ()
         return ("ban", "kick", "ignore")
 
     async def _publish_detection_case_serial(

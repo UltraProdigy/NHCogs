@@ -7844,11 +7844,11 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                     honeypot.Honeypot(_Bot()),
                     "case-1",
                     has_image_feedback=True,
-                    moderation_actions=("ignore",),
+                    moderation_actions=(),
                 )
                 self.assertEqual(
                     [item.label for item in after_ban.children],
-                    ["Ignore", "All TP", "All FP", "Ignore", "Individual"],
+                    ["All TP", "All FP", "Ignore", "Individual"],
                 )
 
                 after_classification = honeypot.DetectionCaseView(
