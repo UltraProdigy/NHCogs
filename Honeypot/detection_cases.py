@@ -963,8 +963,16 @@ class DetectionCaseStore:
                 protected_effect = connection.execute(
                     """SELECT 1 FROM detection_operations
                        WHERE operation_id = ?
-                         AND operation_type IN ('moderator_ban', 'moderator_kick')
-                         AND effect_started_at IS NOT NULL""",
+                          AND (
+                            (
+                              operation_type IN ('moderator_ban', 'moderator_kick')
+                              AND effect_started_at IS NOT NULL
+                            )
+                            OR (
+                              operation_type = 'moderator_ignore'
+                              AND status = 'succeeded'
+                            )
+                          )""",
                     (case_row["resolving_token"],),
                 ).fetchone()
                 if protected_effect is not None:
@@ -1763,6 +1771,23 @@ class DetectionCaseStore:
                     "UPDATE detection_cases SET needs_attention = 1 WHERE case_id = ?",
                     (case_id,),
                 )
+            return result.rowcount == 1
+
+    def complete_message_delete_retry(
+        self,
+        case_id: str,
+        message_sequence: int,
+        status: DeleteStatus,
+    ) -> bool:
+        if status not in {DeleteStatus.DELETED, DeleteStatus.ALREADY_GONE}:
+            raise ValueError("a message delete retry must finish successfully")
+        with closing(self._connect()) as connection, connection:
+            result = connection.execute(
+                """UPDATE detection_messages SET delete_status = ?, error = NULL
+                   WHERE case_id = ? AND sequence = ?
+                     AND delete_status IN ('forbidden', 'transient_failure')""",
+                (status.value, case_id, message_sequence),
+            )
             return result.rowcount == 1
 
     def mark_case_needs_attention(self, case_id: str) -> bool:

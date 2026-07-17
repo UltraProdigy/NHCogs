@@ -394,6 +394,55 @@ class DetectionCaseStoreTests(unittest.TestCase):
             attachments=attachments,
         )
 
+    def test_late_message_preserves_completed_ignore_until_evidence_finishes(self):
+        now = datetime(2026, 7, 14, 12, tzinfo=timezone.utc)
+        attachment = NewAttachment(
+            0,
+            "proof.png",
+            128,
+            "image/png",
+            32,
+            16,
+            "https://cdn.test/proof.png",
+        )
+        first = self.store.append_message(
+            self.message(40, now, attachments=(attachment,)),
+            (),
+        )
+        ignored = self.store.record_moderator_ignore(
+            first.case.case_id,
+            99,
+            now + timedelta(seconds=1),
+        )
+
+        second = self.store.append_message(
+            self.message(41, now + timedelta(seconds=2)),
+            (),
+        )
+        waiting = self.store.get_case(first.case.case_id)
+
+        self.assertEqual(ignored.result, "ignore")
+        self.assertEqual(second.case.case_id, first.case.case_id)
+        self.assertEqual(waiting.case.status, CaseStatus.RESOLVING)
+        self.assertIn(
+            ignored.operation_id,
+            {operation.operation_id for operation in waiting.operations},
+        )
+
+        self.store.fail_pending_attachment_captures(
+            first.case.case_id,
+            first.message.sequence,
+            "capture failed",
+        )
+        reconciled = self.store.reconcile_moderator_actions(
+            now + timedelta(seconds=3)
+        )
+        resolved = self.store.get_case(first.case.case_id)
+
+        self.assertEqual(reconciled, (first.case.case_id,))
+        self.assertEqual(resolved.case.status, CaseStatus.RESOLVED)
+        self.assertEqual(resolved.case.resolution, "ignore")
+
     def test_attachment_description_and_spoiler_survive_store_roundtrip(self):
         now = datetime(2026, 7, 14, 12, tzinfo=timezone.utc)
         attachment = NewAttachment(
@@ -719,6 +768,26 @@ class DetectionCaseStoreTests(unittest.TestCase):
             [signal.signal.detector for signal in snapshot.signals],
             ["forward_purge"],
         )
+
+    def test_failed_message_delete_can_be_completed_by_a_retry(self):
+        created_at = datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
+        appended = self.store.append_message(self.message(40, created_at), ())
+        case_id = appended.case.case_id
+        self.assertTrue(
+            self.store.update_message_delete(
+                case_id, 1, DeleteStatus.FORBIDDEN, "denied", True
+            )
+        )
+
+        self.assertTrue(
+            self.store.complete_message_delete_retry(
+                case_id, 1, DeleteStatus.DELETED
+            )
+        )
+
+        message = self.store.get_case(case_id).messages[0]
+        self.assertEqual(message.delete_status, DeleteStatus.DELETED)
+        self.assertIsNone(message.error)
 
     def test_shared_sqlite_reservations_cap_concurrent_case_evidence(self):
         created_at = datetime(2026, 7, 13, 12, tzinfo=timezone.utc)

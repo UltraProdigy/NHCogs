@@ -179,7 +179,12 @@ class ImageScanCleanupTests(unittest.TestCase):
 
     def test_detection_case_view_exposes_image_controls_with_feedback(self) -> None:
         view = honeypot.DetectionCaseView(
-            object(), "case-1", has_image_feedback=True
+            object(),
+            "case-1",
+            has_image_feedback=True,
+            feedback_items=(
+                SimpleNamespace(detector_matched=True, decision=None),
+            ),
         )
 
         custom_ids = {item.custom_id for item in view.children}

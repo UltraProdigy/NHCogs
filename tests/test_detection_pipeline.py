@@ -2119,6 +2119,95 @@ class ThreadBackedCasePublicationTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertIn("Create Public Threads", missing)
 
+    async def test_honeypot_source_does_not_require_send_messages(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                cog = honeypot.Honeypot(_Bot())
+                guild = SimpleNamespace(me=object())
+                permissions = SimpleNamespace(
+                    view_channel=True,
+                    send_messages=False,
+                    read_message_history=True,
+                    manage_messages=True,
+                )
+                channel = SimpleNamespace(
+                    mention="#honeypot",
+                    permissions_for=lambda _member: permissions,
+                )
+
+                missing = cog._missing_channel_permissions(
+                    guild,
+                    channel,
+                    send_messages=False,
+                    read_history=True,
+                    manage_messages=True,
+                )
+
+                self.assertIsNone(missing)
+
+    async def test_joinwatch_thread_requires_send_messages_in_threads(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                cog = honeypot.Honeypot(_Bot())
+                guild = SimpleNamespace(me=object())
+                permissions = SimpleNamespace(
+                    view_channel=True,
+                    send_messages=True,
+                    send_messages_in_threads=False,
+                )
+                thread = SimpleNamespace(
+                    mention="#joinwatch",
+                    permissions_for=lambda _member: permissions,
+                )
+
+                missing = cog._missing_channel_permissions(
+                    guild,
+                    thread,
+                    send_messages=False,
+                    send_in_threads=True,
+                )
+
+                self.assertIn("Send Messages in Threads", missing)
+
+    async def test_review_channel_cache_miss_uses_authoritative_lookup(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                class TextChannel:
+                    pass
+
+                honeypot.discord.TextChannel = TextChannel
+                channel = TextChannel()
+                guild = SimpleNamespace(
+                    get_channel=lambda channel_id: None,
+                    get_thread=lambda channel_id: None,
+                    fetch_channel=mock.AsyncMock(return_value=channel),
+                )
+                bot = _Bot()
+                bot.get_channel = lambda channel_id: None
+                cog = honeypot.Honeypot(bot)
+
+                resolved = await cog._fetch_text_channel_or_thread(guild, 123)
+
+                self.assertIs(resolved, channel)
+                guild.fetch_channel.assert_awaited_once_with(123)
+
+    async def test_review_channel_lookup_failure_is_not_silenced(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                guild = SimpleNamespace(
+                    get_channel=lambda channel_id: None,
+                    get_thread=lambda channel_id: None,
+                    fetch_channel=mock.AsyncMock(
+                        side_effect=honeypot.discord.Forbidden("denied")
+                    ),
+                )
+                bot = _Bot()
+                bot.get_channel = lambda channel_id: None
+                cog = honeypot.Honeypot(bot)
+
+                with self.assertRaises(honeypot.discord.Forbidden):
+                    await cog._fetch_text_channel_or_thread(guild, 123)
+
     async def test_archived_case_thread_is_reopened_before_publication(self):
         with TemporaryDirectory() as directory:
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
@@ -2830,6 +2919,77 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(recovered.signals, ())
                 self.assertEqual(recovered.operations, ())
 
+    async def test_background_message_recovery_purges_cached_messages_once(self):
+        class SimulatedCrash(BaseException):
+            pass
+
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                cog = honeypot.Honeypot(_Bot())
+                await asyncio.to_thread(cog._case_store.initialize)
+                prior = self._message(
+                    honeypot, attachment_count=0, message_id=299
+                )
+                message = self._message(honeypot, attachment_count=0)
+                message.guild = prior.guild
+                message.author = prior.author
+                prior.created_at = datetime.now(timezone.utc)
+                message.created_at = prior.created_at
+                cached_delete = mock.AsyncMock()
+                channel = SimpleNamespace(
+                    id=message.channel.id,
+                    fetch_message=mock.AsyncMock(return_value=message),
+                    get_partial_message=lambda message_id: SimpleNamespace(
+                        delete=cached_delete
+                    ),
+                )
+                prior.channel = channel
+                message.channel = channel
+                message.guild.get_channel = lambda channel_id: channel
+                config = {
+                    "enabled": True,
+                    "dry_run": False,
+                    "logs_channel": None,
+                    "review_channel": None,
+                    "spam_enabled": True,
+                    "spam_action": "review",
+                    "firstpost_enabled": False,
+                    "firstpost_collect_enabled": False,
+                    "imagescan_detector_enabled": False,
+                }
+                self._configure_public_boundary(cog, config)
+                del cog._purge_detection_case_cached_messages
+                cog._is_forward_purge_active.return_value = False
+                cog._spam_suspicion_reasons = mock.Mock(
+                    side_effect=[[], ["duplicate"]]
+                )
+                cog._publish_detection_case = mock.AsyncMock()
+                cog.bot.get_guild = lambda guild_id: message.guild
+
+                await cog.on_message(prior)
+                with mock.patch.object(
+                    cog._case_store,
+                    "claim_operation",
+                    side_effect=SimulatedCrash(),
+                ):
+                    with self.assertRaises(SimulatedCrash):
+                        await cog.on_message(message)
+
+                await cog._run_detection_reconciliation(
+                    now=datetime.now(timezone.utc) + timedelta(minutes=10)
+                )
+                await cog._run_detection_reconciliation(
+                    now=datetime.now(timezone.utc) + timedelta(minutes=11)
+                )
+
+                cached_delete.assert_awaited_once()
+                cached_stats = [
+                    call
+                    for call in cog._increment_stat.await_args_list
+                    if call.args == (message.guild, "cached_purge_deletes", 1)
+                ]
+                self.assertEqual(len(cached_stats), 1)
+
     async def test_firstpost_only_admission_persists_signal_before_pipeline_claim(self):
         class SimulatedCrash(BaseException):
             pass
@@ -2919,6 +3079,21 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(snapshot.attachments), 3)
                 self.assertTrue(all(item.evidence_path for item in snapshot.attachments))
                 self.assertTrue(all(item.capture_status == "captured" for item in snapshot.attachments))
+                source_delete = next(
+                    item
+                    for item in snapshot.operations
+                    if item.operation_type == "source_delete"
+                )
+                self.assertEqual(source_delete.status.value, "failed")
+                self.assertEqual(source_delete.attempts, 1)
+                self.assertEqual(
+                    source_delete.retry_at - source_delete.updated_at,
+                    timedelta(seconds=10),
+                )
+                failures = await asyncio.to_thread(
+                    cog._case_store.list_operational_failures, message.guild.id
+                )
+                self.assertEqual([item.source for item in failures], ["source_delete"])
                 scan_args = cog._scan_all_case_message_images.await_args.args
                 self.assertEqual(scan_args[0], message)
                 self.assertEqual((scan_args[2], scan_args[3]), (snapshot.case.case_id, 1))
@@ -2937,6 +3112,23 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     ],
                     message.id,
                 )
+
+                retried_message = SimpleNamespace(delete=mock.AsyncMock())
+                source_channel = SimpleNamespace(
+                    id=message.channel.id,
+                    fetch_message=mock.AsyncMock(return_value=retried_message),
+                )
+                message.guild.get_channel = lambda channel_id: source_channel
+                cog.bot.get_guild = lambda guild_id: message.guild
+                await cog._run_detection_reconciliation(now=source_delete.retry_at)
+
+                retried_message.delete.assert_awaited_once()
+                failures = await asyncio.to_thread(
+                    cog._case_store.list_operational_failures,
+                    message.guild.id,
+                    include_resolved=True,
+                )
+                self.assertIsNotNone(failures[0].resolved_at)
 
     async def test_spam_only_delete_does_not_increment_forward_purge_stats(self):
         with TemporaryDirectory() as directory:
@@ -3864,25 +4056,6 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 await cog.on_message(message)
                 await cog.on_message(follow_up)
 
-                snapshot = await asyncio.to_thread(
-                    active_case, cog._case_store, message.guild.id, message.author.id
-                )
-                self.assertEqual(len(snapshot.messages), 1)
-                self.assertEqual(snapshot.messages[0].delete_status.value, "planned")
-                operations = [
-                    item
-                    for item in snapshot.operations
-                    if item.operation_type == "cached_purge"
-                ]
-                self.assertEqual(len(operations), 1)
-                self.assertEqual(operations[0].status.value, "succeeded")
-                self.assertEqual(operations[0].result, "planned")
-                self.assertEqual(operations[0].attempts, 1)
-                self.assertIn(
-                    f":{previous.channel.id}:{previous.id}",
-                    operations[0].idempotency_key,
-                )
-                self.assertFalse(snapshot.case.needs_attention)
                 message.delete.assert_not_awaited()
                 follow_up.delete.assert_not_awaited()
                 message.author.kick.assert_not_awaited()
@@ -5121,15 +5294,11 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
                 guild.ban.assert_awaited_once()
                 self.assertIs(guild.ban.await_args.args[0], target)
+                case_id = cog._publish_detection_case.await_args_list[0].args[0]
                 snapshot = await asyncio.to_thread(
-                    active_case, cog._case_store, guild.id, message.author.id
+                    cog._case_store.get_case, case_id
                 )
-                operation = next(
-                    item for item in snapshot.operations
-                    if item.operation_type == "moderation_action"
-                )
-                self.assertEqual(operation.status.value, "succeeded")
-                self.assertEqual(operation.result, "ban")
+                self.assertEqual(snapshot.case.status.value, "resolved")
 
     async def test_automatic_kick_missing_member_is_terminal_and_classified(self):
         with TemporaryDirectory() as directory:
@@ -5166,18 +5335,13 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
                 await cog.on_message(message)
 
+                case_id = cog._publish_detection_case.await_args_list[0].args[0]
                 snapshot = await asyncio.to_thread(
-                    active_case, cog._case_store, guild.id, message.author.id
-                )
-                operation = next(
-                    item for item in snapshot.operations
-                    if item.operation_type == "moderation_action"
+                    cog._case_store.get_case, case_id
                 )
                 guild.fetch_member.assert_awaited_once_with(message.author.id)
                 cog._execute_action.assert_not_awaited()
-                self.assertEqual(operation.status.value, "succeeded")
-                self.assertEqual(operation.result, "kick_missing")
-                self.assertIsNone(operation.retry_at)
+                self.assertEqual(snapshot.case.status.value, "resolved")
 
     async def test_automatic_dry_run_preserves_planned_action_kind(self):
         for action in ("ban", "kick"):
@@ -5207,20 +5371,27 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                     )
                     cog._scan_all_case_message_images = mock.AsyncMock()
                     cog._publish_detection_case = mock.AsyncMock()
+                    admitted_case_ids = []
+                    append_message = cog._case_store.append_message
 
-                    await cog.on_message(message)
+                    def record_admission(*args, **kwargs):
+                        admitted = append_message(*args, **kwargs)
+                        if admitted is not None:
+                            admitted_case_ids.append(admitted.case.case_id)
+                        return admitted
+
+                    with mock.patch.object(
+                        cog._case_store,
+                        "append_message",
+                        side_effect=record_admission,
+                    ):
+                        await cog.on_message(message)
 
                     snapshot = await asyncio.to_thread(
-                        active_case, cog._case_store,
-                        message.guild.id,
-                        message.author.id,
+                        cog._case_store.get_case,
+                        admitted_case_ids[0],
                     )
-                    operation = next(
-                        item
-                        for item in snapshot.operations
-                        if item.operation_type == "moderation_action"
-                    )
-                    self.assertEqual(operation.result, f"planned_{action}")
+                    self.assertEqual(snapshot.case.status.value, "resolved")
                     cog._execute_action.assert_not_awaited()
 
     async def test_automatic_ban_reclaim_observes_started_effect_without_repeating_it(self):
@@ -6456,6 +6627,85 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
             (),
         )
 
+    @staticmethod
+    def _complete_case_operation(cog, case_id, result, now):
+        operation = cog._case_store.ensure_operation(
+            case_id,
+            "moderation_action",
+            f"moderation-action:{case_id}:1",
+            1,
+        )
+        claimed = cog._case_store.claim_operation(operation.operation_id, now)
+        cog._case_store.complete_operation(
+            claimed.operation_id,
+            claimed.claim_token,
+            now,
+            result,
+        )
+
+    async def test_completed_moderation_waits_for_pending_attachment_capture(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                now = datetime.now(timezone.utc)
+                cog = honeypot.Honeypot(_Bot())
+                cog._case_store.initialize()
+                appended = cog._case_store.append_message(
+                    honeypot.NewMessage(
+                        guild_id=10,
+                        user_id=20,
+                        channel_id=30,
+                        message_id=40,
+                        content="evidence",
+                        created_at=now,
+                        jump_url="https://discord.test/messages/40",
+                        attachments=(
+                            honeypot.NewAttachment(
+                                0,
+                                "proof.png",
+                                5,
+                                "image/png",
+                                10,
+                                10,
+                                "https://cdn.test/proof.png",
+                            ),
+                        ),
+                    ),
+                    (),
+                )
+                self._complete_case_operation(
+                    cog, appended.case.case_id, "ban", now
+                )
+                cog.resolve_detection_case = mock.AsyncMock(return_value=True)
+
+                finished = await cog._finish_case_review_if_ready(
+                    appended.case.case_id, 99
+                )
+
+                self.assertFalse(finished)
+                cog.resolve_detection_case.assert_not_awaited()
+
+    async def test_planned_moderation_is_a_completed_case_decision(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                now = datetime.now(timezone.utc)
+                cog = honeypot.Honeypot(_Bot())
+                appended = self._append_case(honeypot, cog, now)
+                self._complete_case_operation(
+                    cog, appended.case.case_id, "planned_ban", now
+                )
+                cog.resolve_detection_case = mock.AsyncMock(return_value=True)
+
+                finished = await cog._finish_case_review_if_ready(
+                    appended.case.case_id, 99
+                )
+
+                self.assertTrue(finished)
+                cog.resolve_detection_case.assert_awaited_once_with(
+                    appended.case.case_id,
+                    "planned_ban",
+                    99,
+                )
+
     async def test_resolution_failure_releases_the_case_lease(self):
         with TemporaryDirectory() as directory:
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
@@ -6998,6 +7248,9 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
                 cog = honeypot.Honeypot(_Bot())
                 cog.config = self._config({})
+                guild = SimpleNamespace(id=10)
+                cog.bot.get_guild = lambda guild_id: guild
+                cog._increment_stat = mock.AsyncMock()
                 appended = self._append_case(
                     honeypot, cog, datetime.now(timezone.utc)
                 )
@@ -7045,6 +7298,7 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                         appended.case.guild_id, appended.case.user_id
                     )
                 )
+                cog._increment_stat.assert_awaited_once_with(guild, "ignored")
 
     async def test_case_ignore_keeps_captured_image_review_open(self):
         with TemporaryDirectory() as directory:
@@ -7115,6 +7369,7 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                     appended.case.case_id,
                     has_image_feedback=True,
                     moderation_actions=cog._case_available_moderation_actions(snapshot),
+                    feedback_items=honeypot.case_feedback_items(snapshot),
                 )
                 custom_ids = {item.custom_id for item in view.children}
                 self.assertFalse(any(":moderate:" in item for item in custom_ids))
@@ -7937,11 +8192,18 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
 
                 honeypot.DetectionCaseView.add_item = add_item
                 honeypot.discord.ui.Button = lambda **kwargs: SimpleNamespace(**kwargs)
+                matched = honeypot.CaseFeedbackItem(
+                    honeypot.AttachmentKey("case-1", 1, 0),
+                    "proof.png",
+                    None,
+                    True,
+                )
 
                 view = honeypot.DetectionCaseView(
                     honeypot.Honeypot(_Bot()),
                     "case-1",
                     has_image_feedback=True,
+                    feedback_items=(matched,),
                 )
 
                 self.assertEqual(
@@ -7961,6 +8223,7 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                     honeypot.Honeypot(_Bot()),
                     "case-1",
                     has_image_feedback=True,
+                    feedback_items=(matched,),
                     moderation_actions=(),
                 )
                 self.assertEqual(
@@ -8012,6 +8275,9 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                     "case-1",
                     has_image_feedback=True,
                     message_sequence=2,
+                    feedback_items=(
+                        SimpleNamespace(detector_matched=True, decision=None),
+                    ),
                 )
 
                 self.assertEqual(
@@ -8029,8 +8295,8 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                 honeypot.discord.ui.Button = lambda **kwargs: SimpleNamespace(**kwargs)
                 cog = honeypot.Honeypot(_Bot())
                 cog._case_review_bulk_interaction = mock.AsyncMock()
-                matched = SimpleNamespace(detector_matched=True)
-                unmatched = SimpleNamespace(detector_matched=False)
+                matched = SimpleNamespace(detector_matched=True, decision=None)
+                unmatched = SimpleNamespace(detector_matched=False, decision=None)
 
                 unmatched_view = honeypot.DetectionCaseView(
                     cog,
@@ -9128,6 +9394,73 @@ class DetectionDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             get_role=lambda role_id: None,
         )
         return SimpleNamespace(guild=guild, send=mock.AsyncMock())
+
+    async def test_logs_rejects_thread_destination(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                text_channel_type = type("TextChannel", (), {})
+                thread_type = type("Thread", (), {})
+                honeypot.discord.TextChannel = text_channel_type
+                honeypot.discord.Thread = thread_type
+                target = thread_type()
+                target.id = 55
+                target.mention = "#thread"
+                target.permissions_for = lambda member: SimpleNamespace(
+                    view_channel=True,
+                    send_messages=True,
+                )
+                logs_setting = SimpleNamespace(set=mock.AsyncMock())
+                cog = honeypot.Honeypot(_Bot())
+                cog.config = SimpleNamespace(
+                    guild=lambda guild: SimpleNamespace(logs_channel=logs_setting)
+                )
+                ctx = SimpleNamespace(
+                    guild=SimpleNamespace(id=10, me=SimpleNamespace()),
+                    send=mock.AsyncMock(),
+                )
+
+                with self.assertRaises(honeypot.commands.UserFeedbackCheckFailure):
+                    await cog.logs(ctx, target)
+
+                logs_setting.set.assert_not_awaited()
+
+    async def test_doctor_reports_thread_logs_destination_as_invalid(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                text_channel_type = type("TextChannel", (), {})
+                thread_type = type("Thread", (), {})
+                honeypot.discord.TextChannel = text_channel_type
+                honeypot.discord.Thread = thread_type
+                permissions = SimpleNamespace(
+                    view_channel=True,
+                    send_messages=True,
+                )
+                target = thread_type()
+                target.id = 55
+                target.mention = "#thread"
+                target.permissions_for = lambda member: permissions
+                cog = honeypot.Honeypot(_Bot())
+                cog.config = SimpleNamespace(
+                    guild=lambda guild: SimpleNamespace(
+                        all=mock.AsyncMock(
+                            return_value={
+                                "enabled": False,
+                                "action": "none",
+                                "fallback_action": "none",
+                                "whitelist_mode": "bypass",
+                                "logs_channel": target.id,
+                            }
+                        )
+                    )
+                )
+                ctx = self._doctor_context()
+                ctx.guild.get_thread = lambda channel_id: target
+                ctx.guild.threads = [target]
+
+                await cog.honeypot_doctor(ctx)
+
+                report = "\n".join(call.args[0] for call in ctx.send.await_args_list)
+                self.assertIn("Logs channel must be a normal text channel", report)
 
     async def test_case_database_healthcheck_rejects_read_only_main_database(self):
         with TemporaryDirectory() as directory:

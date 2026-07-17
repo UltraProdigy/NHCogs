@@ -42,11 +42,14 @@ from .detection_cases import (
 from .case_review import (
     CaseFeedbackItem,
     CaseReviewService,
+    available_image_review_actions,
+    bulk_image_confirmation_label,
     case_custom_id,
     case_feedback_items,
     is_persisted_image_attachment,
     render_case,
     render_timeline,
+    validate_image_review_action,
 )
 from . import detection_runtime
 from .image_detector import (
@@ -427,17 +430,20 @@ class DetectionCaseView(discord.ui.View):
                 add_item(button)
         if resolved or not has_image_feedback:
             return
-        bulk_actions = (
-            (
-                ("All TP", "tp", discord.ButtonStyle.success),
-                ("All FP", "fp", discord.ButtonStyle.danger),
-            )
-            if all(item.detector_matched for item in feedback_items)
-            else (("Add all", "tp", discord.ButtonStyle.success),)
-        )
-        for label, action, style in bulk_actions + (
-            ("Ignore", "ignore", discord.ButtonStyle.secondary),
-        ):
+        available_actions = available_image_review_actions(feedback_items)
+        labels = {
+            "tp": "All TP" if "fp" in available_actions else "Add all",
+            "fp": "All FP",
+            "ignore": "Ignore",
+        }
+        styles = {
+            "tp": discord.ButtonStyle.success,
+            "fp": discord.ButtonStyle.danger,
+            "ignore": discord.ButtonStyle.secondary,
+        }
+        for action in available_actions:
+            label = labels[action]
+            style = styles[action]
             button = discord.ui.Button(
                 label=label,
                 style=style,
@@ -504,6 +510,7 @@ class DetectionBulkConfirmationView(discord.ui.View):
         *,
         message_sequence: int | None = None,
         confirm_label: str | None = None,
+        expected_keys: tuple[AttachmentKey, ...] = (),
     ) -> None:
         super().__init__()
         self.timeout = 60
@@ -511,6 +518,7 @@ class DetectionBulkConfirmationView(discord.ui.View):
         self.case_id = case_id
         self.action = action
         self.message_sequence = message_sequence
+        self.expected_keys = expected_keys
         add_item = getattr(self, "add_item", None)
         if not callable(add_item):
             return
@@ -531,6 +539,7 @@ class DetectionBulkConfirmationView(discord.ui.View):
                     self.case_id,
                     self.action,
                     confirmed=True,
+                    expected_keys=self.expected_keys,
                 )
             else:
                 await self.cog._case_review_message_bulk_interaction(
@@ -539,6 +548,7 @@ class DetectionBulkConfirmationView(discord.ui.View):
                     self.message_sequence,
                     self.action,
                     confirmed=True,
+                    expected_keys=self.expected_keys,
                 )
 
         button.callback = callback
@@ -612,19 +622,20 @@ class DetectionIndividualView(discord.ui.View):
                 elif hasattr(self, "children") and button in self.children:
                     self.children.remove(button)
             action_buttons.clear()
-            actions = (
-                (
-                    ("TP", "tp", discord.ButtonStyle.success),
-                    ("FP", "fp", discord.ButtonStyle.danger),
-                    ("Ignore", "ignore", discord.ButtonStyle.secondary),
-                )
-                if item.detector_matched
-                else (
-                    ("Add", "tp", discord.ButtonStyle.success),
-                    ("Ignore", "ignore", discord.ButtonStyle.secondary),
-                )
-            )
-            for label, action, style in actions:
+            available_actions = available_image_review_actions((item,))
+            labels = {
+                "tp": "TP" if "fp" in available_actions else "Add",
+                "fp": "FP",
+                "ignore": "Ignore",
+            }
+            styles = {
+                "tp": discord.ButtonStyle.success,
+                "fp": discord.ButtonStyle.danger,
+                "ignore": discord.ButtonStyle.secondary,
+            }
+            for action in available_actions:
+                label = labels[action]
+                style = styles[action]
                 button = discord.ui.Button(
                     label=label,
                     style=style,
@@ -2100,6 +2111,7 @@ class Honeypot(Cog):
         guild: discord.Guild,
         channel: discord.TextChannel | discord.Thread,
         *,
+        send_messages: bool = True,
         read_history: bool = False,
         manage_messages: bool = False,
         create_public_threads: bool = False,
@@ -2114,7 +2126,7 @@ class Honeypot(Cog):
         perms = channel.permissions_for(me)
         if not perms.view_channel:
             return _("I need `View Channel` in {channel}.").format(channel=channel.mention)
-        if not perms.send_messages:
+        if send_messages and not perms.send_messages:
             return _("I need `Send Messages` in {channel}.").format(channel=channel.mention)
         if read_history and not perms.read_message_history:
             return _("I need `Read Message History` in {channel}.").format(channel=channel.mention)
@@ -2689,6 +2701,41 @@ class Honeypot(Cog):
                     delete_result.error,
                     needs_attention,
                 )
+                if needs_attention:
+                    retry = await asyncio.to_thread(
+                        self._case_store.ensure_operation,
+                        operation.case_id,
+                        "source_delete",
+                        (
+                            f"source-delete:{operation.case_id}:"
+                            f"{source.channel_id}:{source.message_id}"
+                        ),
+                        source.sequence,
+                    )
+                    claimed_retry = await asyncio.to_thread(
+                        self._case_store.claim_operation,
+                        retry.operation_id,
+                        now,
+                    )
+                    if claimed_retry is not None:
+                        failed_retry = await asyncio.to_thread(
+                            self._case_store.fail_operation,
+                            claimed_retry.operation_id,
+                            claimed_retry.claim_token,
+                            delete_result.error or delete_result.status.value,
+                            now,
+                            now + timedelta(seconds=DETECTION_FAST_RETRY_SECONDS),
+                            delete_result.status.value,
+                        )
+                        if failed_retry:
+                            await self._record_operational_failure(
+                                snapshot.case.guild_id,
+                                "source_delete",
+                                delete_result.error or delete_result.status.value,
+                                case_id=operation.case_id,
+                                operation_id=claimed_retry.operation_id,
+                                attempts=claimed_retry.attempts,
+                            )
                 if direct_message:
                     if delete_result.status is DeleteStatus.DELETED:
                         await self._increment_stat(guild, "purged_messages")
@@ -2706,7 +2753,7 @@ class Honeypot(Cog):
                             await self._increment_stat(
                                 guild, "forward_purge_delete_failures"
                             )
-            if containment_required and direct_message:
+            if containment_required and live_message is not None:
                 deleted = await self._purge_detection_case_cached_messages(
                     guild,
                     snapshot.case.user_id,
@@ -3107,6 +3154,53 @@ class Honeypot(Cog):
                     DeleteStatus.ALREADY_GONE,
                 ):
                     raise RuntimeError(result.error or result.status.value)
+            elif operation.operation_type == "source_delete":
+                guild = self.bot.get_guild(snapshot.case.guild_id)
+                if guild is None:
+                    raise RuntimeError("detection case guild is unavailable")
+                _, case_id, channel_id, message_id = operation.idempotency_key.split(":")
+                if case_id != operation.case_id:
+                    raise RuntimeError("source delete operation case identity does not match")
+                if operation.message_sequence is None:
+                    raise RuntimeError("source delete operation has no message identity")
+                channel = await self._fetch_message_channel(guild, int(channel_id))
+                if channel is None:
+                    result = detection_runtime.DeleteResult(
+                        DeleteStatus.ALREADY_GONE, 1, None
+                    )
+                else:
+                    try:
+                        message = await channel.fetch_message(int(message_id))
+                    except discord.NotFound:
+                        result = detection_runtime.DeleteResult(
+                            DeleteStatus.ALREADY_GONE, 1, None
+                        )
+                    else:
+                        result = await detection_runtime.delete_message(message)
+                operation_result = result.status.value
+                if result.status not in {
+                    DeleteStatus.DELETED,
+                    DeleteStatus.ALREADY_GONE,
+                }:
+                    raise RuntimeError(result.error or result.status.value)
+                completed_delete = await asyncio.to_thread(
+                    self._case_store.complete_message_delete_retry,
+                    operation.case_id,
+                    operation.message_sequence,
+                    result.status,
+                )
+                if completed_delete and result.status is DeleteStatus.DELETED:
+                    await self._increment_stat(guild, "purged_messages")
+                    source_signals = tuple(
+                        item.signal
+                        for item in snapshot.signals
+                        if item.message_sequence == operation.message_sequence
+                    )
+                    if any(
+                        signal.detector == "forward_purge"
+                        for signal in source_signals
+                    ):
+                        await self._increment_stat(guild, "forward_purge_deletes")
             elif operation.operation_type in {"moderator_ban", "moderator_kick"}:
                 action = operation.operation_type.removeprefix("moderator_")
                 config = await self.config.guild_from_id(snapshot.case.guild_id).all()
@@ -3299,6 +3393,8 @@ class Honeypot(Cog):
                 if operation.attempts <= DETECTION_FAST_RETRY_LIMIT
                 else timedelta(minutes=DETECTION_SLOW_RETRY_MINUTES)
             )
+            if operation.operation_type == "source_delete":
+                retry_at = now + timedelta(seconds=DETECTION_FAST_RETRY_SECONDS)
             cached_purge_exhausted = (
                 operation.operation_type == "cached_purge"
                 and operation_result == DeleteStatus.TRANSIENT_FAILURE.value
@@ -3400,6 +3496,8 @@ class Honeypot(Cog):
             await asyncio.to_thread(
                 self._case_store.compact_terminal_case, operation.case_id
             )
+        elif completed and operation.operation_type == "message_process":
+            await self._finish_case_review_if_ready(operation.case_id, None)
 
     async def _renew_detection_operation(self, operation) -> None:
         while True:
@@ -4980,7 +5078,9 @@ class Honeypot(Cog):
         if config.get("review_channel") is not None or snapshot.case.review_channel_id is not None:
             guild = self.bot.get_guild(snapshot.case.guild_id)
         review_channel = (
-            self._get_text_channel_or_thread(guild, config.get("review_channel"))
+            await self._fetch_text_channel_or_thread(
+                guild, config.get("review_channel")
+            )
             if guild is not None and config.get("review_channel") is not None
             else None
         )
@@ -5205,11 +5305,16 @@ class Honeypot(Cog):
         await self._case_review_rerender(case_id)
 
     async def _finish_case_review_if_ready(
-        self, case_id: str, moderator_id: int
+        self, case_id: str, moderator_id: int | None
     ) -> bool:
         snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
-        if snapshot is None or any(
-            item.decision is None for item in case_feedback_items(snapshot)
+        if (
+            snapshot is None
+            or any(
+                attachment.capture_status == "pending"
+                for attachment in snapshot.attachments
+            )
+            or any(item.decision is None for item in case_feedback_items(snapshot))
         ):
             return False
         completed = next(
@@ -5225,7 +5330,14 @@ class Honeypot(Cog):
                 }
                 and operation.status.value == "succeeded"
                 and operation.result
-                in {"ban", "kick", "kick_missing", "ignore"}
+                in {
+                    "ban",
+                    "kick",
+                    "kick_missing",
+                    "ignore",
+                    "planned_ban",
+                    "planned_kick",
+                }
             ),
             None,
         )
@@ -5252,6 +5364,7 @@ class Honeypot(Cog):
         action: str,
         *,
         confirmed: bool = False,
+        expected_keys: tuple[AttachmentKey, ...] = (),
     ) -> None:
         if not self._case_review_has_permission(interaction):
             await self._case_review_error(interaction, _("You do not have permission to review this case."))
@@ -5260,13 +5373,17 @@ class Honeypot(Cog):
         pending_feedback = self._pending_feedback_items(
             case_feedback_items(snapshot) if snapshot is not None else ()
         )
-        all_detector_matched = bool(pending_feedback) and all(
-            item.detector_matched for item in pending_feedback
+        review_items = (
+            tuple(item for item in pending_feedback if item.key in set(expected_keys))
+            if confirmed and expected_keys
+            else pending_feedback
         )
-        if action == "fp" and not all_detector_matched:
+        try:
+            validate_image_review_action(review_items, action)
+        except ValueError as error:
             await self._case_review_error(
                 interaction,
-                _("FP is only available for images flagged by the detector."),
+                _(str(error)),
             )
             return
         if action in {"tp", "fp"} and not confirmed:
@@ -5276,11 +5393,10 @@ class Honeypot(Cog):
                     self,
                     case_id,
                     action,
-                    confirm_label=(
-                        "Confirm All TP"
-                        if all_detector_matched
-                        else "Confirm Add all"
+                    confirm_label=bulk_image_confirmation_label(
+                        pending_feedback, action
                     ),
+                    expected_keys=tuple(item.key for item in pending_feedback),
                 ),
                 ephemeral=True,
             )
@@ -5288,7 +5404,10 @@ class Honeypot(Cog):
         await interaction.response.defer()
         try:
             await self._case_review_service.apply_bulk(
-                case_id, action, interaction.user.id
+                case_id,
+                action,
+                interaction.user.id,
+                expected_keys=expected_keys or None,
             )
             await self._finish_case_review_if_ready(case_id, interaction.user.id)
             await self._case_review_rerender_if_open(case_id)
@@ -5303,6 +5422,7 @@ class Honeypot(Cog):
         action: str,
         *,
         confirmed: bool = False,
+        expected_keys: tuple[AttachmentKey, ...] = (),
     ) -> None:
         if not self._case_review_has_permission(interaction):
             await self._case_review_error(
@@ -5314,13 +5434,17 @@ class Honeypot(Cog):
             case_feedback_items(snapshot) if snapshot is not None else (),
             message_sequence,
         )
-        all_detector_matched = bool(pending_feedback) and all(
-            item.detector_matched for item in pending_feedback
+        review_items = (
+            tuple(item for item in pending_feedback if item.key in set(expected_keys))
+            if confirmed and expected_keys
+            else pending_feedback
         )
-        if action == "fp" and not all_detector_matched:
+        try:
+            validate_image_review_action(review_items, action)
+        except ValueError as error:
             await self._case_review_error(
                 interaction,
-                _("FP is only available for images flagged by the detector."),
+                _(str(error)),
             )
             return
         if action in {"tp", "fp"} and not confirmed:
@@ -5331,11 +5455,10 @@ class Honeypot(Cog):
                     case_id,
                     action,
                     message_sequence=message_sequence,
-                    confirm_label=(
-                        "Confirm All TP"
-                        if all_detector_matched
-                        else "Confirm Add all"
+                    confirm_label=bulk_image_confirmation_label(
+                        pending_feedback, action
                     ),
+                    expected_keys=tuple(item.key for item in pending_feedback),
                 ),
                 ephemeral=True,
             )
@@ -5343,7 +5466,11 @@ class Honeypot(Cog):
         await interaction.response.defer()
         try:
             await self._case_review_service.apply_message(
-                case_id, message_sequence, action, interaction.user.id
+                case_id,
+                message_sequence,
+                action,
+                interaction.user.id,
+                expected_keys=expected_keys or None,
             )
             await self._finish_case_review_if_ready(case_id, interaction.user.id)
             await self._case_review_rerender_if_open(case_id)
@@ -5403,6 +5530,9 @@ class Honeypot(Cog):
                     self._deactivate_forward_purge(
                         snapshot.case.guild_id, snapshot.case.user_id
                     )
+                    guild = self.bot.get_guild(snapshot.case.guild_id)
+                    if guild is not None:
+                        await self._increment_stat(guild, "ignored")
                 await self._finish_case_review_if_ready(case_id, interaction.user.id)
                 await self._case_review_rerender_if_open(case_id)
                 return
@@ -5937,6 +6067,10 @@ class Honeypot(Cog):
                 f"cached_purge:{case_id}:{ref.channel_id}:{ref.message_id}",
                 message_sequence,
             )
+            was_deleted = (
+                operation.status.value == "succeeded"
+                and operation.result == DeleteStatus.DELETED.value
+            )
             now = datetime.now(timezone.utc)
             if operation.status.value == "failed" and operation.retry_at is not None:
                 now = max(now, operation.retry_at)
@@ -5960,7 +6094,7 @@ class Honeypot(Cog):
                 for item in snapshot.operations
                 if item.operation_id == operation.operation_id
             )
-            if persisted.result == DeleteStatus.DELETED.value:
+            if persisted.result == DeleteStatus.DELETED.value and not was_deleted:
                 deleted += 1
         if not config.get("dry_run"):
             self._activate_forward_purge(guild.id, user_id, config)
@@ -7280,6 +7414,7 @@ class Honeypot(Cog):
         missing = self._missing_channel_permissions(
             ctx.guild,
             target,
+            send_messages=False,
             read_history=True,
             manage_messages=True,
         )
@@ -7319,12 +7454,16 @@ class Honeypot(Cog):
         )
 
     @channels.command()
-    async def logs(self, ctx: commands.Context, target: discord.TextChannel | discord.Thread = None) -> None:
+    async def logs(self, ctx: commands.Context, target: discord.TextChannel = None) -> None:
         """Set the channel used for honeypot logs."""
         if target is None:
             v = await self.config.guild(ctx.guild).logs_channel()
             await ctx.send(_("Logs channel: {channel}").format(channel=ctx.guild.get_channel(v) if v else _("not set")))
         else:
+            if not isinstance(target, discord.TextChannel):
+                raise commands.UserFeedbackCheckFailure(
+                    _("The logs channel must be a normal text channel.")
+                )
             missing = self._missing_channel_permissions(ctx.guild, target)
             if missing is not None:
                 raise commands.UserFeedbackCheckFailure(missing)
@@ -8188,7 +8327,13 @@ class Honeypot(Cog):
             v = await self.config.guild(ctx.guild).joinwatch_channel()
             await ctx.send(_("Joinwatch channel: {channel}").format(channel=ctx.guild.get_channel(v) if v else _("not set")))
         else:
-            missing = self._missing_channel_permissions(ctx.guild, target)
+            is_thread = isinstance(target, discord.Thread)
+            missing = self._missing_channel_permissions(
+                ctx.guild,
+                target,
+                send_messages=not is_thread,
+                send_in_threads=is_thread,
+            )
             if missing is not None:
                 raise commands.UserFeedbackCheckFailure(missing)
             await self.config.guild(ctx.guild).joinwatch_channel.set(target.id)
@@ -8995,7 +9140,20 @@ class Honeypot(Cog):
             for channel_id in self._honeypot_channel_ids_from_config(config)
             if (channel := self._get_text_channel_or_thread(ctx.guild, channel_id)) is not None
         ]
-        logs_channel = self._get_text_channel_or_thread(ctx.guild, config.get("logs_channel"))
+        logs_channel_id = config.get("logs_channel")
+        configured_logs_channel = (
+            self._get_cached_message_channel(ctx.guild, logs_channel_id)
+            if isinstance(logs_channel_id, int)
+            else None
+        )
+        logs_channel = (
+            configured_logs_channel
+            if isinstance(configured_logs_channel, discord.TextChannel)
+            else None
+        )
+        logs_channel_invalid = (
+            configured_logs_channel is not None and logs_channel is None
+        )
         review_channel = self._get_text_channel_or_thread(ctx.guild, config.get("review_channel"))
         if not config.get("enabled"):
             warnings.append("⚠️ Honeypot is disabled.")
@@ -9007,7 +9165,15 @@ class Honeypot(Cog):
             checks.append(("Spam action is invalid", False, "Run `honeypot spam action`."))
         if config.get("enabled") and not honeypot_channels:
             checks.append(("No honeypot channel exists", False, "Run `honeypot channel add`."))
-        if config.get("enabled") and logs_channel is None:
+        if logs_channel_invalid:
+            checks.append(
+                (
+                    "Logs channel must be a normal text channel",
+                    False,
+                    "Run `honeypot channel logs` with a normal text channel.",
+                )
+            )
+        if config.get("enabled") and logs_channel is None and not logs_channel_invalid:
             checks.append(("Logs channel is missing", False, "Run `honeypot channel logs`."))
         if (
             config.get("fallback_action") == "review"
@@ -9045,8 +9211,24 @@ class Honeypot(Cog):
                 checks.append(("Joinwatch alert channel is missing", False, "Run `honeypot joinwatch channel`."))
             if joinwatch_channel is not None:
                 perms = joinwatch_channel.permissions_for(me)
-                if not perms.send_messages:
-                    checks.append(("Cannot send joinwatch alerts", False, "Grant Send Messages."))
+                send_permission = (
+                    "send_messages_in_threads"
+                    if isinstance(joinwatch_channel, discord.Thread)
+                    else "send_messages"
+                )
+                if not getattr(perms, send_permission, False):
+                    permission_label = (
+                        "Send Messages in Threads"
+                        if send_permission == "send_messages_in_threads"
+                        else "Send Messages"
+                    )
+                    checks.append(
+                        (
+                            "Cannot send joinwatch alerts",
+                            False,
+                            f"Grant {permission_label}.",
+                        )
+                    )
         for honeypot_channel in honeypot_channels:
             perms = honeypot_channel.permissions_for(me)
             missing_permissions = missing_purge_permissions(perms)

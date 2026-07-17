@@ -82,6 +82,37 @@ class CaseFeedbackItem:
         return self.key.position
 
 
+def available_image_review_actions(
+    items: tuple[CaseFeedbackItem, ...],
+) -> tuple[str, ...]:
+    pending = tuple(item for item in items if item.decision is None)
+    if not pending:
+        return ()
+    if all(item.detector_matched for item in pending):
+        return ("tp", "fp", "ignore")
+    return ("tp", "ignore")
+
+
+def validate_image_review_action(
+    items: tuple[CaseFeedbackItem, ...], action: str
+) -> None:
+    if action == "fp" and (
+        not items or not all(item.detector_matched for item in items)
+    ):
+        raise ValueError("FP is only available for images flagged by the detector")
+
+
+def bulk_image_confirmation_label(
+    items: tuple[CaseFeedbackItem, ...], action: str
+) -> str:
+    validate_image_review_action(items, action)
+    if action == "fp":
+        return "Confirm All FP"
+    if all(item.detector_matched for item in items):
+        return "Confirm All TP"
+    return "Confirm Add all"
+
+
 @dataclass(frozen=True)
 class CaseReviewField:
     name: str
@@ -157,15 +188,23 @@ class CaseReviewService:
         self._store = store
 
     async def apply_bulk(
-        self, case_id: str, action: str, moderator_id: int
+        self,
+        case_id: str,
+        action: str,
+        moderator_id: int,
+        *,
+        expected_keys: tuple[AttachmentKey, ...] | None = None,
     ) -> CaseSnapshot:
         decision = self._decision(action)
         snapshot = await self._snapshot(case_id)
         feedback_items = case_feedback_items(snapshot)
+        feedback_items = self._expected_items(feedback_items, expected_keys)
+        pending = tuple(item for item in feedback_items if item.decision is None)
+        if pending:
+            validate_image_review_action(pending, action)
         decisions = {
             item.key: decision
-            for item in feedback_items
-            if item.decision is None
+            for item in pending
         }
         if not decisions:
             if feedback_items and all(
@@ -189,6 +228,8 @@ class CaseReviewService:
         message_sequence: int,
         action: str,
         moderator_id: int,
+        *,
+        expected_keys: tuple[AttachmentKey, ...] | None = None,
     ) -> CaseSnapshot:
         decision = self._decision(action)
         snapshot = await self._snapshot(case_id)
@@ -197,10 +238,13 @@ class CaseReviewService:
             for item in case_feedback_items(snapshot)
             if item.message_sequence == message_sequence
         )
+        feedback_items = self._expected_items(feedback_items, expected_keys)
+        pending = tuple(item for item in feedback_items if item.decision is None)
+        if pending:
+            validate_image_review_action(pending, action)
         decisions = {
             item.key: decision
-            for item in feedback_items
-            if item.decision is None
+            for item in pending
         }
         if not decisions:
             if feedback_items and all(
@@ -221,8 +265,13 @@ class CaseReviewService:
         self, key: AttachmentKey, action: str, moderator_id: int
     ) -> CaseSnapshot:
         snapshot = await self._snapshot(key.case_id)
-        if key not in {item.key for item in case_feedback_items(snapshot)}:
+        item = next(
+            (item for item in case_feedback_items(snapshot) if item.key == key),
+            None,
+        )
+        if item is None:
             raise ValueError("attachment is not captured image evidence")
+        validate_image_review_action((item,), action)
         await asyncio.to_thread(
             self._store.apply_attachment_decisions,
             key.case_id,
@@ -237,6 +286,19 @@ class CaseReviewService:
         if snapshot is None:
             raise KeyError(case_id)
         return snapshot
+
+    @staticmethod
+    def _expected_items(
+        items: tuple[CaseFeedbackItem, ...],
+        expected_keys: tuple[AttachmentKey, ...] | None,
+    ) -> tuple[CaseFeedbackItem, ...]:
+        if expected_keys is None:
+            return items
+        expected = set(expected_keys)
+        selected = tuple(item for item in items if item.key in expected)
+        if {item.key for item in selected} != expected:
+            raise ValueError("confirmed image evidence is no longer available")
+        return selected
 
     @staticmethod
     def _decision(action: str) -> str:
@@ -413,7 +475,8 @@ def render_case(snapshot: CaseSnapshot) -> CaseReviewProjection:
         operation
         for operation in snapshot.operations
         if operation.operation_type == "moderation_action"
-        or operation.operation_type in {"moderator_ban", "moderator_kick"}
+        or operation.operation_type
+        in {"moderator_ban", "moderator_kick", "moderator_ignore"}
     )
     if moderation_operations:
         moderation = moderation_operations[-1]

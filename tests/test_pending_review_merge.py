@@ -29,6 +29,43 @@ case_review = _load_case_review()
 
 
 class CaseReviewProjectionTests(unittest.TestCase):
+    def test_image_review_policy_labels_and_validates_detector_actions(self):
+        matched = case_review.CaseFeedbackItem(
+            cases.AttachmentKey("case-1", 1, 0),
+            "matched.png",
+            None,
+            True,
+        )
+        unmatched = case_review.CaseFeedbackItem(
+            cases.AttachmentKey("case-1", 1, 1),
+            "unmatched.png",
+            None,
+            False,
+        )
+
+        self.assertEqual(
+            case_review.available_image_review_actions((matched,)),
+            ("tp", "fp", "ignore"),
+        )
+        self.assertEqual(
+            case_review.available_image_review_actions((unmatched,)),
+            ("tp", "ignore"),
+        )
+        self.assertEqual(
+            case_review.bulk_image_confirmation_label((matched,), "fp"),
+            "Confirm All FP",
+        )
+        self.assertEqual(
+            case_review.bulk_image_confirmation_label((matched,), "tp"),
+            "Confirm All TP",
+        )
+        self.assertEqual(
+            case_review.bulk_image_confirmation_label((unmatched,), "tp"),
+            "Confirm Add all",
+        )
+        with self.assertRaisesRegex(ValueError, "flagged by the detector"):
+            case_review.validate_image_review_action((unmatched,), "fp")
+
     def test_case_summary_keeps_persisted_user_identity_and_account_age(self):
         snapshot = self.snapshot(channels=(100,))
         subject = cases.CaseSubjectRecord(
@@ -225,6 +262,37 @@ class CaseReviewProjectionTests(unittest.TestCase):
         self.assertIn(f"Expires: <t:{timestamp}:R>", visible)
         self.assertNotIn(f"<t:{timestamp}:F>", visible)
         self.assertIn("Evidence: Capture incomplete", visible)
+
+    def test_review_projects_completed_moderator_ignore(self):
+        snapshot = self.snapshot()
+        operation = cases.OperationRecord(
+            "op-ignore",
+            snapshot.case.case_id,
+            None,
+            "moderator_ignore",
+            cases.OperationStatus.SUCCEEDED,
+            1,
+            snapshot.case.created_at,
+            snapshot.case.created_at,
+            None,
+            None,
+            "ignore",
+            99,
+            f"moderator-ignore:{snapshot.case.case_id}",
+            None,
+            None,
+        )
+        snapshot = cases.CaseSnapshot(
+            snapshot.case,
+            snapshot.messages,
+            snapshot.attachments,
+            snapshot.signals,
+            (operation,),
+        )
+
+        projection = case_review.render_case(snapshot)
+
+        self.assertEqual(projection.moderation_status, "Ignore")
 
     def test_open_summary_separates_standard_information_from_optional_effects(self):
         snapshot = self.snapshot()
@@ -664,7 +732,52 @@ class CaseReviewServiceTests(unittest.IsolatedAsyncioTestCase):
                 position,
                 f"case/1/{position}-same.png",
             )
+            self.store.update_attachment_scan(
+                appended.case.case_id,
+                appended.message.sequence,
+                position,
+                f"sha-{position}",
+                f"phash-{position}",
+                {"matched": True},
+                None,
+            )
         return appended.case.case_id
+
+    async def test_persisted_mixed_scan_drives_controls_and_confirmed_feedback(self):
+        case_id = self.create_case()
+        snapshot = self.store.get_case(case_id)
+        self.store.update_attachment_scan(
+            case_id,
+            1,
+            1,
+            "sha-1",
+            "phash-1",
+            {"matched": False},
+            None,
+        )
+        snapshot = self.store.get_case(case_id)
+        items = case_review.case_feedback_items(snapshot)
+
+        self.assertEqual(
+            case_review.available_image_review_actions(items),
+            ("tp", "ignore"),
+        )
+        self.assertEqual(
+            case_review.bulk_image_confirmation_label(items, "tp"),
+            "Confirm Add all",
+        )
+
+        updated = await case_review.CaseReviewService(self.store).apply_message(
+            case_id,
+            1,
+            "tp",
+            moderator_id=7,
+            expected_keys=tuple(item.key for item in items),
+        )
+        self.assertEqual(
+            [item.learning_decision for item in updated.attachments],
+            ["true_positive", "true_positive"],
+        )
 
     async def test_bulk_tp_ignores_captured_pdf_evidence(self):
         now = datetime(2026, 7, 14, tzinfo=timezone.utc)
@@ -744,6 +857,15 @@ class CaseReviewServiceTests(unittest.IsolatedAsyncioTestCase):
             0,
             "case/2/0-second.png",
         )
+        self.store.update_attachment_scan(
+            case_id,
+            appended.message.sequence,
+            0,
+            "sha-second",
+            "phash-second",
+            {"matched": True},
+            None,
+        )
 
         snapshot = await case_review.CaseReviewService(self.store).apply_message(
             case_id, appended.message.sequence, "fp", moderator_id=7
@@ -767,6 +889,59 @@ class CaseReviewServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [item.learning_decision for item in snapshot.attachments],
             ["false_positive", "true_positive"],
+        )
+
+    async def test_confirmed_bulk_fp_uses_exact_verified_attachment_set(self):
+        case_id = self.create_case()
+        for position in (0, 1):
+            self.store.update_attachment_scan(
+                case_id,
+                1,
+                position,
+                f"sha-{position}",
+                f"phash-{position}",
+                {"matched": True},
+                None,
+            )
+        expected_keys = tuple(
+            item.key for item in case_review.case_feedback_items(self.store.get_case(case_id))
+        )
+        now = datetime(2026, 7, 14, 12, 1, tzinfo=timezone.utc)
+        late = self.store.append_message(
+            cases.NewMessage(
+                1,
+                2,
+                20,
+                1000,
+                "late message",
+                now,
+                None,
+                (
+                    cases.NewAttachment(
+                        0, "late.png", 10, "image/png", None, None, "late"
+                    ),
+                ),
+            ),
+            (cases.DetectionSignal("spam", "match", cases.ActionIntent.REVIEW, True, {}),),
+        )
+        capture_attachment(
+            self.store,
+            case_id,
+            late.message.sequence,
+            0,
+            "case/2/0-late.png",
+        )
+
+        snapshot = await case_review.CaseReviewService(self.store).apply_bulk(
+            case_id,
+            "fp",
+            moderator_id=7,
+            expected_keys=expected_keys,
+        )
+
+        self.assertEqual(
+            [item.learning_decision for item in snapshot.attachments],
+            ["false_positive", "false_positive", None],
         )
 
     async def test_individual_action_uses_stable_attachment_key(self):
