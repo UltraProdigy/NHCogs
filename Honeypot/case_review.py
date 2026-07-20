@@ -583,9 +583,18 @@ def render_case(snapshot: CaseSnapshot) -> CaseReviewProjection:
     )
     resolution_lines: tuple[str, ...] = ()
     if snapshot.case.resolution is not None:
-        resolution_lines += (_resolution_label(snapshot.case.resolution),)
+        automatic_resolution = any(
+            operation.operation_type == "moderation_action"
+            and operation.status is OperationStatus.SUCCEEDED
+            and operation.result == snapshot.case.resolution
+            for operation in moderation_operations
+        )
+        resolution_label = _resolution_label(snapshot.case.resolution)
+        if automatic_resolution:
+            resolution_label += " automatically"
+        resolution_lines += (resolution_label,)
     if snapshot.case.moderator_id is not None:
-        reviewer = f"<@{snapshot.case.moderator_id}> ({snapshot.case.moderator_id})"
+        reviewer = f"<@{snapshot.case.moderator_id}>"
         if snapshot.case.resolved_at is not None:
             reviewer += f" • <t:{int(snapshot.case.resolved_at.timestamp())}:F>"
         resolution_lines += (reviewer,)

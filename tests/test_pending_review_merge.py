@@ -465,6 +465,52 @@ class CaseReviewProjectionTests(unittest.TestCase):
         self.assertNotIn("HTTPException", visible)
         self.assertNotIn("case-1", visible)
 
+    def test_automatic_ban_keeps_image_reviewer_out_of_moderation_attribution(self):
+        snapshot = self.snapshot(channels=(20,))
+        resolved_at = snapshot.case.created_at + timedelta(minutes=5)
+        case = cases.CaseRecord(
+            **{
+                **snapshot.case.__dict__,
+                "status": cases.CaseStatus.RESOLVED,
+                "resolution": "ban",
+                "moderator_id": 99,
+                "resolved_at": resolved_at,
+            }
+        )
+        automatic_ban = cases.OperationRecord(
+            "op-auto-ban",
+            "case-1",
+            1,
+            "moderation_action",
+            cases.OperationStatus.SUCCEEDED,
+            1,
+            snapshot.case.created_at,
+            resolved_at,
+            None,
+            None,
+            "ban",
+            None,
+            "moderation-action:case-1:1",
+            None,
+            None,
+        )
+        snapshot = cases.CaseSnapshot(
+            case,
+            snapshot.messages,
+            snapshot.attachments,
+            snapshot.signals,
+            (automatic_ban,),
+        )
+
+        projection = case_review.render_case(snapshot)
+        visible = projection.description + "\n" + "\n".join(
+            field.value for page in projection.pages for field in page
+        )
+
+        self.assertIn("Banned automatically", visible)
+        self.assertIn("<@99>", visible)
+        self.assertNotIn("<@99> (99)", visible)
+
     def test_review_keeps_user_id_but_hides_case_uuid(self):
         projection = case_review.render_case(self.snapshot())
 

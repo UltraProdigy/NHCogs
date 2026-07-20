@@ -534,7 +534,7 @@ class DetectionBulkConfirmationView(discord.ui.View):
 
         async def callback(interaction):
             if self.message_sequence is None:
-                await self.cog._case_review_bulk_interaction(
+                completed = await self.cog._case_review_bulk_interaction(
                     interaction,
                     self.case_id,
                     self.action,
@@ -542,7 +542,7 @@ class DetectionBulkConfirmationView(discord.ui.View):
                     expected_keys=self.expected_keys,
                 )
             else:
-                await self.cog._case_review_message_bulk_interaction(
+                completed = await self.cog._case_review_message_bulk_interaction(
                     interaction,
                     self.case_id,
                     self.message_sequence,
@@ -550,6 +550,11 @@ class DetectionBulkConfirmationView(discord.ui.View):
                     confirmed=True,
                     expected_keys=self.expected_keys,
                 )
+            if completed:
+                try:
+                    await interaction.delete_original_response()
+                except discord.NotFound:
+                    pass
 
         button.callback = callback
         add_item(button)
@@ -575,9 +580,14 @@ class DetectionModerationConfirmationView(discord.ui.View):
         )
 
         async def callback(interaction):
-            await self.cog._case_review_moderation_interaction(
+            completed = await self.cog._case_review_moderation_interaction(
                 interaction, self.case_id, self.action, confirmed=True
             )
+            if completed:
+                try:
+                    await interaction.delete_original_response()
+                except discord.NotFound:
+                    pass
 
         button.callback = callback
         add_item(button)
@@ -3814,6 +3824,7 @@ class Honeypot(Cog):
                     "position": scan["image_position"],
                     "filename": scan["attachment"].filename,
                     "hash_diff": result.get("score"),
+                    "threshold": result.get("threshold"),
                     "exact_decision": result.get("exact_decision"),
                 }
             )
@@ -4467,14 +4478,26 @@ class Honeypot(Cog):
         details = [attachment.capture_status]
         metadata = attachment.match_metadata
         matched_filename = metadata.get("matched_filename")
-        hash_diff = metadata.get("hash_diff", metadata.get("distance"))
+        hash_diff = metadata.get(
+            "hash_diff", metadata.get("distance", metadata.get("score"))
+        )
+        threshold = metadata.get("threshold")
         if matched_filename:
             match = f"matched {matched_filename}"
             if hash_diff is not None:
-                match += f" (hash difference {hash_diff})"
+                difference = str(hash_diff)
+                if threshold is not None:
+                    difference += f"/{threshold}"
+                match += f" (hash difference {difference})"
             details.append(match)
         elif metadata.get("matched"):
-            details.append("matched known suspicious content")
+            match = "matched known suspicious content"
+            if hash_diff is not None:
+                difference = str(hash_diff)
+                if threshold is not None:
+                    difference += f"/{threshold}"
+                match += f" (hash difference {difference})"
+            details.append(match)
         matches = metadata.get("matches")
         if isinstance(matches, (list, tuple)):
             for match in matches[:3]:
@@ -4484,7 +4507,11 @@ class Honeypot(Cog):
                 distance = match.get("hash_diff", match.get("distance", match.get("score")))
                 detail = f"matched {filename}"
                 if distance is not None:
-                    detail += f" (hash difference {distance})"
+                    difference = str(distance)
+                    match_threshold = match.get("threshold")
+                    if match_threshold is not None:
+                        difference += f"/{match_threshold}"
+                    detail += f" (hash difference {difference})"
                 details.append(detail)
         if attachment.learning_decision:
             decisions = {
@@ -5441,10 +5468,10 @@ class Honeypot(Cog):
         *,
         confirmed: bool = False,
         expected_keys: tuple[AttachmentKey, ...] = (),
-    ) -> None:
+    ) -> bool:
         if not self._case_review_has_permission(interaction):
             await self._case_review_error(interaction, _("You do not have permission to review this case."))
-            return
+            return False
         snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
         pending_feedback = self._pending_feedback_items(
             case_feedback_items(snapshot) if snapshot is not None else ()
@@ -5461,7 +5488,7 @@ class Honeypot(Cog):
                 interaction,
                 _(str(error)),
             )
-            return
+            return False
         if action in {"tp", "fp"} and not confirmed:
             await interaction.response.send_message(
                 _("Confirm this bulk image decision."),
@@ -5476,7 +5503,7 @@ class Honeypot(Cog):
                 ),
                 ephemeral=True,
             )
-            return
+            return False
         await interaction.response.defer()
         try:
             await self._case_review_service.apply_bulk(
@@ -5487,8 +5514,10 @@ class Honeypot(Cog):
             )
             await self._finish_case_review_if_ready(case_id, interaction.user.id)
             await self._case_review_rerender_if_open(case_id)
+            return True
         except (KeyError, ValueError) as error:
             await self._case_review_error(interaction, str(error))
+            return False
 
     async def _case_review_message_bulk_interaction(
         self,
@@ -5499,12 +5528,12 @@ class Honeypot(Cog):
         *,
         confirmed: bool = False,
         expected_keys: tuple[AttachmentKey, ...] = (),
-    ) -> None:
+    ) -> bool:
         if not self._case_review_has_permission(interaction):
             await self._case_review_error(
                 interaction, _("You do not have permission to review this case.")
             )
-            return
+            return False
         snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
         pending_feedback = self._pending_feedback_items(
             case_feedback_items(snapshot) if snapshot is not None else (),
@@ -5522,7 +5551,7 @@ class Honeypot(Cog):
                 interaction,
                 _(str(error)),
             )
-            return
+            return False
         if action in {"tp", "fp"} and not confirmed:
             await interaction.response.send_message(
                 _("Confirm this message's image decision."),
@@ -5538,7 +5567,7 @@ class Honeypot(Cog):
                 ),
                 ephemeral=True,
             )
-            return
+            return False
         await interaction.response.defer()
         try:
             await self._case_review_service.apply_message(
@@ -5550,8 +5579,10 @@ class Honeypot(Cog):
             )
             await self._finish_case_review_if_ready(case_id, interaction.user.id)
             await self._case_review_rerender_if_open(case_id)
+            return True
         except (KeyError, ValueError) as error:
             await self._case_review_error(interaction, str(error))
+            return False
 
     async def _case_review_moderation_interaction(
         self,
@@ -5560,12 +5591,12 @@ class Honeypot(Cog):
         action: str,
         *,
         confirmed: bool = False,
-    ) -> None:
+    ) -> bool:
         if not self._case_review_has_action_permission(interaction, action):
             await self._case_review_error(
                 interaction, _("You do not have permission to review this case.")
             )
-            return
+            return False
         if action in {"ban", "kick"} and not confirmed:
             snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
             has_unreviewed_images = snapshot is not None and any(
@@ -5589,7 +5620,7 @@ class Honeypot(Cog):
                     view=DetectionModerationConfirmationView(self, case_id, action),
                     ephemeral=True,
                 )
-                return
+                return False
         await interaction.response.defer()
         try:
             if action == "ignore":
@@ -5613,7 +5644,7 @@ class Honeypot(Cog):
                 await self._release_detection_case_roles(case_id, moderated_at)
                 await self._finish_case_review_if_ready(case_id, interaction.user.id)
                 await self._case_review_rerender_if_open(case_id)
-                return
+                return True
             if action not in {"ban", "kick"}:
                 raise ValueError("unsupported detection case moderation action")
             operation = await asyncio.to_thread(
@@ -5647,13 +5678,15 @@ class Honeypot(Cog):
             )
             if persisted is None:
                 if snapshot.case.status.value in {"resolved", "expired"}:
-                    return
+                    return True
                 raise ValueError("moderator action result is unavailable")
             if persisted.status.value != "succeeded":
                 await self._case_review_rerender_safely(case_id)
                 raise ValueError(persisted.last_error or "moderator action failed")
+            return True
         except (KeyError, ValueError) as error:
             await self._case_review_error(interaction, str(error))
+            return False
 
     async def _case_review_attachment_interaction(
         self, interaction: discord.Interaction, key: AttachmentKey, action: str

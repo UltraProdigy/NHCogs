@@ -950,6 +950,7 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                         if hashes["sha256"] == "image-3"
                         else None,
                         "score": 0 if hashes["sha256"] == "image-3" else 3,
+                        "threshold": threshold,
                     }
 
                 with (
@@ -995,6 +996,7 @@ class DetectionSignalCollectionTests(unittest.IsolatedAsyncioTestCase):
                     [match["position"] for match in signals[0].metadata["matches"]], [3]
                 )
                 self.assertEqual(signals[0].metadata["matches"][0]["exact_decision"], "true_positive")
+                self.assertEqual(signals[0].metadata["matches"][0]["threshold"], 20)
                 for attachment in attachments[:4]:
                     attachment.read.assert_awaited_once()
                 for attachment in attachments[4:]:
@@ -1235,6 +1237,7 @@ class ThreadBackedCasePublicationTests(unittest.IsolatedAsyncioTestCase):
                     match_metadata={
                         "matched_filename": "known-scam.png",
                         "hash_diff": 3,
+                        "threshold": 17,
                     },
                     learning_decision=None,
                     publication_error=None,
@@ -1254,7 +1257,40 @@ class ThreadBackedCasePublicationTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertIn(message.jump_url, content)
                 self.assertIn("matched known-scam.png", content)
-                self.assertIn("hash difference 3", content)
+                self.assertIn("hash difference 3/17", content)
+
+    async def test_timeline_card_shows_detector_score_and_effective_threshold(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                attachment = SimpleNamespace(
+                    key=honeypot.AttachmentKey("case-1", 1, 0),
+                    filename="proof.png",
+                    capture_status="captured",
+                    match_metadata={
+                        "matched": True,
+                        "score": 3,
+                        "threshold": 17,
+                    },
+                    learning_decision=None,
+                    publication_error=None,
+                )
+                message = SimpleNamespace(
+                    sequence=1,
+                    channel_id=30,
+                    created_at=datetime(2026, 7, 14, 12, tzinfo=timezone.utc),
+                    delete_status="Deleted",
+                    signal_reasons=("Image matched",),
+                    content="suspicious",
+                    jump_url="https://discord.com/channels/10/30/40",
+                    attachments=(attachment,),
+                )
+
+                content = honeypot.Honeypot._case_timeline_message_content(message)
+
+                self.assertIn(
+                    "matched known suspicious content (hash difference 3/17)",
+                    content,
+                )
 
     async def test_long_timeline_message_preserves_fenced_content_source_and_attachment_details(self):
         with TemporaryDirectory() as directory:
@@ -8005,7 +8041,7 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                 )
                 interaction.response.send_message.assert_awaited_once()
 
-                await cog._case_review_bulk_interaction(
+                completed = await cog._case_review_bulk_interaction(
                     interaction,
                     appended.case.case_id,
                     "tp",
@@ -8017,6 +8053,7 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                     attachment.filename: attachment.learning_decision
                     for attachment in snapshot.attachments
                 }
+                self.assertTrue(completed)
                 self.assertEqual(decisions["proof.png"], "true_positive")
                 self.assertIsNone(decisions["invoice.pdf"])
 
@@ -8168,6 +8205,7 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                         is_done=lambda: True,
                     ),
                     followup=SimpleNamespace(send=mock.AsyncMock()),
+                    delete_original_response=mock.AsyncMock(),
                 )
                 await confirmation.children[0].callback(confirmation_interaction)
 
@@ -8178,8 +8216,60 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                     if item.operation_type == "moderator_ban"
                 )
                 confirmation_interaction.response.defer.assert_awaited_once()
+                confirmation_interaction.delete_original_response.assert_awaited_once_with()
                 self.assertEqual(operation.status.value, "succeeded")
                 self.assertEqual(operation.result, "planned_ban")
+
+    async def test_successful_bulk_confirmation_deletes_ephemeral_message(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                honeypot.DetectionBulkConfirmationView.add_item = (
+                    lambda view, item: setattr(
+                        view, "children", getattr(view, "children", []) + [item]
+                    )
+                )
+                honeypot.discord.ui.Button = lambda **kwargs: SimpleNamespace(**kwargs)
+                cog = SimpleNamespace(
+                    _case_review_bulk_interaction=mock.AsyncMock(return_value=True)
+                )
+                view = honeypot.DetectionBulkConfirmationView(
+                    cog,
+                    "case-1",
+                    "tp",
+                )
+                interaction = SimpleNamespace(
+                    delete_original_response=mock.AsyncMock()
+                )
+
+                await view.children[0].callback(interaction)
+
+                cog._case_review_bulk_interaction.assert_awaited_once()
+                interaction.delete_original_response.assert_awaited_once_with()
+
+    async def test_failed_bulk_confirmation_keeps_ephemeral_message(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                honeypot.DetectionBulkConfirmationView.add_item = (
+                    lambda view, item: setattr(
+                        view, "children", getattr(view, "children", []) + [item]
+                    )
+                )
+                honeypot.discord.ui.Button = lambda **kwargs: SimpleNamespace(**kwargs)
+                cog = SimpleNamespace(
+                    _case_review_bulk_interaction=mock.AsyncMock(return_value=False)
+                )
+                view = honeypot.DetectionBulkConfirmationView(
+                    cog,
+                    "case-1",
+                    "tp",
+                )
+                interaction = SimpleNamespace(
+                    delete_original_response=mock.AsyncMock()
+                )
+
+                await view.children[0].callback(interaction)
+
+                interaction.delete_original_response.assert_not_awaited()
 
     async def test_dry_run_moderator_ban_is_persisted_as_planned(self):
         with TemporaryDirectory() as directory:
