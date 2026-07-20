@@ -2850,11 +2850,16 @@ class Honeypot(Cog):
             logs_channel = publication_channel or self._get_text_channel_or_thread(
                 guild, config.get("logs_channel")
             )
-            has_review_publication = any(
-                item.operation_type == "review_publish"
-                and item.message_sequence == source.sequence
-                for item in refreshed.operations
+            review_publication = next(
+                (
+                    item
+                    for item in refreshed.operations
+                    if item.operation_type == "review_publish"
+                    and item.message_sequence == source.sequence
+                ),
+                None,
             )
+            has_review_publication = review_publication is not None
             preview_published = False
             if has_review_publication:
                 try:
@@ -2866,6 +2871,13 @@ class Honeypot(Cog):
                         skip_if_done=capture_task,
                     )
                 except Exception as error:
+                    await self._record_operational_failure(
+                        snapshot.case.guild_id,
+                        "review_publish",
+                        f"{type(error).__name__}: {error}",
+                        case_id=operation.case_id,
+                        operation_id=review_publication.operation_id,
+                    )
                     log.warning(
                         "Detection case preview publication failed case=%s "
                         "message=%s error=%s",
@@ -3554,13 +3566,16 @@ class Honeypot(Cog):
                 raise RuntimeError(
                     "detection case operation lease was lost before completion"
                 )
-        elif snapshot is not None and operation.attempts > 1:
+        elif snapshot is not None and (
+            operation.attempts > 1
+            or operation.operation_type == "review_publish"
+        ):
             recovered = await asyncio.to_thread(
                 self._case_store.resolve_operational_failure,
                 operation.operation_id,
                 now,
             )
-            if recovered:
+            if recovered and operation.attempts > 1:
                 await self._send_operational_alert(
                     snapshot.case.guild_id,
                     f"✅ Recovered: {operation.operation_type} succeeded after "
@@ -4819,10 +4834,13 @@ class Honeypot(Cog):
                     auto_archive_duration=1440,
                     reason="Honeypot detection case",
                 )
-            except discord.HTTPException:
+            except discord.HTTPException as create_error:
                 if not callable(fetch_thread):
                     raise
-                thread = await fetch_thread()
+                try:
+                    thread = await fetch_thread()
+                except discord.NotFound:
+                    raise create_error
         parent = getattr(summary_message, "channel", None)
         parent_channel_id = getattr(parent, "id", snapshot.case.review_channel_id)
         try:
@@ -9382,8 +9400,12 @@ class Honeypot(Cog):
             perms = logs_channel.permissions_for(me)
             if not perms.send_messages:
                 checks.append(("Cannot send logs", False, "Grant Send Messages."))
-        if review_channel is not None:
-            perms = review_channel.permissions_for(me)
+        case_destination = review_channel or logs_channel
+        if case_destination is not None:
+            perms = case_destination.permissions_for(me)
+            destination_label = (
+                "Review channel" if review_channel is not None else "Logs channel"
+            )
             required = (
                 ("view_channel", "View Channel"),
                 ("send_messages", "Send Messages"),
@@ -9397,14 +9419,14 @@ class Honeypot(Cog):
             missing = [
                 label for attribute, label in required if not getattr(perms, attribute, False)
             ]
-            if not isinstance(review_channel, discord.TextChannel) or missing:
+            if not isinstance(case_destination, discord.TextChannel) or missing:
                 checks.append(
                     (
-                        "Review channel cannot host case threads",
+                        f"{destination_label} cannot host case threads",
                         False,
                         (
                             "Use a normal text channel."
-                            if not isinstance(review_channel, discord.TextChannel)
+                            if not isinstance(case_destination, discord.TextChannel)
                             else "Grant: " + ", ".join(missing)
                         ),
                     )

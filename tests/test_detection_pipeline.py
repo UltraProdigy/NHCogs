@@ -1763,6 +1763,39 @@ class ThreadBackedCasePublicationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(endpoint.thread_id, 60)
 
+    async def test_thread_creation_failure_preserves_the_discord_error(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                cog = honeypot.Honeypot(_Bot())
+                await asyncio.to_thread(cog._case_store.initialize)
+                now = datetime(2026, 7, 14, 12, tzinfo=timezone.utc)
+                appended = await asyncio.to_thread(
+                    cog._case_store.append_message,
+                    honeypot.NewMessage(
+                        10, 20, 30, 40, "evidence", now, None, ()
+                    ),
+                    (),
+                )
+                snapshot = await asyncio.to_thread(
+                    cog._case_store.get_case, appended.case.case_id
+                )
+                create_error = honeypot.discord.HTTPException(
+                    "Create Public Threads denied"
+                )
+                summary = SimpleNamespace(
+                    id=60,
+                    channel=SimpleNamespace(id=50),
+                    fetch_thread=mock.AsyncMock(
+                        side_effect=honeypot.discord.NotFound("missing")
+                    ),
+                    create_thread=mock.AsyncMock(side_effect=create_error),
+                )
+
+                with self.assertRaises(honeypot.discord.HTTPException) as raised:
+                    await cog._ensure_detection_case_thread(snapshot, summary)
+
+                self.assertIs(raised.exception, create_error)
+
     async def test_evidence_batches_wait_until_every_attachment_is_terminal(self):
         with TemporaryDirectory() as directory:
             data_path = Path(directory)
@@ -4042,6 +4075,71 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIn("review unavailable", operation.last_error)
                 message.delete.assert_awaited_once()
+
+    async def test_preview_thread_failure_is_visible_until_later_publication_succeeds(self):
+        with TemporaryDirectory() as directory:
+            data_path = Path(directory)
+            with _isolated_honeypot_modules(data_path) as honeypot:
+                cog = honeypot.Honeypot(_Bot())
+                await asyncio.to_thread(cog._case_store.initialize)
+                message = self._message(honeypot, attachment_count=1)
+                self._configure_public_boundary(
+                    cog,
+                    {
+                        "enabled": True,
+                        "dry_run": False,
+                        "logs_channel": None,
+                        "review_channel": None,
+                        "spam_enabled": False,
+                        "firstpost_enabled": False,
+                        "firstpost_collect_enabled": False,
+                    },
+                )
+                scan_started = asyncio.Event()
+                finish_scan = asyncio.Event()
+
+                async def scan_images(*args, **kwargs):
+                    scan_started.set()
+                    await finish_scan.wait()
+
+                cog._scan_all_case_message_images = mock.AsyncMock(
+                    side_effect=scan_images
+                )
+                cog._publish_detection_case = mock.AsyncMock(
+                    side_effect=[
+                        RuntimeError(
+                            "summary was posted but the case thread could not be created"
+                        ),
+                        True,
+                    ]
+                )
+
+                processing = asyncio.create_task(cog.on_message(message))
+                await asyncio.wait_for(scan_started.wait(), timeout=1)
+
+                failures = await asyncio.to_thread(
+                    cog._case_store.list_operational_failures,
+                    message.guild.id,
+                )
+
+                finish_scan.set()
+                await processing
+                self.assertEqual(
+                    [failure.source for failure in failures],
+                    ["review_publish"],
+                )
+                self.assertIn("case thread", failures[0].summary)
+                active_after_recovery = await asyncio.to_thread(
+                    cog._case_store.list_operational_failures,
+                    message.guild.id,
+                )
+                failure_history = await asyncio.to_thread(
+                    cog._case_store.list_operational_failures,
+                    message.guild.id,
+                    include_resolved=True,
+                )
+                self.assertEqual(active_after_recovery, ())
+                self.assertIsNotNone(failure_history[0].resolved_at)
 
     async def test_reconciliation_checks_due_retries_every_ten_seconds(self):
         with TemporaryDirectory() as directory:
@@ -10132,6 +10230,50 @@ class DetectionDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
 
                 report = "\n".join(call.args[0] for call in ctx.send.await_args_list)
                 self.assertIn("Logs channel must be a normal text channel", report)
+
+    async def test_doctor_checks_thread_permissions_on_logs_fallback_destination(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                text_channel_type = type("TextChannel", (), {})
+                honeypot.discord.TextChannel = text_channel_type
+                permissions = SimpleNamespace(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    create_public_threads=False,
+                    send_messages_in_threads=True,
+                    embed_links=True,
+                    attach_files=True,
+                    manage_threads=True,
+                )
+                target = text_channel_type()
+                target.id = 55
+                target.mention = "#logs"
+                target.permissions_for = lambda member: permissions
+                cog = honeypot.Honeypot(_Bot())
+                cog.config = SimpleNamespace(
+                    guild=lambda guild: SimpleNamespace(
+                        all=mock.AsyncMock(
+                            return_value={
+                                "enabled": False,
+                                "action": "none",
+                                "fallback_action": "none",
+                                "whitelist_mode": "bypass",
+                                "logs_channel": target.id,
+                                "review_channel": None,
+                            }
+                        )
+                    )
+                )
+                ctx = self._doctor_context()
+                ctx.guild.get_channel = lambda channel_id: target
+                ctx.guild.channels = [target]
+
+                await cog.honeypot_doctor(ctx)
+
+                report = "\n".join(call.args[0] for call in ctx.send.await_args_list)
+                self.assertIn("Logs channel cannot host case threads", report)
+                self.assertIn("Create Public Threads", report)
 
     async def test_case_database_healthcheck_rejects_read_only_main_database(self):
         with TemporaryDirectory() as directory:
