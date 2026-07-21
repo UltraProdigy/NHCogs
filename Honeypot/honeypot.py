@@ -51,6 +51,7 @@ from .case_review import (
     render_timeline,
     validate_image_review_action,
 )
+from .console_dump import ReadOnlyLogBuffer, build_log_dump
 from . import detection_runtime
 from .image_detector import (
     ImageSample,
@@ -65,6 +66,17 @@ _TIMELINE_VIEW_UNSET = object()
 DETECTION_FAST_RETRY_SECONDS = 10
 DETECTION_FAST_RETRY_LIMIT = 5
 DETECTION_SLOW_RETRY_MINUTES = 5
+CONSOLE_DUMP_USAGE = (
+    "Usage: `consoledump <bot|honeypot> <hours 1-24> "
+    "[debug|info|warning|error|critical]`\n"
+    "Scope: `bot` includes all captured Python logs. `honeypot` includes Honeypot "
+    "logs and related tracebacks.\n"
+    "Hours: a whole number from 1 to 24.\n"
+    "Level (optional): the minimum log level to include. Omit it to include all "
+    "levels.\n"
+    "Examples: `consoledump bot 2`, `consoledump honeypot 1`, "
+    "`consoledump bot 6 error`"
+)
 
 try:
     from PIL import Image
@@ -751,6 +763,7 @@ class Honeypot(Cog):
             baitrole_action="ban",
         )
 
+        self._console_log_buffer = ReadOnlyLogBuffer()
         self._post_ban_sweep_tasks: set[asyncio.Task] = set()
         self._recent_user_messages: dict[int, dict[int, deque[MessageRef]]] = defaultdict(
             lambda: defaultdict(deque)
@@ -2291,6 +2304,15 @@ class Honeypot(Cog):
             return f"{size / 1024:.1f} KB"
         return f"{size} B"
 
+    def _install_console_log_buffer(self) -> None:
+        root_logger = logging.getLogger()
+        if self._console_log_buffer not in root_logger.handlers:
+            root_logger.addHandler(self._console_log_buffer)
+
+    def _remove_console_log_buffer(self) -> None:
+        root_logger = logging.getLogger()
+        if self._console_log_buffer in root_logger.handlers:
+            root_logger.removeHandler(self._console_log_buffer)
 
 
     async def cog_load(self) -> None:
@@ -2309,6 +2331,7 @@ class Honeypot(Cog):
         self._case_restore_task.add_done_callback(
             lambda task: self._observe_background_task(task, "detection case view restoration")
         )
+        self._install_console_log_buffer()
 
     @staticmethod
     def _observe_background_task(task: asyncio.Task, label: str) -> None:
@@ -2339,6 +2362,7 @@ class Honeypot(Cog):
             pass
 
     async def cog_unload(self) -> None:
+        self._remove_console_log_buffer()
         self.joinwatch_auto_role_loop.cancel()
         self.purge_cache_cleanup_loop.cancel()
         self.firstpost_seen_flush_loop.cancel()
@@ -7253,6 +7277,72 @@ class Honeypot(Cog):
         return temp_root, archives
 
     # ─── Commands ─────────────────────────────────────────────────────────
+
+    @commands.command(name="consoledump")
+    @commands.guild_only()
+    async def console_dump(
+        self,
+        ctx: commands.Context,
+        scope: str | None = None,
+        hours: str | None = None,
+        level: str | None = None,
+    ) -> None:
+        """Export recent sanitized Python logs to a private text channel."""
+        channel = ctx.channel
+        if not isinstance(channel, discord.TextChannel):
+            await ctx.send(_("Console dumps require a private text channel."))
+            return
+        if not channel.permissions_for(ctx.author).manage_messages:
+            await ctx.send(_("You need Manage Messages to use this command."))
+            return
+        if channel.permissions_for(ctx.guild.default_role).view_channel:
+            await ctx.send(
+                _("Console dumps cannot be sent to a channel visible to @everyone.")
+            )
+            return
+        missing_permissions = self._missing_channel_permissions(
+            ctx.guild,
+            channel,
+            attach_files=True,
+        )
+        if missing_permissions is not None:
+            await ctx.send(missing_permissions)
+            return
+
+        normalized_scope = scope.casefold() if scope is not None else None
+        normalized_level = level.casefold() if level is not None else None
+        try:
+            parsed_hours = int(hours) if hours is not None else None
+        except ValueError:
+            parsed_hours = None
+        levels = {
+            "debug": logging.DEBUG,
+            "info": logging.INFO,
+            "warning": logging.WARNING,
+            "error": logging.ERROR,
+            "critical": logging.CRITICAL,
+        }
+        if (
+            normalized_scope not in {"bot", "honeypot"}
+            or parsed_hours is None
+            or not 1 <= parsed_hours <= 24
+            or (normalized_level is not None and normalized_level not in levels)
+        ):
+            await ctx.send(CONSOLE_DUMP_USAGE)
+            return
+
+        dump = build_log_dump(
+            self._console_log_buffer.snapshot(),
+            scope=normalized_scope,
+            hours=parsed_hours,
+            minimum_level=levels.get(normalized_level),
+            upload_limit=int(ctx.guild.filesize_limit),
+            now=datetime.now(timezone.utc),
+        )
+        await ctx.send(
+            file=discord.File(io.BytesIO(dump.content), filename=dump.filename),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @commands.guild_only()
     @commands.permissions_check(lambda ctx: ctx.author.id == ctx.guild.owner_id or ctx.author.id in ctx.bot.owner_ids)
