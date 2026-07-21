@@ -7105,6 +7105,84 @@ class ForwardPurgeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 for attachment in message.attachments:
                     attachment.read.assert_awaited_once()
 
+    async def test_honeypot_image_match_uses_suspicious_action(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                cog = honeypot.Honeypot(_Bot())
+                await asyncio.to_thread(cog._case_store.initialize)
+                await cog._init_imagescan_store()
+                message = self._message(
+                    honeypot,
+                    attachment_count=1,
+                    channel_id=400,
+                )
+                message.author.ban = mock.AsyncMock()
+                message.guild.get_member = lambda user_id: message.author
+                message.guild.me = SimpleNamespace(id=1)
+                cog.bot.get_guild = lambda guild_id: message.guild
+                config = {
+                    "enabled": True,
+                    "dry_run": False,
+                    "logs_channel": None,
+                    "review_channel": None,
+                    "honeypot_channels": [400],
+                    "whitelisted_roles": [],
+                    "fallback_action": "review",
+                    "action": "ban",
+                    "spam_enabled": False,
+                    "firstpost_enabled": False,
+                    "firstpost_collect_enabled": False,
+                    "imagescan_detector_enabled": True,
+                    "imagescan_detector_action": "review",
+                    "imagescan_detector_threshold": 20,
+                }
+                self._configure_public_boundary(cog, config)
+                cog._is_forward_purge_active.return_value = False
+                cog._imagescan_load_samples = mock.AsyncMock(
+                    return_value=[SimpleNamespace(decision="true_positive")]
+                )
+                cog._imagescan_model_state = mock.AsyncMock(
+                    return_value={"valid": True, "effective_threshold": 20}
+                )
+                cog._missing_action_permission = mock.Mock(return_value=None)
+                cog._ban_delete_message_seconds = mock.Mock(return_value=0)
+                cog._schedule_post_ban_sweep = mock.Mock()
+                cog._publish_detection_case = mock.AsyncMock()
+                honeypot.modlog.create_case = mock.AsyncMock()
+
+                with (
+                    mock.patch.object(
+                        honeypot,
+                        "image_hashes_from_bytes",
+                        return_value={"sha256": "new", "phash": "near-known"},
+                    ),
+                    mock.patch.object(
+                        honeypot,
+                        "match_image",
+                        return_value={
+                            "matched": True,
+                            "score": 7,
+                            "threshold": 20,
+                            "exact_decision": None,
+                        },
+                    ),
+                ):
+                    await cog.on_message(message)
+
+                message.author.ban.assert_awaited_once()
+                snapshot = await asyncio.to_thread(
+                    active_case,
+                    cog._case_store,
+                    message.guild.id,
+                    message.author.id,
+                )
+                signals = {item.signal.detector: item.signal for item in snapshot.signals}
+                self.assertEqual(signals["honeypot"].action, honeypot.ActionIntent.BAN)
+                self.assertEqual(signals["image"].action, honeypot.ActionIntent.NONE)
+                match = signals["image"].metadata["matches"][0]
+                self.assertEqual(match["hash_diff"], 7)
+                self.assertEqual(match["threshold"], 20)
+
     async def test_initial_scan_read_failure_is_retried_for_evidence_and_durable_scan(self):
         with TemporaryDirectory() as directory:
             with _isolated_honeypot_modules(Path(directory)) as honeypot:

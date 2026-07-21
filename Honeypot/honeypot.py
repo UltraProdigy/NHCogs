@@ -3743,7 +3743,11 @@ class Honeypot(Cog):
 
 
     async def _honeypot_signals(
-        self, message: discord.Message, config: dict
+        self,
+        message: discord.Message,
+        config: dict,
+        *,
+        image_evidence: DetectionSignal | None = None,
     ) -> tuple[DetectionSignal, ...]:
         if message.channel.id not in self._honeypot_channel_ids_from_config(config):
             return ()
@@ -3763,6 +3767,8 @@ class Honeypot(Cog):
                 ),
             )
         reasons = await self._suspicion_reasons(message, config)
+        if image_evidence is not None:
+            reasons.append(_("Known suspicious image match"))
         second_strike_role_ids = {
             role_id
             for role_id in (config.get("mute_role"), config.get("joinwatch_auto_role_id"))
@@ -3801,7 +3807,11 @@ class Honeypot(Cog):
         )
 
     async def _initial_image_signal(
-        self, message: discord.Message, config: dict
+        self,
+        message: discord.Message,
+        config: dict,
+        *,
+        action_override: ActionIntent | None = None,
     ) -> DetectionSignal | None:
         if not config.get("imagescan_detector_enabled", False):
             return None
@@ -3878,9 +3888,13 @@ class Honeypot(Cog):
         return DetectionSignal(
             detector="image",
             reason="Initial image scan matched known suspicious content",
-            action=self._signal_action(
-                config.get("imagescan_detector_action", "review"),
-                IMAGE_SCAN_DETECTOR_ACTION_OPTIONS,
+            action=(
+                action_override
+                if action_override is not None
+                else self._signal_action(
+                    config.get("imagescan_detector_action", "review"),
+                    IMAGE_SCAN_DETECTOR_ACTION_OPTIONS,
+                )
             ),
             decisive=True,
             metadata={"matches": tuple(matches)},
@@ -3893,8 +3907,26 @@ class Honeypot(Cog):
         signals: list[DetectionSignal] = []
         if forward is not None:
             signals.append(forward)
-        if message.channel.id in self._honeypot_channel_ids_from_config(config):
-            signals.extend(await self._honeypot_signals(message, config))
+        in_honeypot = (
+            message.channel.id in self._honeypot_channel_ids_from_config(config)
+        )
+        if in_honeypot:
+            image = None
+            if not any(signal.decisive for signal in signals):
+                image = await self._initial_image_signal(
+                    message,
+                    config,
+                    action_override=ActionIntent.NONE,
+                )
+            signals.extend(
+                await self._honeypot_signals(
+                    message,
+                    config,
+                    image_evidence=image,
+                )
+            )
+            if image is not None:
+                signals.append(image)
         else:
             spam = self._spam_signal(message, config)
             if spam is not None:
@@ -3902,10 +3934,10 @@ class Honeypot(Cog):
             firstpost = await self._firstpost_signal(message, config)
             if firstpost is not None:
                 signals.append(firstpost)
-        if not any(signal.decisive for signal in signals):
-            image = await self._initial_image_signal(message, config)
-            if image is not None:
-                signals.append(image)
+            if not any(signal.decisive for signal in signals):
+                image = await self._initial_image_signal(message, config)
+                if image is not None:
+                    signals.append(image)
         return tuple(signals)
 
     @staticmethod
