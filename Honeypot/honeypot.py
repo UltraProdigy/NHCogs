@@ -545,8 +545,9 @@ class DetectionBulkConfirmationView(discord.ui.View):
         button = discord.ui.Button(label=label, style=style)
 
         async def callback(interaction):
+            await self.cog._dismiss_case_review_prompt(interaction)
             if self.message_sequence is None:
-                completed = await self.cog._case_review_bulk_interaction(
+                await self.cog._case_review_bulk_interaction(
                     interaction,
                     self.case_id,
                     self.action,
@@ -554,7 +555,7 @@ class DetectionBulkConfirmationView(discord.ui.View):
                     expected_keys=self.expected_keys,
                 )
             else:
-                completed = await self.cog._case_review_message_bulk_interaction(
+                await self.cog._case_review_message_bulk_interaction(
                     interaction,
                     self.case_id,
                     self.message_sequence,
@@ -562,11 +563,6 @@ class DetectionBulkConfirmationView(discord.ui.View):
                     confirmed=True,
                     expected_keys=self.expected_keys,
                 )
-            if completed:
-                try:
-                    await interaction.delete_original_response()
-                except discord.NotFound:
-                    pass
 
         button.callback = callback
         add_item(button)
@@ -592,14 +588,10 @@ class DetectionModerationConfirmationView(discord.ui.View):
         )
 
         async def callback(interaction):
-            completed = await self.cog._case_review_moderation_interaction(
+            await self.cog._dismiss_case_review_prompt(interaction)
+            await self.cog._case_review_moderation_interaction(
                 interaction, self.case_id, self.action, confirmed=True
             )
-            if completed:
-                try:
-                    await interaction.delete_original_response()
-                except discord.NotFound:
-                    pass
 
         button.callback = callback
         add_item(button)
@@ -668,6 +660,7 @@ class DetectionIndividualView(discord.ui.View):
                 async def callback(interaction, selected=action):
                     if self.selected_key is None:
                         return
+                    await self.cog._dismiss_case_review_prompt(interaction)
                     await self.cog._case_review_attachment_interaction(
                         interaction, self.selected_key, selected
                     )
@@ -5446,6 +5439,25 @@ class Honeypot(Cog):
             interaction
         )
 
+    @staticmethod
+    async def _case_review_defer(interaction: discord.Interaction) -> None:
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+
+    async def _dismiss_case_review_prompt(
+        self, interaction: discord.Interaction
+    ) -> None:
+        await self._case_review_defer(interaction)
+        try:
+            await interaction.delete_original_response()
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            log.warning(
+                "Could not dismiss Honeypot ephemeral review prompt",
+                exc_info=True,
+            )
+
     async def _case_review_error(self, interaction: discord.Interaction, message: str) -> None:
         response = interaction.response
         if not response.is_done():
@@ -5578,7 +5590,7 @@ class Honeypot(Cog):
                 ephemeral=True,
             )
             return False
-        await interaction.response.defer()
+        await self._case_review_defer(interaction)
         try:
             await self._case_review_service.apply_bulk(
                 case_id,
@@ -5642,7 +5654,7 @@ class Honeypot(Cog):
                 ephemeral=True,
             )
             return False
-        await interaction.response.defer()
+        await self._case_review_defer(interaction)
         try:
             await self._case_review_service.apply_message(
                 case_id,
@@ -5695,7 +5707,7 @@ class Honeypot(Cog):
                     ephemeral=True,
                 )
                 return False
-        await interaction.response.defer()
+        await self._case_review_defer(interaction)
         try:
             if action == "ignore":
                 snapshot = await asyncio.to_thread(self._case_store.get_case, case_id)
@@ -5768,7 +5780,7 @@ class Honeypot(Cog):
         if not self._case_review_has_permission(interaction):
             await self._case_review_error(interaction, _("You do not have permission to review this case."))
             return
-        await interaction.response.defer()
+        await self._case_review_defer(interaction)
         try:
             await self._case_review_service.apply_individual(key, action, interaction.user.id)
             await self._finish_case_review_if_ready(key.case_id, interaction.user.id)

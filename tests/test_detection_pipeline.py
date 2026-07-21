@@ -7961,7 +7961,7 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 snapshot = cog._case_store.get_case(appended.case.case_id)
-                interaction.response.defer.assert_awaited_once()
+                interaction.response.defer.assert_not_awaited()
                 self.assertEqual(snapshot.case.status.value, "resolved")
                 self.assertEqual(snapshot.case.resolution, "ignore")
                 self.assertEqual(
@@ -8534,11 +8534,17 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(snapshot.case.status.value, "pending")
                 self.assertEqual(snapshot.operations, ())
 
+                confirmation_response_done = False
+
+                async def defer_confirmation():
+                    nonlocal confirmation_response_done
+                    confirmation_response_done = True
+
                 confirmation_interaction = SimpleNamespace(
                     user=interaction.user,
                     response=SimpleNamespace(
-                        defer=mock.AsyncMock(),
-                        is_done=lambda: True,
+                        defer=mock.AsyncMock(side_effect=defer_confirmation),
+                        is_done=lambda: confirmation_response_done,
                     ),
                     followup=SimpleNamespace(send=mock.AsyncMock()),
                     delete_original_response=mock.AsyncMock(),
@@ -8556,7 +8562,7 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(operation.status.value, "succeeded")
                 self.assertEqual(operation.result, "planned_ban")
 
-    async def test_successful_bulk_confirmation_deletes_ephemeral_message(self):
+    async def test_bulk_confirmation_dismisses_prompt_before_action_finishes(self):
         with TemporaryDirectory() as directory:
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
                 honeypot.DetectionBulkConfirmationView.add_item = (
@@ -8565,24 +8571,57 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 honeypot.discord.ui.Button = lambda **kwargs: SimpleNamespace(**kwargs)
-                cog = SimpleNamespace(
-                    _case_review_bulk_interaction=mock.AsyncMock(return_value=True)
+                cog = honeypot.Honeypot(_Bot())
+                action_started = asyncio.Event()
+                release_action = asyncio.Event()
+                order = []
+
+                async def run_action(*args, **kwargs):
+                    order.append("action")
+                    action_started.set()
+                    await release_action.wait()
+                    return False
+
+                cog._case_review_bulk_interaction = mock.AsyncMock(
+                    side_effect=run_action
                 )
                 view = honeypot.DetectionBulkConfirmationView(
                     cog,
                     "case-1",
                     "tp",
                 )
+                response_done = False
+
+                async def defer():
+                    nonlocal response_done
+                    order.append("defer")
+                    response_done = True
+
+                async def delete_original_response():
+                    order.append("delete")
+
                 interaction = SimpleNamespace(
-                    delete_original_response=mock.AsyncMock()
+                    response=SimpleNamespace(
+                        defer=mock.AsyncMock(side_effect=defer),
+                        is_done=lambda: response_done,
+                    ),
+                    followup=SimpleNamespace(send=mock.AsyncMock()),
+                    delete_original_response=mock.AsyncMock(
+                        side_effect=delete_original_response
+                    ),
                 )
 
-                await view.children[0].callback(interaction)
+                callback = asyncio.create_task(
+                    view.children[0].callback(interaction)
+                )
+                await action_started.wait()
 
-                cog._case_review_bulk_interaction.assert_awaited_once()
                 interaction.delete_original_response.assert_awaited_once_with()
+                self.assertEqual(order, ["defer", "delete", "action"])
+                release_action.set()
+                await callback
 
-    async def test_failed_bulk_confirmation_keeps_ephemeral_message(self):
+    async def test_dismissed_confirmation_reports_failure_in_new_ephemeral_message(self):
         with TemporaryDirectory() as directory:
             with _isolated_honeypot_modules(Path(directory)) as honeypot:
                 honeypot.DetectionBulkConfirmationView.add_item = (
@@ -8591,21 +8630,102 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 honeypot.discord.ui.Button = lambda **kwargs: SimpleNamespace(**kwargs)
-                cog = SimpleNamespace(
-                    _case_review_bulk_interaction=mock.AsyncMock(return_value=False)
-                )
+                cog = honeypot.Honeypot(_Bot())
                 view = honeypot.DetectionBulkConfirmationView(
                     cog,
                     "case-1",
                     "tp",
                 )
+                response_done = False
+
+                async def defer():
+                    nonlocal response_done
+                    response_done = True
+
                 interaction = SimpleNamespace(
-                    delete_original_response=mock.AsyncMock()
+                    user=SimpleNamespace(
+                        id=99,
+                        guild_permissions=SimpleNamespace(
+                            manage_messages=False,
+                            moderate_members=False,
+                            ban_members=False,
+                            kick_members=False,
+                        ),
+                    ),
+                    response=SimpleNamespace(
+                        defer=mock.AsyncMock(side_effect=defer),
+                        is_done=lambda: response_done,
+                    ),
+                    followup=SimpleNamespace(send=mock.AsyncMock()),
+                    delete_original_response=mock.AsyncMock(),
                 )
 
                 await view.children[0].callback(interaction)
 
-                interaction.delete_original_response.assert_not_awaited()
+                interaction.delete_original_response.assert_awaited_once_with()
+                interaction.followup.send.assert_awaited_once_with(
+                    "You do not have permission to review this case.",
+                    ephemeral=True,
+                )
+
+    async def test_moderation_confirmation_dismisses_prompt_before_action_finishes(self):
+        with TemporaryDirectory() as directory:
+            with _isolated_honeypot_modules(Path(directory)) as honeypot:
+                honeypot.DetectionModerationConfirmationView.add_item = (
+                    lambda view, item: setattr(
+                        view, "children", getattr(view, "children", []) + [item]
+                    )
+                )
+                honeypot.discord.ui.Button = lambda **kwargs: SimpleNamespace(**kwargs)
+                cog = honeypot.Honeypot(_Bot())
+                action_started = asyncio.Event()
+                release_action = asyncio.Event()
+                order = []
+
+                async def run_action(*args, **kwargs):
+                    order.append("action")
+                    action_started.set()
+                    await release_action.wait()
+                    return True
+
+                cog._case_review_moderation_interaction = mock.AsyncMock(
+                    side_effect=run_action
+                )
+                view = honeypot.DetectionModerationConfirmationView(
+                    cog,
+                    "case-1",
+                    "ban",
+                )
+                response_done = False
+
+                async def defer():
+                    nonlocal response_done
+                    order.append("defer")
+                    response_done = True
+
+                async def delete_original_response():
+                    order.append("delete")
+
+                interaction = SimpleNamespace(
+                    response=SimpleNamespace(
+                        defer=mock.AsyncMock(side_effect=defer),
+                        is_done=lambda: response_done,
+                    ),
+                    followup=SimpleNamespace(send=mock.AsyncMock()),
+                    delete_original_response=mock.AsyncMock(
+                        side_effect=delete_original_response
+                    ),
+                )
+
+                callback = asyncio.create_task(
+                    view.children[0].callback(interaction)
+                )
+                await action_started.wait()
+
+                interaction.delete_original_response.assert_awaited_once_with()
+                self.assertEqual(order, ["defer", "delete", "action"])
+                release_action.set()
+                await callback
 
     async def test_dry_run_moderator_ban_is_persisted_as_planned(self):
         with TemporaryDirectory() as directory:
@@ -9529,16 +9649,32 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
 
                 selector.values = [selector.options[0].value]
                 selection = SimpleNamespace(
-                    response=SimpleNamespace(edit_message=mock.AsyncMock())
+                    response=SimpleNamespace(edit_message=mock.AsyncMock()),
+                    delete_original_response=mock.AsyncMock(),
                 )
                 await selector.callback(selection)
+                selection.delete_original_response.assert_not_awaited()
                 self.assertEqual(
                     [item.label for item in view.children[1:]],
                     ["TP", "FP", "Ignore"],
                 )
-                await view.children[1].callback(selection)
+                response_done = False
+
+                async def defer():
+                    nonlocal response_done
+                    response_done = True
+
+                action_interaction = SimpleNamespace(
+                    response=SimpleNamespace(
+                        defer=mock.AsyncMock(side_effect=defer),
+                        is_done=lambda: response_done,
+                    ),
+                    delete_original_response=mock.AsyncMock(),
+                )
+                await view.children[1].callback(action_interaction)
+                action_interaction.delete_original_response.assert_awaited_once_with()
                 cog._case_review_attachment_interaction.assert_awaited_with(
-                    selection,
+                    action_interaction,
                     honeypot.AttachmentKey(appended.case.case_id, 1, 0),
                     "tp",
                 )
@@ -9549,9 +9685,18 @@ class DetectionExpiryTests(unittest.IsolatedAsyncioTestCase):
                     [item.label for item in view.children[1:]],
                     ["Add", "Ignore"],
                 )
-                await view.children[1].callback(selection)
+                response_done = False
+                action_interaction = SimpleNamespace(
+                    response=SimpleNamespace(
+                        defer=mock.AsyncMock(side_effect=defer),
+                        is_done=lambda: response_done,
+                    ),
+                    delete_original_response=mock.AsyncMock(),
+                )
+                await view.children[1].callback(action_interaction)
+                action_interaction.delete_original_response.assert_awaited_once_with()
                 cog._case_review_attachment_interaction.assert_awaited_with(
-                    selection,
+                    action_interaction,
                     honeypot.AttachmentKey(appended.case.case_id, 1, 1),
                     "tp",
                 )
