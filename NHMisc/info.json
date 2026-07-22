@@ -1,0 +1,25 @@
+{
+  "author": [
+    "Pxx500"
+  ],
+  "name": "NHMisc",
+  "install_msg": "Thank you for installing this cog.\nDo `[p]help NHMisc` to get the list of commands and their description.",
+  "short": "Miscellaneous small utilities for Red-DiscordBot.",
+  "description": "A placeholder cog intended for miscellaneous small bot functionality.",
+  "tags": [
+    "misc",
+    "utility",
+    "redbot"
+  ],
+  "requirements": [
+    "matplotlib"
+  ],
+  "min_bot_version": "3.5.0",
+  "min_python_version": [
+    3,
+    10,
+    0
+  ],
+  "end_user_data_statement": "This cog stores Discord user IDs with passively collected message-count aggregates for configurable short-term activity detail retention. Closed daily summary history stores aggregate counts and channel IDs, but not user IDs. It does not store message content or message IDs."
+}
+
