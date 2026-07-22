@@ -8,8 +8,8 @@ is typed as `!nhmisc status`.
 ## Installation
 
 ```ini
-[p]repo add NHMisc https://github.com/Pxx500/NHMisc
-[p]cog install NHMisc NHMisc
+[p]repo add NHCogs https://github.com/Pxx500/NHCogs
+[p]cog install NHCogs NHMisc
 [p]load NHMisc
 ```
 

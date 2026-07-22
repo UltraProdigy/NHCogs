@@ -7,8 +7,8 @@ and either punished automatically or sent to moderators for review. It also aler
 ## Installation
 
 ```ini
-[p]repo add Honeypot https://github.com/Pxx500/Honeypot
-[p]cog install Honeypot Honeypot
+[p]repo add NHCogs https://github.com/Pxx500/NHCogs
+[p]cog install NHCogs Honeypot
 [p]load Honeypot
 ```
 
