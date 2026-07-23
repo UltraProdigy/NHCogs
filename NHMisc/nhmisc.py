@@ -35,6 +35,39 @@ DEFAULT_VCJUMPING_WINDOW_SECONDS = 30
 DEFAULT_ACTIVITY_DETAIL_RETENTION_DAYS = 31
 DEFAULT_ACTIVITY_HISTORY_RETENTION_DAYS = -1
 RETENTION_CONFIRMATION = "I understand"
+GATECOUNT_TIERS = (
+    # For Each Tier: emoji ID, SP role ID, MP role ID
+    (
+        "stargate",
+        769315278953381928,
+        1348078501986828461,
+        798700443979087892,
+    ),
+    (
+        "gatefinity",
+        1004823049037680702,
+        1348078496710135888,
+        1004822424921055233,
+    ),
+    (
+        "gateforce",
+        1097204464919773205,
+        1348078483384958986,
+        1097204292198338692,
+    ),
+    (
+        "gateflower",
+        1442240252084486286,
+        1442209676530815076,
+        1442209801374269682,
+    ),
+    (
+        "gatelympics",
+        1442208021655715961,
+        1442208051212976158,
+        1437811360208781406,
+    ),
+)
 
 
 class NHMisc(commands.Cog):
@@ -154,6 +187,43 @@ class NHMisc(commands.Cog):
                 seconds=config["vcjumping_window_seconds"],
             )
         )
+
+    @commands.command(name="gatecount")
+    @commands.guild_only()
+    async def gatecount(self, ctx: commands.Context) -> None:
+        """Show the current SP and MP gate role member counts."""
+        resolved_roles = []
+        for emoji_name, emoji_id, sp_role_id, mp_role_id in GATECOUNT_TIERS:
+            label = emoji_name.title()
+            sp_role = ctx.guild.get_role(sp_role_id)
+            if sp_role is None:
+                raise commands.UserFeedbackCheckFailure(
+                    f"Gatecount is misconfigured: {label} SP role "
+                    f"({sp_role_id}) was not found in this server."
+                )
+
+            mp_role = ctx.guild.get_role(mp_role_id)
+            if mp_role is None:
+                raise commands.UserFeedbackCheckFailure(
+                    f"Gatecount is misconfigured: {label} MP role "
+                    f"({mp_role_id}) was not found in this server."
+                )
+
+            resolved_roles.append((emoji_name, emoji_id, sp_role, mp_role))
+
+        lines = [
+            (
+                f"<:{emoji_name}:{emoji_id}> — "
+                f"**{len(sp_role.members)} SP** | **{len(mp_role.members)} MP**"
+            )
+            for emoji_name, emoji_id, sp_role, mp_role in resolved_roles
+        ]
+        embed = discord.Embed(
+            title="Current Gatecount",
+            description="\n".join(lines),
+            color=discord.Color.blue(),
+        )
+        await ctx.send(embed=embed)
 
     @nhmisc.group(name="stickyroles", invoke_without_command=True)
     async def nhmisc_stickyroles(self, ctx: commands.Context) -> None:

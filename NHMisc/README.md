@@ -55,6 +55,15 @@ Defaults:
 - VC jumping entries: `3`
 - VC jumping window: `30` seconds
 
+## Gatecount
+
+```ini
+[p]gatecount
+```
+
+Shows the current SP and MP role member counts for each configured gate tier. This
+command can be used by any server member.
+
 ## Sticky Roles
 
 Sticky roles remember selected roles when a member leaves and restore them when the
