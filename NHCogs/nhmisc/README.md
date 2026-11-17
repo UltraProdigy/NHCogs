@@ -447,6 +447,13 @@ Daily summaries include:
 - average messages per active user;
 - peak hour shown as a Discord-localized timestamp;
 - top 5 channels as Discord channel mentions.
+- Emoji of the Day, selected by message uses plus the nonnegative reaction balance.
+
+Emoji of the Day uses the completed UTC day and appears in the existing daily report.
+Each emoji counts once per message. Normal reactions and super reactions share one
+balance, with additions increasing it and individual removals decreasing it. A day
+without recorded emoji usage shows `No recorded usage`. The winner is saved with the
+daily summary, so it remains available after detailed emoji history is pruned.
 
 ### Activity Commands
 
@@ -591,6 +598,93 @@ user.
 
 Shows the users who sent the most messages across the server in the retained date range.
 The result count must be between 1 and 20.
+
+### Emoji Chart
+
+```ini
+[p]emojichart [channel_or_thread] [summary|days] [amount] [all|messages|reactions]
+```
+
+Charts custom emoji belonging to this server. Unicode emoji, emoji from other servers,
+and known bot reactions are ignored. Messages from bots and webhooks are ignored.
+Animated server emoji are included. One message contributes at most one use per emoji,
+even if it repeats that emoji. Different emoji in the same message count separately.
+
+The command requires Manage Messages. With no arguments, it shows the server-wide
+`summary`, top 10 emoji, ranked by message uses plus reaction balance. `summary` covers
+all observations since tracking began. A numeric range accepts only 1 through 30 and
+includes today and the preceding UTC days. `amount` accepts 1 through 20.
+
+```ini
+[p]emojichart summary
+[p]emojichart 7 10
+[p]emojichart 30 20 reactions
+[p]emojichart #general summary 10 messages
+[p]emojichart #thread 7 10 all
+```
+
+An optional channel or thread mention or raw ID restricts the ranking to that exact
+location. Threads are recorded separately from their parents. The selected location
+must be visible to the caller. The chart is posted where the command is invoked.
+
+The horizontal ranking and donut use the same colours. `Other` contains eligible
+emoji outside the selected top. The accompanying embed displays Discord emoji and
+separate message, reaction, and combined counts. Percentages use the total for the
+selected metric, including emoji outside the top. Empty selections return a short
+no-data message.
+
+The ranking displays a thumbnail next to each emoji name. Thumbnails are fetched from
+Discord's CDN as WebP only while rendering a chart, for the selected top emoji. Animated
+emoji use their first frame because the chart is a PNG. If an image is unavailable,
+the name and counts remain visible. Image downloads have time and size limits and do
+not change the collected statistics.
+
+Reactions are a balance of additions and individual removals observed in the selected
+period. Normal reactions and super reactions use the same counter. Changes are assigned
+to the UTC day when the bot receives the event. Daily balances may be negative, with
+only the final per-emoji sum clamped to zero for display. Repeated add/remove cycles
+therefore cancel. Bulk reaction removal, message deletion, and message edits do not
+adjust these counters. No individual reaction ledger is stored.
+
+Collection requires Guild Messages and Message Content intents for message usage,
+Guild Message Reactions for reactions, and Guild Expressions to keep the server emoji
+cache up to date. Reaction
+events can come from old messages outside the bot's message cache. No message history
+is fetched. Events missed while the bot is offline cannot be reconstructed by this
+feature. Data is recorded only from locations whose events reach the bot.
+
+Daily emoji aggregates are retained for 30 days independently of activity detail and
+summary retention. The small per-channel lifetime aggregates used by `summary` are
+retained until the bot leaves the server. No pre-installation history is imported.
+
+### Complete Emoji Report
+
+```ini
+[p]emojireport
+```
+
+Exports a complete CSV for every custom emoji currently belonging to this server,
+including emoji with zero recorded uses. The command requires Manage Messages and
+uses the same collection intent requirements as the combined emoji chart. It accepts
+no arguments and reports lifetime observations since emoji tracking began.
+
+Rows are sorted from the lowest use rate to the highest. Columns include the current
+emoji name and ID, animation flag, message uses, reaction balance, combined total,
+tracking start date, tracking days, and uses per day. Deleted emoji and emoji belonging
+to other servers are excluded from this catalog report.
+
+For emoji older than tracking, days begin at the recorded start of tracking for this
+server. For emoji created later, days begin on their creation date. The current UTC
+day is included, so an emoji created today has one tracking day. Uses per day equals
+the combined total divided by this number of calendar days. It is not a measurement
+of bot uptime. Normal reactions and super reactions share the same balance, with
+individual removals deducted. Message uses count each emoji once per message.
+
+The accompanying embed shows the number of current emoji, how many have zero uses,
+examples of those emoji, and the lowest nonzero rates. The CSV uses the existing export
+helper and is compressed to ZIP if needed to fit Discord's attachment limit. Tracking
+start dates are retained across restart and daily-history pruning and are removed when
+the bot leaves the server.
 
 ### User Command
 
@@ -737,6 +831,14 @@ Expected command, permission, and validation outcomes use normal command feedbac
 The cog stores Discord user IDs with passively collected message-count aggregates for
 configurable short-term activity detail retention. Closed daily summary history stores
 aggregate counts and channel IDs, but not user IDs.
+
+Emoji statistics store guild, channel or thread, and emoji IDs, UTC dates, message-use
+counts, signed reaction balances, emoji names, and animation flags in the activity
+SQLite database. Daily rows are kept for 30 days. Lifetime per-channel counters are
+kept separately, along with each server's tracking start date. Daily reports retain
+the winning emoji under normal summary retention.
+No message content, message IDs, or reacting user IDs are stored by emoji statistics.
+Guild removal deletes that guild's emoji counters, metadata, and saved daily winners.
 
 The detailed activity row is keyed by UTC date, user ID, parent channel ID, thread ID,
 and message count. A user can have multiple rows for the same day when they post in

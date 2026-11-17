@@ -105,6 +105,32 @@ def _draw_donut(
     axis.axis("equal")
 
 
+def _draw_row_icons(axis, row_icons: Sequence[bytes | None]) -> None:
+    import numpy as np
+    from matplotlib.offsetbox import AnnotationBbox, OffsetImage
+    from PIL import Image
+
+    axis.tick_params(axis="y", pad=36)
+    for position, data in enumerate(row_icons):
+        if data is None:
+            continue
+        try:
+            with Image.open(io.BytesIO(data)) as source:
+                image = source.convert("RGBA")
+                image.thumbnail((24, 24))
+        except (OSError, ValueError):
+            continue
+        axis.add_artist(AnnotationBbox(
+            OffsetImage(np.asarray(image)),
+            (0, position),
+            xycoords=axis.get_yaxis_transform(),
+            xybox=(-18, 0),
+            boxcoords="offset points",
+            frameon=False,
+            annotation_clip=False,
+        ))
+
+
 def render_ranked_donut_chart(
     rows: Sequence[tuple[str, int]],
     *,
@@ -114,6 +140,7 @@ def render_ranked_donut_chart(
     center_unit: str,
     donut_title: str,
     filename: str,
+    row_icons: Sequence[bytes | None] | None = None,
 ) -> discord.File:
     import matplotlib
 
@@ -125,6 +152,8 @@ def render_ranked_donut_chart(
     total_count = sum(values) + other_count
     if not values or total_count <= 0:
         raise ValueError("ranked donut chart requires positive data")
+    if row_icons is not None and len(row_icons) != len(rows):
+        raise ValueError("Each chart row must have one icon slot")
 
     bar_colors = list(SERIES_COLORS[: len(values)])
     figure_height = max(5.5, 1.5 + len(rows) * 0.5)
@@ -135,6 +164,8 @@ def render_ranked_donut_chart(
         donut_axis = figure.add_subplot(grid[0, 1])
 
         _draw_ranking(ranking_axis, labels, values, bar_colors, total_count)
+        if row_icons is not None and any(row_icons):
+            _draw_row_icons(ranking_axis, row_icons)
         _draw_donut(
             donut_axis,
             values=values,

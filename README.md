@@ -34,3 +34,6 @@ The combined extension also provides shared technical error reporting. See the
 [p]cog install NHCogs NHCogs
 [p]load NHCogs
 ```
+
+
+https://www.youtube.com/watch?v=3TNpOD6bov8&t=83s

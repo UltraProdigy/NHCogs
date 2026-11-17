@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
@@ -14,6 +14,40 @@ class TopChannel:
     channel_id: int
     message_count: int
     rank: int
+
+
+@dataclass(frozen=True)
+class EmojiInfo:
+    emoji_id: int
+    name: str
+    animated: bool
+
+    @property
+    def mention(self) -> str:
+        return f"<{'a' if self.animated else ''}:{self.name}:{self.emoji_id}>"
+
+
+@dataclass(frozen=True)
+class EmojiCount:
+    emoji: EmojiInfo
+    message_uses: int
+    reaction_uses: int
+
+    @property
+    def emoji_id(self) -> int:
+        return self.emoji.emoji_id
+
+    @property
+    def total(self) -> int:
+        return self.message_uses + self.reaction_uses
+
+
+@dataclass(frozen=True)
+class EmojiUsageRate:
+    usage: EmojiCount
+    tracked_since: date
+    tracked_days: int
+    uses_per_day: float
 
 
 @dataclass(frozen=True)
@@ -29,6 +63,7 @@ class DailySummary:
     peak_hour_utc: int | None
     messages_per_active_user: float
     top_channels: list[TopChannel]
+    emoji_of_day: EmojiInfo | None = None
 
 
 @dataclass(frozen=True)
@@ -116,7 +151,15 @@ HISTORY_ACTIVITY_TABLES = (
     "activity_daily_top_channels",
     "activity_daily_channel_summary",
 )
+EMOJI_ACTIVITY_TABLES = (
+    "activity_emoji_day",
+    "activity_emoji_total",
+    "activity_emoji_metadata",
+    "activity_daily_emoji",
+    "activity_emoji_tracking",
+)
 NO_THREAD_ID = 0
+EMOJI_HISTORY_DAYS = 30
 
 
 class ActivityStore:
@@ -141,6 +184,8 @@ class ActivityStore:
         channel_id: int,
         thread_id: int | None,
         now_utc: datetime,
+        *,
+        emojis: Sequence[EmojiInfo] = (),
     ) -> None:
         async with self._lock:
             await asyncio.to_thread(
@@ -152,7 +197,49 @@ class ActivityStore:
                 channel_id,
                 thread_id,
                 now_utc,
+                emojis,
             )
+
+    async def record_emoji_reaction(
+        self, guild_id: int, date_utc: date, channel_id: int, emoji: EmojiInfo, delta: int
+    ) -> None:
+        if delta not in {-1, 1}:
+            raise ValueError("Reaction change must be -1 or 1")
+        async with self._lock:
+            await asyncio.to_thread(
+                self._record_emoji_reaction_sync, guild_id, date_utc, channel_id, emoji, delta
+            )
+
+    async def begin_emoji_tracking(self, guild_id: int, started_on: date) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._begin_emoji_tracking_sync, guild_id, started_on)
+
+    async def get_emoji_report(
+        self, guild_id: int, end_date_utc: date, catalog: Sequence[tuple[EmojiInfo, date]],
+    ) -> list[EmojiUsageRate]:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._get_emoji_report_sync, guild_id, end_date_utc, catalog
+            )
+
+    async def get_emoji_counts(
+        self, guild_id: int, end_date_utc: date, days: int | None,
+        channel_id: int | None = None,
+    ) -> list[EmojiCount]:
+        if days is not None and not 1 <= days <= EMOJI_HISTORY_DAYS:
+            raise ValueError("Emoji range must be from 1 through 30 days")
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._get_emoji_counts_sync, guild_id, end_date_utc, days, channel_id
+            )
+
+    async def prune_emoji_history(self, guild_id: int, today: date) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._prune_emoji_history_sync, guild_id, today)
+
+    async def delete_emoji_guild(self, guild_id: int) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._delete_emoji_guild_sync, guild_id)
 
     async def close_stale_days(
         self, guild_id: int, current_date_utc: date, member_count: int
@@ -478,6 +565,46 @@ class ActivityStore:
                     ON activity_daily_top_channels (guild_id, date_utc);
                 CREATE INDEX IF NOT EXISTS idx_activity_daily_channel_summary_lookup
                     ON activity_daily_channel_summary (guild_id, channel_id, date_utc);
+
+                  CREATE TABLE IF NOT EXISTS activity_emoji_metadata (
+                      guild_id INTEGER NOT NULL,
+                      emoji_id INTEGER NOT NULL,
+                      name TEXT NOT NULL,
+                      animated INTEGER NOT NULL,
+                      PRIMARY KEY (guild_id, emoji_id)
+                  );
+                  CREATE TABLE IF NOT EXISTS activity_emoji_day (
+                      guild_id INTEGER NOT NULL,
+                      date_utc TEXT NOT NULL,
+                      channel_id INTEGER NOT NULL,
+                      emoji_id INTEGER NOT NULL,
+                      message_uses INTEGER NOT NULL,
+                      reaction_delta INTEGER NOT NULL,
+                      PRIMARY KEY (guild_id, date_utc, channel_id, emoji_id)
+                  );
+                  CREATE TABLE IF NOT EXISTS activity_emoji_total (
+                      guild_id INTEGER NOT NULL,
+                      channel_id INTEGER NOT NULL,
+                      emoji_id INTEGER NOT NULL,
+                      message_uses INTEGER NOT NULL,
+                      reaction_delta INTEGER NOT NULL,
+                      PRIMARY KEY (guild_id, channel_id, emoji_id)
+                  );
+                  CREATE TABLE IF NOT EXISTS activity_daily_emoji (
+                      guild_id INTEGER NOT NULL,
+                      date_utc TEXT NOT NULL,
+                      emoji_id INTEGER NOT NULL,
+                      name TEXT NOT NULL,
+                      animated INTEGER NOT NULL,
+                      PRIMARY KEY (guild_id, date_utc),
+                      FOREIGN KEY (guild_id, date_utc)
+                          REFERENCES activity_daily_summary (guild_id, date_utc)
+                          ON DELETE CASCADE
+                  );
+                  CREATE TABLE IF NOT EXISTS activity_emoji_tracking (
+                      guild_id INTEGER PRIMARY KEY,
+                      started_on TEXT NOT NULL
+                  );
                 """
             )
 
@@ -490,11 +617,13 @@ class ActivityStore:
         channel_id: int,
         thread_id: int | None,
         now_utc: datetime,
+        emojis: Sequence[EmojiInfo],
     ) -> None:
         date_key = date_utc.isoformat()
         stored_thread_id = thread_id or NO_THREAD_ID
         now_key = now_utc.isoformat()
         with self._connection() as conn:
+            self._begin_emoji_tracking_with_conn(conn, guild_id, date_utc)
             conn.execute(
                 """
                 INSERT INTO activity_open_day
@@ -530,6 +659,143 @@ class ActivityStore:
                 ("guild_id", "date_utc", "user_id", "channel_id", "thread_id"),
                 (guild_id, date_key, user_id, channel_id, stored_thread_id),
             )
+            for emoji in {emoji.emoji_id: emoji for emoji in emojis}.values():
+                self._record_emoji_with_conn(
+                    conn, guild_id, date_utc, thread_id or channel_id, emoji, 1, 0
+                )
+
+    def _record_emoji_with_conn(
+        self, conn: sqlite3.Connection, guild_id: int, day: date, channel_id: int,
+        emoji: EmojiInfo, message_uses: int, reaction_delta: int,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO activity_emoji_metadata VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id, emoji_id) DO UPDATE SET
+                name = excluded.name, animated = excluded.animated
+            """,
+            (guild_id, emoji.emoji_id, emoji.name, int(emoji.animated)),
+        )
+        conn.execute(
+            """
+            INSERT INTO activity_emoji_day VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, date_utc, channel_id, emoji_id) DO UPDATE SET
+                message_uses = message_uses + excluded.message_uses,
+                reaction_delta = reaction_delta + excluded.reaction_delta
+            """,
+            (guild_id, day.isoformat(), channel_id, emoji.emoji_id, message_uses, reaction_delta),
+        )
+        conn.execute(
+            """
+            INSERT INTO activity_emoji_total VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, channel_id, emoji_id) DO UPDATE SET
+                message_uses = message_uses + excluded.message_uses,
+                reaction_delta = reaction_delta + excluded.reaction_delta
+            """,
+            (guild_id, channel_id, emoji.emoji_id, message_uses, reaction_delta),
+        )
+
+    def _record_emoji_reaction_sync(
+        self, guild_id: int, day: date, channel_id: int, emoji: EmojiInfo, delta: int
+    ) -> None:
+        with self._connection() as conn:
+            self._begin_emoji_tracking_with_conn(conn, guild_id, day)
+            self._record_emoji_with_conn(conn, guild_id, day, channel_id, emoji, 0, delta)
+            conn.execute(
+                """
+                INSERT INTO activity_open_day VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO NOTHING
+                """,
+                (guild_id, day.isoformat(), day.isoformat(), day.isoformat()),
+            )
+
+    def _begin_emoji_tracking_with_conn(
+        self, conn: sqlite3.Connection, guild_id: int, started_on: date,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO activity_emoji_tracking VALUES (?, ?) ON CONFLICT(guild_id) DO NOTHING",
+            (guild_id, started_on.isoformat()),
+        )
+
+    def _begin_emoji_tracking_sync(self, guild_id: int, started_on: date) -> None:
+        with self._connection() as conn:
+            self._begin_emoji_tracking_with_conn(conn, guild_id, started_on)
+
+    def _get_emoji_report_sync(
+        self, guild_id: int, end_date: date, catalog: Sequence[tuple[EmojiInfo, date]],
+    ) -> list[EmojiUsageRate]:
+        with self._connection() as conn:
+            self._begin_emoji_tracking_with_conn(conn, guild_id, end_date)
+            started_on = date.fromisoformat(conn.execute(
+                "SELECT started_on FROM activity_emoji_tracking WHERE guild_id = ?", (guild_id,),
+            ).fetchone()[0])
+            counts = {
+                row.emoji_id: row
+                for row in self._emoji_counts_with_conn(conn, guild_id, end_date, None)
+            }
+        rows = []
+        for emoji, created_on in catalog:
+            usage = counts.get(emoji.emoji_id, EmojiCount(emoji, 0, 0))
+            # The live catalog supplies current names, including unused emoji.
+            usage = EmojiCount(emoji, usage.message_uses, usage.reaction_uses)
+            tracked_since = max(started_on, created_on)
+            tracked_days = max(1, (end_date - tracked_since).days + 1)
+            rows.append(EmojiUsageRate(usage, tracked_since, tracked_days, usage.total / tracked_days))
+        return sorted(rows, key=lambda row: (
+            row.uses_per_day, row.usage.total,
+            row.usage.emoji.name.casefold(), row.usage.emoji_id,
+        ))
+
+    def _get_emoji_counts_sync(
+        self, guild_id: int, end_date: date, days: int | None, channel_id: int | None,
+    ) -> list[EmojiCount]:
+        with self._connection() as conn:
+            return self._emoji_counts_with_conn(conn, guild_id, end_date, days, channel_id)
+
+    def _emoji_counts_with_conn(
+        self, conn: sqlite3.Connection, guild_id: int, end_date: date,
+        days: int | None, channel_id: int | None = None,
+    ) -> list[EmojiCount]:
+        table = "activity_emoji_total" if days is None else "activity_emoji_day"
+        filters = ["c.guild_id = ?"]
+        parameters: list[int | str] = [guild_id]
+        if days is not None:
+            filters.append("c.date_utc BETWEEN ? AND ?")
+            parameters.extend([
+                (end_date - timedelta(days=days - 1)).isoformat(), end_date.isoformat(),
+            ])
+        if channel_id is not None:
+            filters.append("c.channel_id = ?")
+            parameters.append(channel_id)
+        rows = conn.execute(
+            f"""
+            SELECT c.emoji_id, m.name, m.animated, SUM(c.message_uses) AS messages,
+                   MAX(0, SUM(c.reaction_delta)) AS reactions
+            FROM {table} c JOIN activity_emoji_metadata m
+                ON m.guild_id = c.guild_id AND m.emoji_id = c.emoji_id
+            WHERE {' AND '.join(filters)}
+            GROUP BY c.emoji_id
+            HAVING messages + reactions > 0
+            ORDER BY messages + reactions DESC, c.emoji_id ASC
+            """,
+            parameters,
+        ).fetchall()
+        return [
+            EmojiCount(EmojiInfo(int(row[0]), str(row[1]), bool(row[2])), int(row[3]), int(row[4]))
+            for row in rows
+        ]
+
+    def _prune_emoji_history_sync(self, guild_id: int, today: date) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "DELETE FROM activity_emoji_day WHERE guild_id = ? AND date_utc < ?",
+                (guild_id, (today - timedelta(days=EMOJI_HISTORY_DAYS - 1)).isoformat()),
+            )
+
+    def _delete_emoji_guild_sync(self, guild_id: int) -> None:
+        with self._connection() as conn:
+            for table in EMOJI_ACTIVITY_TABLES:
+                conn.execute(f"DELETE FROM {table} WHERE guild_id = ?", (guild_id,))
 
     def _increment_counter(
         self,
@@ -614,7 +880,9 @@ class ActivityStore:
         ).fetchone()
         total_messages = int(row[0] or 0)
         active_users = int(row[1] or 0)
-        if total_messages == 0 and active_users == 0:
+        emoji_counts = self._emoji_counts_with_conn(conn, guild_id, date_utc, 1)
+        emoji_of_day = emoji_counts[0].emoji if emoji_counts else None
+        if total_messages == 0 and active_users == 0 and emoji_of_day is None:
             return None
 
         channel_count_row = conn.execute(
@@ -664,6 +932,7 @@ class ActivityStore:
                 float(total_messages) / float(active_users) if active_users else 0.0
             ),
             top_channels=top_channels,
+            emoji_of_day=emoji_of_day,
         )
 
     def _save_daily_summary_with_conn(
@@ -709,6 +978,16 @@ class ActivityStore:
             "DELETE FROM activity_daily_top_channels WHERE guild_id = ? AND date_utc = ?",
             (guild_id, date_key),
         )
+        conn.execute(
+            "DELETE FROM activity_daily_emoji WHERE guild_id = ? AND date_utc = ?",
+            (guild_id, date_key),
+        )
+        if summary.emoji_of_day is not None:
+            emoji = summary.emoji_of_day
+            conn.execute(
+                "INSERT INTO activity_daily_emoji VALUES (?, ?, ?, ?, ?)",
+                (guild_id, date_key, emoji.emoji_id, emoji.name, int(emoji.animated)),
+            )
         conn.executemany(
             """
             INSERT INTO activity_daily_top_channels
@@ -789,6 +1068,11 @@ class ActivityStore:
         ).fetchone()
         if row is None:
             return None
+        emoji_row = conn.execute(
+            "SELECT emoji_id, name, animated FROM activity_daily_emoji "
+            "WHERE guild_id = ? AND date_utc = ?",
+            (guild_id, date_key),
+        ).fetchone()
         top_rows = conn.execute(
             """
             SELECT channel_id, message_count, rank
@@ -813,6 +1097,10 @@ class ActivityStore:
                 TopChannel(int(channel_id), int(count), int(rank))
                 for channel_id, count, rank in top_rows
             ],
+            emoji_of_day=(
+                EmojiInfo(int(emoji_row[0]), str(emoji_row[1]), bool(emoji_row[2]))
+                if emoji_row is not None else None
+            ),
         )
 
     def _get_timeline_top_channels_sync(
@@ -1334,6 +1622,7 @@ class ActivityStore:
             *CACHE_ACTIVITY_TABLES,
             CANONICAL_ACTIVITY_TABLE,
             *HISTORY_ACTIVITY_TABLES,
+            *EMOJI_ACTIVITY_TABLES,
         )
         file_size = self._path.stat().st_size if self._path.exists() else 0
         with self._connection() as conn:
